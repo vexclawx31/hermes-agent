@@ -187,6 +187,13 @@ def assemble_api_request(
     # they crash json.dumps() inside the OpenAI SDK and trigger the 3-retry cycle.
     _sanitize_messages_surrogates(api_messages)
 
+    # Mandatory final provider-egress boundary. This operates on the request
+    # copy and raises closed if redaction cannot complete; persisted history is
+    # never mutated.
+    from agent.redact import redact_provider_payload
+
+    api_messages = redact_provider_payload(api_messages)
+
     # No send-time pad loop here: ``repair_empty_non_final_messages`` (inside
     # ``_sanitize_api_messages``) is the single owner of empty-turn repair.
 

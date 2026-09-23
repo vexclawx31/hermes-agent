@@ -385,6 +385,90 @@ def _slack_mention_detection_text(event: dict) -> str:
     return (flat.strip() + "\n" + " ".join(extra)).strip() if extra else flat
 
 
+_SLACK_USER_MENTION_RE = re.compile(r"<@([^>|]+)(?:\|[^>]*)?>")
+
+
+def _extract_direct_slack_mention_ids(text: Any) -> list[str]:
+    """Extract native authored mentions while excluding quote and code display."""
+    if not isinstance(text, str) or not text:
+        return []
+    mentions: list[str] = []
+    in_fence = False
+    for line in text.splitlines() or [text]:
+        if line.lstrip().startswith((">", "&gt;")) and not in_fence:
+            continue
+        pieces = line.split("```")
+        for index, piece in enumerate(pieces):
+            if index:
+                in_fence = not in_fence
+            if not in_fence:
+                visible = re.sub(r"`[^`]*`", "", piece)
+                mentions.extend(match.group(1) for match in _SLACK_USER_MENTION_RE.finditer(visible))
+    return mentions
+
+
+def _collect_slack_block_mention_ids(blocks: Any) -> list[str]:
+    """Extract user ids only from non-quoted, non-code Block Kit content."""
+    mentions: list[str] = []
+
+    def _walk(node: Any, verbatim: bool) -> None:
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, verbatim)
+            return
+        if not isinstance(node, dict):
+            return
+        node_type = node.get("type")
+        style = node.get("style")
+        in_code = isinstance(style, dict) and bool(style.get("code"))
+        nested_verbatim = verbatim or node_type in {
+            "rich_text_quote", "rich_text_preformatted",
+        } or in_code
+        if node_type == "user" and not nested_verbatim and node.get("user_id"):
+            mentions.append(str(node["user_id"]))
+        elif node_type == "mrkdwn" and not nested_verbatim:
+            mentions.extend(_extract_direct_slack_mention_ids(node.get("text")))
+        for key in ("elements", "element", "text", "fields"):
+            if key in node:
+                _walk(node[key], nested_verbatim)
+
+    try:
+        _walk(blocks, False)
+    except Exception:  # pragma: no cover - malformed untrusted payload
+        return []
+    return mentions
+
+
+def _slack_direct_mention_user_ids(event: dict) -> frozenset[str]:
+    """Authenticated routing mentions; never derive authority from display-only carriers."""
+    mentions = _extract_direct_slack_mention_ids(event.get("text", ""))
+    mentions.extend(_collect_slack_block_mention_ids(event.get("blocks")))
+    for attachment in event.get("attachments") or []:
+        if not isinstance(attachment, dict) or any(
+            attachment.get(flag) for flag in (
+                "is_msg_unfurl", "is_reply_unfurl", "is_thread_root_unfurl",
+                "is_app_unfurl", "is_share",
+            )
+        ):
+            continue
+        enabled = set(attachment.get("mrkdwn_in") or [])
+        if "blocks" in attachment:
+            mentions.extend(_collect_slack_block_mention_ids(attachment.get("blocks")))
+        for key in ("pretext", "text"):
+            if key in enabled:
+                mentions.extend(_extract_direct_slack_mention_ids(attachment.get(key)))
+        if "fields" in enabled:
+            for field in attachment.get("fields") or []:
+                if isinstance(field, dict):
+                    mentions.extend(_extract_direct_slack_mention_ids(field.get("value")))
+    return frozenset(mentions)
+
+
+def _slack_event_mentions_bot(event: dict, bot_user_id: str) -> bool:
+    """Whether the authenticated workspace bot ID is directly mentioned."""
+    return bool(bot_user_id and bot_user_id in _slack_direct_mention_user_ids(event))
+
+
 def _rewrite_known_bang_command(text: str) -> str:
     """Rewrite a known leading ``!cmd`` to the gateway ``/cmd`` form."""
     if not text.startswith("!"):
@@ -3961,51 +4045,70 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id=channel_id, thread_ts=thread_ts, current_ts="", team_id=team_id)
         return False
 
+    async def _thread_root_owner_and_mentions(
+        self, channel_id: str, thread_ts: str, team_id: str = "",
+    ) -> Tuple[str, bool]:
+        """Return authenticated root ownership and whether this bot was directly mentioned.
+
+        Ownership uses the exact workspace/channel/thread cache key. Unknown and foreign-bot
+        roots cannot inherit process-local markers or a persisted active session.
+        """
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id) or ""
+        if not thread_ts or not bot_uid:
+            return "unknown", False
+        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+        cached = self._thread_context_cache.get(cache_key)
+        if cached is None:
+            await self._fetch_thread_context(
+                channel_id=channel_id, thread_ts=thread_ts, current_ts="", team_id=team_id)
+            cached = self._thread_context_cache.get(cache_key)
+        if cached is None:
+            return "unknown", False
+        root = next(
+            (message for message in cached.messages
+             if str(message.get("ts") or "") == str(thread_ts)),
+            None,
+        )
+        directly_mentioned = any(
+            _slack_event_mentions_bot(message, bot_uid) for message in cached.messages[:101])
+        parent_user_id = str(cached.parent_user_id or "")
+        if parent_user_id == bot_uid:
+            return "self_bot", directly_mentioned
+        if root and self._event_declares_bot_sender(root):
+            return "foreign_bot", directly_mentioned
+        if parent_user_id:
+            is_bot = await self._resolve_user_is_bot(
+                parent_user_id, chat_id=channel_id, team_id=team_id)
+            return ("foreign_bot" if is_bot else "human"), directly_mentioned
+        return "unknown", directly_mentioned
+
     async def _should_wake_on_unmentioned_message(
         self, event_thread_ts, channel_id: str, user_id: str, is_thread_reply: bool,
         team_id: str = "", chat_type: str = "group") -> bool:
-        """Return True if the bot should wake on an un-mentioned message. Checks, in order: root
-        sent via send() (_bot_message_ts); thread previously @-mentioned; active session;
-        bot-authored root via raw chat.postMessage; thread parent @-mentioned the bot.
+        """Wake only when authenticated thread ownership supports this bot.
 
-        1. 2. _mentioned_threads        (someone @-mentioned us earlier) 3. _has_active_session... (there's
-        already an agent session) 4. _bot_authored_thread_root (#63530: the bot posted the thread root via
-        direct chat.postMessage, outside the gateway send() path — derived from the Slack API, so it also
-        survives restarts).
+        Self-authored roots and direct authored mentions are authoritative. Human roots may
+        continue an already-owned session. Unknown or foreign-bot roots fail closed instead of
+        inheriting stale local markers from another process or workspace.
         """
-        if not event_thread_ts:
+        if not event_thread_ts or not is_thread_reply:
+            return False
+        root_owner, directly_mentioned = await self._thread_root_owner_and_mentions(
+            channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id)
+        if root_owner == "self_bot" or directly_mentioned:
+            if directly_mentioned and not self._slack_strict_mention():
+                self._register_mentioned_thread(event_thread_ts, team_id=team_id)
+            return True
+        if root_owner in {"foreign_bot", "unknown"}:
+            logger.debug(
+                "[Slack] unmentioned_thread_admission wake=false root_owner=%s", root_owner)
             return False
         thread_marker = self._workspace_message_marker(team_id, event_thread_ts)
-        # Check scoped marker AND bare ts: entries recorded before team_id was
-        # known are bare, and a scoped-vs-bare mismatch must not silence the bot.
-        if is_thread_reply and (
-            thread_marker in self._bot_message_ts or event_thread_ts in self._bot_message_ts):
+        if thread_marker in self._mentioned_threads:
             return True
-        if thread_marker in self._mentioned_threads or event_thread_ts in self._mentioned_threads:
-            return True
-        if is_thread_reply and self._has_active_session_for_thread(
-            channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id,
-            chat_type=chat_type):
-            return True
-        if is_thread_reply and await self._bot_authored_thread_root(
-            channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id):
-            return True
-        # Thread PARENT @-mentioned the bot before this process (restart): a bare "run" is for us.
-        # 5th check (#24848): the thread PARENT @-mentioned the bot, but the mention event predates this
-        # process (restart) or the parent asked the bot to wait for a follow-up (e.g. A plain reply like
-        # "run" in that thread is addressed to the bot even though the reply itself carries no mention.
-        if is_thread_reply:
-            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-            if bot_uid:
-                parent_text = await self._fetch_thread_parent_text(
-                    channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id,
-                    strip_bot_mention=False)
-                if parent_text and f"<@{bot_uid}>" in parent_text:
-                    # Remember so later replies skip the fetch.
-                    if not self._slack_strict_mention():
-                        self._register_mentioned_thread(event_thread_ts)
-                    return True
-        return False
+        return self._has_active_session_for_thread(
+            channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id,
+            team_id=team_id, chat_type=chat_type)
 
     @staticmethod
     def _append_block_text(text: str, blocks: list, bot_uid: str) -> str:
@@ -4321,8 +4424,7 @@ class SlackAdapter(BasePlatformAdapter):
         if allow_bots == "mentions":
             # Mentions may live only in Block Kit, not the flat text.
             # See #52387.
-            text_check = _slack_mention_detection_text(event)
-            if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+            if self._bot_user_id and not _slack_event_mentions_bot(event, self._bot_user_id):
                 logger.debug(
                     "[Slack] Dropping bot message under allow_bots=mentions: "
                     "no <@%s> mention in flat text or blocks", self._bot_user_id)
@@ -4488,9 +4590,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Mentions may live only in Block Kit blocks.
         # See #52387.
         routing_text = _slack_mention_detection_text(event) or original_text or ""
-        is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
-            or self._slack_message_matches_mention_patterns(routing_text))
+        is_mentioned = _slack_event_mentions_bot(event, bot_uid or "")
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
         # Internal triggers (reactions) skip the mention requirement but NOT

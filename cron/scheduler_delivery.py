@@ -576,21 +576,8 @@ def cron_delivery_targets() -> list[dict]:
     return targets
 
 
-def _origin_thread_is_stale(origin: dict) -> bool:
-    """True when a Slack origin's thread is a stale creation-turn artifact. Thread-per-message
-    Slack stamps each top-level message id as the session thread (a KEY, not a location); old jobs
-    carry it as ``origin.thread_id``. Heuristic: if the origin chat IS the Slack home chat, the
-    pinned thread is that artifact and delivery goes top-level (or to the home target's thread)."""
-    if str(origin.get("platform") or "").lower() != "slack" or not origin.get("thread_id"):
-        return False
-    home_chat = _get_home_target_chat_id("slack")
-    return bool(home_chat) and str(origin.get("chat_id")) == str(home_chat)
-
-
 def _origin_delivery_thread(origin: dict):
-    """The thread a deliver=origin job should use, stale stamps dropped."""
-    if _origin_thread_is_stale(origin):
-        return _get_home_target_thread_id("slack") or None
+    """Preserve the trusted thread captured with a ``deliver=origin`` job."""
     return origin.get("thread_id")
 
 
@@ -653,16 +640,6 @@ def _resolve_single_delivery_target(
         if resolution_error:
             logger.warning("Invalid cron delivery target '%s': %s", deliver_value, resolution_error)
             return None
-        if (
-            thread_id is None
-            and platform_key == "slack"
-            and origin
-            and str(origin.get("platform") or "").lower() == platform_key
-            and str(origin.get("chat_id")) == str(chat_id)
-            and origin.get("thread_id")
-            and not _origin_thread_is_stale(origin)
-        ):
-            thread_id = origin.get("thread_id")
         return {
             "platform": platform_name,
             "chat_id": chat_id,

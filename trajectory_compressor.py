@@ -453,6 +453,19 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             return jittered_backoff(attempt + 1, base_delay=self.config.retry_delay, max_delay=30.0)
         return None
 
+    @staticmethod
+    def _redacted_provider_request(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Provider-egress-redacted copy of a direct custom/base-URL request.
+
+        The ``call_llm`` lanes redact inside the shared auxiliary wire boundary, but the raw
+        custom-endpoint client below is its own provider transport: summarized trajectories
+        replay tool output and injected context, so the same mandatory egress policy applies
+        here. Returns a copy — the caller's kwargs are never mutated — and a redaction failure
+        propagates into the retry loop, which reports the attempt as failed and sends nothing.
+        """
+        from agent.redact import redact_provider_payload
+        return redact_provider_payload(kwargs)
+
     def _generate_summary(self, content: str, metrics: TrajectoryMetrics) -> str:
         """Summarize ``content`` with retries; returns a fallback summary after the last failure."""
         prompt = self._summary_prompt(content)
@@ -464,7 +477,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     from agent.auxiliary_client import call_llm
                     response = call_llm(provider=self._llm_provider, temperature=temperature, **kwargs)
                 else:
-                    response = self.client.chat.completions.create(**kwargs)
+                    response = self.client.chat.completions.create(**self._redacted_provider_request(kwargs))
                 return self._finish_summary(response)
             except Exception as e:
                 delay = self._summary_attempt_failed(metrics, attempt, e)
@@ -483,7 +496,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     from agent.auxiliary_client import async_call_llm
                     response = await async_call_llm(provider=self._llm_provider, temperature=temperature, **kwargs)
                 else:
-                    response = await self._get_async_client().chat.completions.create(**kwargs)
+                    response = await self._get_async_client().chat.completions.create(
+                        **self._redacted_provider_request(kwargs))
                 return self._finish_summary(response)
             except Exception as e:
                 delay = self._summary_attempt_failed(metrics, attempt, e)

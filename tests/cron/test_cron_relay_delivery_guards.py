@@ -1,19 +1,10 @@
-"""Fire-time guards: stale Slack creation-thread routing + relay-fronted preflight.
+"""Exact Slack delivery routing and relay-fronted preflight.
 
-Two related defects on relay-fronted Slack deployments:
+Origin delivery preserves its recorded thread, even in the home channel; home
+configuration cannot replace that explicit origin. An explicit channel target
+stays at the channel root rather than inheriting the origin thread.
 
-1. Jobs persisted before the synthetic-thread capture fix carry the creation
-   message's own id as ``origin.thread_id``. At fire time ``deliver=origin``
-   replayed it unconditionally, and the Slack origin-affinity re-attach put it
-   back even on explicit ``slack:<chat_id>`` targets. Guard: when the resolved
-   Slack chat IS the configured home chat, the origin thread is a stale
-   per-message artifact — deliver top-level (home thread config still wins).
-
-2. ``_preflight_check_delivery`` validated the ``slack:`` prefix against
-   natively-configured platforms only; in relay-only topology that set is
-   ``{relay}`` and the job was refused with "no gateway credentials configured"
-   although fire-time routing (resolve_delivery_transport + fronts_platform)
-   would have delivered it. Preflight must consult the relay's fronted set.
+Preflight must also accept relay-fronted platforms without native credentials.
 """
 
 from unittest.mock import MagicMock, patch
@@ -36,15 +27,15 @@ def _slack_home(monkeypatch, chat_id="D0BJTDCSR7C", thread_id=None):
 SYNTH = "1755043010.123456"
 
 
-class TestOriginThreadStaleGuard:
-    def test_origin_thread_dropped_when_chat_is_home(self, monkeypatch):
-        """deliver=origin, slack origin chat == home chat: creation thread is stale."""
+class TestExactOriginThreadRouting:
+    def test_origin_thread_preserved_when_chat_is_home(self, monkeypatch):
+        """A home-channel match does not invalidate the recorded origin thread."""
         _slack_home(monkeypatch)
         job = {"origin": {"platform": "slack", "chat_id": "D0BJTDCSR7C",
                           "thread_id": SYNTH}}
         target = _resolve_single_delivery_target(job, "origin")
         assert target == {"platform": "slack", "chat_id": "D0BJTDCSR7C",
-                          "thread_id": None, "_resolved_from": "origin"}
+                          "thread_id": SYNTH, "_resolved_from": "origin"}
 
     def test_origin_thread_kept_when_chat_not_home(self, monkeypatch):
         """A non-home Slack origin thread may be a genuine working thread: keep it."""
@@ -54,13 +45,13 @@ class TestOriginThreadStaleGuard:
         target = _resolve_single_delivery_target(job, "origin")
         assert target["thread_id"] == "1755040000.000100"
 
-    def test_home_thread_config_still_wins(self, monkeypatch):
-        """When the home target itself pins a thread, deliver there, not top-level."""
+    def test_origin_thread_takes_precedence_over_home_thread(self, monkeypatch):
+        """deliver=origin uses the origin thread, not the configured home thread."""
         _slack_home(monkeypatch, thread_id="1755000000.000001")
         job = {"origin": {"platform": "slack", "chat_id": "D0BJTDCSR7C",
                           "thread_id": SYNTH}}
         target = _resolve_single_delivery_target(job, "origin")
-        assert target["thread_id"] == "1755000000.000001"
+        assert target["thread_id"] == SYNTH
 
     def test_non_slack_origin_thread_untouched(self, monkeypatch):
         """Telegram forum-topic origins replay their thread verbatim."""
@@ -83,8 +74,8 @@ class TestOriginThreadStaleGuard:
         target = _resolve_single_delivery_target(job, "slack:D0BJTDCSR7C")
         assert target["thread_id"] is None
 
-    def test_explicit_target_reattach_kept_for_non_home_chat(self, monkeypatch):
-        """Origin-affinity re-attach is preserved for genuine non-home threads."""
+    def test_explicit_target_no_reattach_for_non_home_chat(self, monkeypatch):
+        """An explicit channel stays at root even when its origin has a thread."""
         _slack_home(monkeypatch, chat_id="D_OTHER_HOME")
         monkeypatch.setattr(
             "tools.send_message_tool.prepare_send_message_platforms", lambda: None)
@@ -94,7 +85,7 @@ class TestOriginThreadStaleGuard:
         job = {"origin": {"platform": "slack", "chat_id": "C0AGENERAL",
                           "thread_id": "1755040000.000100"}}
         target = _resolve_single_delivery_target(job, "slack:C0AGENERAL")
-        assert target["thread_id"] == "1755040000.000100"
+        assert target["thread_id"] is None
 
 
 def _gateway_config(connected_values):

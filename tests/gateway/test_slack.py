@@ -3066,7 +3066,7 @@ class TestThreadReplyHandling:
     async def test_thread_reply_without_mention_with_session_processed(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Thread replies without mention should be processed if there's an active session."""
+        """An active session permits unmentioned replies to an authenticated human root."""
         from gateway.session import SessionEntry
 
         # Deserialize a legacy routing entry so lifecycle flags have real defaults.
@@ -3080,6 +3080,12 @@ class TestThreadReplyHandling:
             "created_at": "2024-01-01T00:00:00",
             "updated_at": "2024-01-01T00:00:00",
         })}
+        # Session state alone cannot authorize an unknown or foreign-bot root.
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(
+            return_value={"messages": [
+                {"ts": "123.000", "user": "U_USER", "text": "Original question"},
+            ]}
+        )
 
         event = {
             "text": "Follow-up question",
@@ -3155,7 +3161,7 @@ class TestThreadReplyHandling:
         # Cold-start context carries the parent so the agent sees the ask.
         assert "check this and ask me for run" in msg_event.channel_context
         # Thread remembered so later replies skip the parent fetch.
-        assert "123.000" in adapter_with_session_store._mentioned_threads
+        assert ("T_TEAM", "123.000") in adapter_with_session_store._mentioned_threads
 
     @pytest.mark.asyncio
     async def test_top_level_mention_registers_thread_for_replies(

@@ -1328,6 +1328,34 @@ def _reset_plugin_redaction_patterns() -> None:
         _rebuild_prefix_matcher()
 
 
+class ProviderEgressRedactionError(RuntimeError):
+    """Raised when a provider-bound payload cannot be safely redacted."""
+
+
+def redact_provider_payload(value):
+    """Return a redacted provider-bound copy, reusing clean objects by identity.
+
+    This is the single mandatory egress policy for transcript and auxiliary
+    messages. Callers intentionally do not catch failures: an unredactable
+    payload must never be sent.
+    """
+    try:
+        if isinstance(value, str):
+            return redact_sensitive_text(value, force=True)
+        if isinstance(value, list):
+            items = [redact_provider_payload(item) for item in value]
+            return value if all(a is b for a, b in zip(items, value)) else items
+        if isinstance(value, tuple):
+            items = tuple(redact_provider_payload(item) for item in value)
+            return value if all(a is b for a, b in zip(items, value)) else items
+        if isinstance(value, dict):
+            items = {key: redact_provider_payload(item) for key, item in value.items()}
+            return value if all(items[key] is item for key, item in value.items()) else items
+        return value
+    except Exception as exc:
+        raise ProviderEgressRedactionError("provider payload redaction failed") from exc
+
+
 class RedactingFormatter(logging.Formatter):
     """Log formatter that redacts secrets from all log messages."""
 

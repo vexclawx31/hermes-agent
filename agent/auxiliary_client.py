@@ -2594,8 +2594,10 @@ def _relay_sync_completion(
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     from agent.auxiliary_wire import prepare_chat_messages
+    from agent.redact import redact_provider_payload
 
     kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = redact_provider_payload(kwargs)
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
     callback = create or (lambda request: _create_with_progress(client, request))
@@ -2624,8 +2626,10 @@ async def _relay_async_completion(
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     from agent.auxiliary_wire import prepare_chat_messages
+    from agent.redact import redact_provider_payload
 
     kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = redact_provider_payload(kwargs)
     # Async twin of the seam default above (#98466).
     callback = create or (lambda request: _acreate_with_progress(client, request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
@@ -2649,8 +2653,10 @@ def _relay_sync_stream(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None, api_mode: str | None = None
 ) -> Any:
     from agent.auxiliary_wire import prepare_chat_messages
+    from agent.redact import redact_provider_payload
 
     kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = redact_provider_payload(kwargs)
     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
     create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))  # noqa: E731
@@ -7793,6 +7799,8 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    from agent.redact import redact_provider_payload
+    messages = redact_provider_payload(messages)
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -8089,6 +8097,8 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    from agent.redact import redact_provider_payload
+    messages = redact_provider_payload(messages)
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()

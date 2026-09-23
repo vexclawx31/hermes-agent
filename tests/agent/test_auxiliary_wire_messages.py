@@ -9,6 +9,9 @@ from openai import AsyncOpenAI, OpenAI
 from agent.auxiliary_client import _relay_async_completion, _relay_sync_completion
 
 
+SYNTHETIC_TOKEN = "".join(("g", "h", "p", "_")) + "Z" * 40
+
+
 @pytest.mark.parametrize("async_mode", [False, True])
 def test_auxiliary_chat_wire_sanitizes_without_mutating_history(async_mode):
     history = [{"role": "assistant", "content": "answer", "_db_persisted": True,
@@ -49,3 +52,18 @@ def test_auxiliary_native_adapters_keep_replay_and_tool_fields(async_mode):
         _relay_sync_completion(SimpleNamespace(), kwargs, create=captured.append)
     assert captured[0] is kwargs
     assert captured[0]["messages"] is history
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_auxiliary_wire_redacts_provider_copy_without_mutating_history(async_mode):
+    history = [{"role": "tool", "content": f"TOKEN={SYNTHETIC_TOKEN}"}]
+    kwargs = {"model": "fixture-model", "messages": history}
+    captured = []
+    if async_mode:
+        async def send(request):
+            captured.append(request)
+        asyncio.run(_relay_async_completion(SimpleNamespace(), kwargs, create=send))
+    else:
+        _relay_sync_completion(SimpleNamespace(), kwargs, create=captured.append)
+    assert SYNTHETIC_TOKEN not in str(captured[0])
+    assert history[0]["content"].endswith(SYNTHETIC_TOKEN)
