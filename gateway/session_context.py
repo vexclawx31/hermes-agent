@@ -130,6 +130,8 @@ def set_session_vars(
     ``""`` / omitted (default-deny, #98619).  ``None`` leaves the var at ``_UNSET`` ("never
     declared"), which ``session_history_delivery_supported()`` treats as NOT capable — an omitted declaration
     cannot grant wake authority."""
+    from gateway.ingress_identity import clear_trusted_ingress
+    clear_trusted_ingress()
     global _session_context_engaged
     _session_context_engaged = True
     values = (
@@ -150,6 +152,8 @@ def clear_session_vars(tokens: list) -> None:
     goes back to ``_UNSET``: a cleared context is default-supported, not opted-out.  Wake
     capability goes back to ``_UNSET`` too — but for the opposite reason: a cleared context has
     declared nothing, and an undeclared capability FAILS CLOSED (#98619)."""
+    from gateway.ingress_identity import clear_trusted_ingress
+    clear_trusted_ingress()
     for var in _SESSION_VARS:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
@@ -163,6 +167,8 @@ def reset_session_vars() -> None:
     task inherits A's already-set vars and a subprocess spawned before B binds would read A's
     identity.  ``_SESSION_ASYNC_DELIVERY`` and ``_SESSION_HISTORY_DELIVERY`` (outside ``_VAR_MAP``)
     are reset explicitly too."""
+    from gateway.ingress_identity import clear_trusted_ingress
+    clear_trusted_ingress()
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)

@@ -1066,6 +1066,7 @@ class GatewayInboundMixin:
                     # (contextvars carried), never the loop thread: blocking I/O there starves the
                     # liveness watchdog and the process exits 75 mid-handler (#105279).
                     _plugin_context = build_session_context(source, self.config)
+                    _plugin_context._ingress_event = event
                     _plugin_context.session_key = self._session_key_for_source(source)
                     user_args = event.get_command_args().strip()
                     with self._session_env_scope(_plugin_context):

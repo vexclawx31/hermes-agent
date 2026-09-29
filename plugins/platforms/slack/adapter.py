@@ -4692,7 +4692,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Remaining ``<@UID>`` are OTHER participants (own mention stripped
         # above); render as ``@DisplayName`` so the agent knows who is addressed.
         text = await self._humanize_user_mentions(text, chat_id=channel_id, team_id=team_id)
-        return MessageEvent(
+        message_event = MessageEvent(
             text=(command_probe_text if is_command_text else text),
             message_type=msg_type,
             source=source,
@@ -4710,6 +4710,9 @@ class SlackAdapter(BasePlatformAdapter):
             metadata={
                 "slack_team_id": team_id, "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts})
+        from gateway.ingress_identity import record_slack_event
+        record_slack_event(self, message_event)
+        return message_event
 
     def _note_attachment_failure(
         self, notices: List[str], detail: Optional[str], fallback_msg: str, *fallback_args: Any,

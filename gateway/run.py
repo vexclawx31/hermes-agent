@@ -3650,6 +3650,8 @@ class GatewayRunner(
         # Launch-time identity of the profile that owns ``self.adapters``; ``_authorization_adapter``
         # compares against this rather than the per-turn ``_active_profile_name()``.
         self._primary_profile_name = self._kanban_notifier_profile = self._active_profile_name()
+        from gateway.ingress_identity import capture_launch
+        capture_launch(self)
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -4257,7 +4259,7 @@ class GatewayRunner(
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(self, context: SessionContext, event=None) -> list:
         """Set session context variables (contextvars, not os.environ, so concurrent messages can't
         overwrite each other). Returns reset tokens for ``_clear_session_env`` in a ``finally``."""
         from gateway.session_context import set_session_vars
@@ -4265,7 +4267,9 @@ class GatewayRunner(
         # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        return set_session_vars(
+        profile = getattr(context.source, "profile", "") or ""
+        message_id = str(context.source.message_id) if context.source.message_id else ""
+        tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_type=str(context.source.chat_type) if context.source.chat_type else "",
@@ -4277,10 +4281,14 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            message_id=message_id,
+            profile=profile,
             async_delivery=_async_delivery,
             cron_session="")
+        if context.source.platform == Platform.SLACK:
+            from gateway.ingress_identity import _bind_trusted_ingress
+            _bind_trusted_ingress(self, context.source, event if event is not None else getattr(context, "_ingress_event", None))
+        return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
