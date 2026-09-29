@@ -905,10 +905,6 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if not text:
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
-    from gateway.runtime_context import current_environment
-    scope = current_environment()
-    if scope:
-        text = scope.redact(text)
     text = redact_registered_vault_values(text)
     if not (force or _redact_enabled()):
         return text

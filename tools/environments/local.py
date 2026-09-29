@@ -929,69 +929,29 @@ class LocalEnvironment(BaseEnvironment):
                 self.cwd, safe_cwd)
         self.cwd = safe_cwd
 
-    def _wrap_command(self, command: str, cwd: str) -> str:
-        from gateway.runtime_context import terminal_scope
-        if terminal_scope():
-            # Neither read nor write session snapshots: aliases/functions can hide
-            # copies of credentials, not merely environment names.
-            return f"cd -- {self._quote_cwd_for_cd(cwd)} && {{\n{command}\n}}"
-        return super()._wrap_command(command, cwd)
-
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
         # Login invocations (init_session's env snapshot) source the user's rc /
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
-        from gateway.runtime_context import terminal_scope
-        scope = terminal_scope()
-        if scope:
-            login = False
         if login:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        def spawn(values):
-            proc = subprocess.Popen(
-                args, text=True, env=_make_run_env(self.env) | values, encoding="utf-8", errors="replace",
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-                start_new_session=True, cwd=self.cwd,
-                **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
-            if scope:
-                import psutil
-                proc._hermes_scoped = True
-                try:
-                    proc._hermes_identity = psutil.Process(proc.pid)
-                except psutil.NoSuchProcess:
-                    proc._hermes_identity = None
-            elif not _IS_WINDOWS:
-                with contextlib.suppress(ProcessLookupError):
-                    proc._hermes_pgid = os.getpgid(proc.pid)
-            return proc
-        proc = scope.spawn(spawn, self._kill_process) if scope else spawn({})
+        proc = subprocess.Popen(
+            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            start_new_session=True, cwd=self.cwd,
+            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        if not _IS_WINDOWS:
+            with contextlib.suppress(ProcessLookupError):
+                proc._hermes_pgid = os.getpgid(proc.pid)
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc
 
     def _kill_process(self, proc):
-        if getattr(proc, '_hermes_scoped', False):
-            # Identity-checked ordinary foreground descendants only. No numeric
-            # PID/group signaling after wait, no daemonization containment claim.
-            import psutil
-            identity = proc._hermes_identity
-            if identity is None:
-                return
-            try:
-                children = identity.children(recursive=True) if identity.is_running() else []
-                for child in reversed(children):
-                    with contextlib.suppress(psutil.NoSuchProcess):
-                        child.kill()
-                with contextlib.suppress(psutil.NoSuchProcess):
-                    identity.kill()
-                proc.wait(timeout=3)
-            except psutil.NoSuchProcess:
-                pass
-            return
         """Kill the entire process group (all children)."""
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)

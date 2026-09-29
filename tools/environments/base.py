@@ -509,10 +509,6 @@ class BaseEnvironment(ABC):
         See #94285.
         """
         self._before_execute()
-        from gateway.runtime_context import terminal_scope
-        scope = terminal_scope()
-        if scope:
-            yield_handler = None
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default; callers
@@ -579,10 +575,6 @@ class BaseEnvironment(ABC):
         result = (
             {"output": f"[Command timed out after {effective_timeout}s]", "returncode": 124}
             if bounded.timed_out else bounded.value)
-        if scope:
-            result = scope.redact(result)
-            for spawned in proc_holder:
-                scope.forget_process(spawned)
         self._update_cwd(result)
         if getattr(self, "_recreated_notice_pending", False):
             self._recreated_notice_pending = False
@@ -591,13 +583,6 @@ class BaseEnvironment(ABC):
 
     def _kill_spawned_tree(self, spawned) -> None:
         """Best-effort kill of a wedged spawned process and its tree (backstop path)."""
-        if getattr(spawned, '_hermes_scoped', False):
-            try:
-                self._kill_process(spawned)
-            except Exception:
-                # Keep the scoped identity check; never fall back to a bare PID kill.
-                logger.warning("terminal scoped wait-bound cleanup failed; teardown unconfirmed")
-            return
         try:
             self._kill_process(spawned)
         except Exception:
