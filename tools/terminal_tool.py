@@ -1257,6 +1257,11 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
+        from gateway.runtime_context import current_environment
+        run_scope = current_environment()
+        if run_scope and (plan.env_type != "local" or background or pty
+                          or plan.promoted_from_foreground_timeout is not None):
+            raise _Rejected(_error_json("Credential runs support bounded local foreground commands only"))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1320,11 +1325,13 @@ def terminal_tool(
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return result
-        return _run_foreground(
-            command, env, plan,
-            task_id=task_id, session_id=session_id, session_key=session_key,
-            workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-        )
+        from gateway.runtime_context import terminal_environment
+        with terminal_environment():
+            return _run_foreground(
+                command, env, plan,
+                task_id=task_id, session_id=session_id, session_key=session_key,
+                workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            )
     except _Rejected as r:
         return r.result_json
     except EnvironmentConnectionError as e:
