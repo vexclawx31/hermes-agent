@@ -592,7 +592,11 @@ class BaseEnvironment(ABC):
     def _kill_spawned_tree(self, spawned) -> None:
         """Best-effort kill of a wedged spawned process and its tree (backstop path)."""
         if getattr(spawned, '_hermes_scoped', False):
-            self._kill_process(spawned)
+            try:
+                self._kill_process(spawned)
+            except Exception:
+                # Keep the scoped identity check; never fall back to a bare PID kill.
+                logger.warning("terminal scoped wait-bound cleanup failed; teardown unconfirmed")
             return
         try:
             self._kill_process(spawned)

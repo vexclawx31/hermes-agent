@@ -816,7 +816,12 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         finally:
             try:
                 if run.environment:
-                    run.environment.close()
+                    try:
+                        run.environment.close()
+                    except Exception:
+                        # Revocation is not proof that every owned process was killed.
+                        # Do not log exception text: callbacks may include credentials.
+                        logger.warning("[api_server] run %s subprocess cleanup failed; teardown unconfirmed", run.run_id)
             finally:
                 try:
                     _api_server._clear_turn_process_ownership(agent)
@@ -843,7 +848,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
 
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
     """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
-    run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
+    run_id, loop = run.run_id, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
         event = dict(approval_data or {})
@@ -858,9 +863,11 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
             smart_denied=bool(event.get("smart_denied")),
             allow_session=event.get("allow_session") is not False,
             allow_permanent=event.get("allow_permanent") is not False)))
+        if run.environment:
+            event = run.environment.redact(event)
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
-            loop.call_soon_threadsafe(q.put_nowait, event)
+            loop.call_soon_threadsafe(run.put_event, event)
 
     return _approval_notify
 
@@ -1237,7 +1244,10 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         if isinstance(scope, RunEnvironment):
             # Revoke new spawns immediately; drain owned foreground processes off
             # the event loop. This is not Paperclip JWT invalidation.
-            await asyncio.to_thread(scope.close)
+            try:
+                await asyncio.to_thread(scope.close)
+            except Exception:
+                logger.warning("[api_server] run %s subprocess cleanup failed; teardown unconfirmed", run_id)
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
