@@ -1370,8 +1370,8 @@ def _render_skills_index(
             if name not in seen:
                 seen.add(name)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
-    from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
-    if is_single_query_session():
+    from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, uses_reduced_skill_footprint
+    if uses_reduced_skill_footprint():
         return (
             ONESHOT_SKILLS_LOAD_GUIDANCE
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"

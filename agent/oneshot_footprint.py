@@ -31,10 +31,18 @@ def is_single_query_session() -> bool:
     return str(get_session_env("HERMES_SINGLE_QUERY_SESSION", "") or "") == "1"
 
 
+def uses_reduced_skill_footprint() -> bool:
+    """Trusted launch opt-in; does not change approvals or finite execution."""
+    if not is_single_query_session():
+        return False
+    from gateway.session_context import get_session_env
+    return get_session_env("HERMES_ONESHOT_SKILL_POLICY", "") != "normal"
+
+
 def prune_oneshot_tools(tools: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """*tools* minus ``ONESHOT_HIDDEN_TOOLS``; identity when the session is not one-shot."""
     tools = list(tools)
-    if not is_single_query_session():
+    if not uses_reduced_skill_footprint():
         return tools
     return [t for t in tools if (t.get("function") or {}).get("name") not in ONESHOT_HIDDEN_TOOLS]
 

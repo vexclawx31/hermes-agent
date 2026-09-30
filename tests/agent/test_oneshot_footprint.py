@@ -9,6 +9,19 @@ session — the control in every test here — keeps the full surface.
 
 import pytest
 
+
+@pytest.mark.parametrize("policy,enabled", [("normal", True), ("", False), ("invalid", False)])
+def test_explicit_skill_policy(monkeypatch, tmp_path, policy, enabled):
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    monkeypatch.setenv("HERMES_ONESHOT_SKILL_POLICY", policy)
+    kept = oneshot_footprint.prune_oneshot_tools(_tools("skill_manage", "skill_view", "skills_list"))
+    names = {t["function"]["name"] for t in kept}
+    assert ("skill_manage" in names) == enabled
+    prompt = build_skills_system_prompt(available_tools=names, skills_dir_override=_skills_dir(tmp_path))
+    assert ("do not create or edit skills" not in prompt) == enabled
+    assert oneshot_footprint.is_single_query_session()  # approval/delegation marker unchanged
+
+
 from agent import oneshot_footprint
 from agent.prompt_builder import build_skills_system_prompt
 
