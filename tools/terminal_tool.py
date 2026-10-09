@@ -1257,6 +1257,11 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
+        from gateway.runtime_context import current_environment
+        run_scope = current_environment()
+        if run_scope and (plan.env_type != "local" or background or pty
+                          or plan.promoted_from_foreground_timeout is not None):
+            raise _Rejected(_error_json("Credential runs support bounded local foreground commands only"))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1270,9 +1275,15 @@ def terminal_tool(
         # Explicit pre-scanner admission for protected policy-derived helper argv.
         from tools.sibling_service_policy import admit_terminal_command, is_candidate
         from agent.deadline import run_bounded_sync
+        sibling_candidate = env_type == 'local' and not _host_local and is_candidate(command)
+        # Fail closed: sibling service control never runs under run credential authority, and the
+        # refusal precedes admission so the helper's fixed-env early return is never reached.
+        if sibling_candidate and run_scope:
+            raise _Rejected(_error_json('Sibling control is unavailable in credential runs; command not run.',
+                                        status='blocked'))
         admission = (run_bounded_sync(lambda: admit_terminal_command(command), 10,
                                       label='terminal.sibling-admission')
-                     if env_type == 'local' and not _host_local and is_candidate(command) else None)
+                     if sibling_candidate else None)
         if admission is not None and admission.timed_out:
             raise _Rejected(_error_json('Sibling admission timed out; command not run.', status='blocked'))
         sibling_argv = admission.value if admission is not None else False
@@ -1357,11 +1368,13 @@ def terminal_tool(
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return result
-        return _run_foreground(
-            command, env, plan,
-            task_id=task_id, session_id=session_id, session_key=session_key,
-            workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-        )
+        from gateway.runtime_context import terminal_environment
+        with terminal_environment():
+            return _run_foreground(
+                command, env, plan,
+                task_id=task_id, session_id=session_id, session_key=session_key,
+                workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            )
     except _Rejected as r:
         return r.result_json
     except EnvironmentConnectionError as e:

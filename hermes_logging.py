@@ -513,7 +513,16 @@ class _NonFormattingQueueHandler(QueueHandler):
     """
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
-        return copy.copy(record)
+        record = copy.copy(record)
+        from gateway.runtime_context import current_environment
+        scope = current_environment()
+        if scope:
+            # Redact on the emitting thread, before its context is lost in the queue.
+            record.msg = scope.redact(logging.Formatter().format(record))
+            record.args = ()
+            record.exc_info = record.exc_text = None
+            record.stack_info = None  # already embedded and redacted in msg
+        return record
 
 
 def _stop_queue_listener() -> None:
