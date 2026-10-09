@@ -73,6 +73,27 @@ def _submit_api_worker(loop, fn):
         with _API_WORKER_LOCK:
             _API_WORKER_LIVE -= 1
         raise
+
+
+async def _drain_threadsafe_callbacks(loop: "asyncio.AbstractEventLoop") -> None:
+    """Return only after every callback already queued on *loop* has run.
+
+    Worker-thread progress/commentary callbacks reach the run queue via
+    ``call_soon_threadsafe``; the loop runs ready callbacks in registration order, so a
+    barrier registered with ``call_soon`` after the worker returned runs after all of them.
+    ``await`` on an already-done executor future does not yield, so without this barrier the
+    terminal event and EOF sentinel could be queued ahead of the worker's last callbacks.
+    """
+    barrier = loop.create_future()
+
+    def _release() -> None:
+        if not barrier.done():  # cancelled while waiting: nothing to release
+            barrier.set_result(None)
+
+    loop.call_soon(_release)
+    await barrier
+
+
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
     else "hermes.room_run_retention_until")
@@ -986,8 +1007,15 @@ async def _execute_run_scoped(self, run: _RunLaunch, *, _api_server) -> None:
         if run.environment:
             agent._api_run_environment = run.environment
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        result, usage, served_runtime = await _submit_api_worker(
+        worker = _submit_api_worker(
             loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        try:
+            result, usage, served_runtime = await worker
+        finally:
+            # The worker has returned (or raised): deliver its queued progress/commentary before
+            # the terminal event and EOF. A cancelled wait leaves the worker running; skip.
+            if worker.done() and not worker.cancelled():
+                await _drain_threadsafe_callbacks(loop)
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
