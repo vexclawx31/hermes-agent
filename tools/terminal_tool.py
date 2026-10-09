@@ -1267,6 +1267,43 @@ def terminal_tool(
 
         session_key = get_current_session_key(default="") or (task_id or "")
 
+        # Explicit pre-scanner admission for protected policy-derived helper argv.
+        from tools.sibling_service_policy import admit_terminal_command, is_candidate
+        from agent.deadline import run_bounded_sync
+        admission = (run_bounded_sync(lambda: admit_terminal_command(command), 10,
+                                      label='terminal.sibling-admission')
+                     if env_type == 'local' and not _host_local and is_candidate(command) else None)
+        if admission is not None and admission.timed_out:
+            raise _Rejected(_error_json('Sibling admission timed out; command not run.', status='blocked'))
+        sibling_argv = admission.value if admission is not None else False
+        if sibling_argv:
+            if background or pty or workdir is not None or plan.promoted_from_foreground_timeout is not None:
+                raise _Rejected(_error_json('Sibling control requires foreground without PTY.', status='blocked'))
+            verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+            import subprocess as _sp
+            logger.info('Sibling control admitted argv=%r approval=%r', sibling_argv, verdict.note)
+            try:
+                completed = _sp.run(
+                    sibling_argv, shell=False, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                    timeout=min(plan.effective_timeout, 60), cwd='/',
+                    env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C'},
+                )
+            except _sp.TimeoutExpired:
+                logger.warning('Sibling control timed out argv=%r; outcome unknown', sibling_argv)
+                return json.dumps({'output': '', 'exit_code': None, 'timed_out': True,
+                                   'service_control': True, 'health_verified': False,
+                                   'outcome': 'unknown', 'error': 'Helper timed out; service operation may have taken effect. Inspect target before retrying.'})
+            logger.info('Sibling control finished argv=%r exit_code=%s', sibling_argv, completed.returncode)
+            result = json.loads(finalize_foreground_result(
+                command=command, result={'output': completed.stdout + completed.stderr,
+                                         'returncode': completed.returncode},
+                env=env, env_type=env_type, effective_task_id=effective_task_id,
+                task_id=task_id, session_id=session_id, session_key=session_key,
+                workdir=None, command_cwd='/', approval_note=verdict.note,
+            ))
+            result.update(service_control=True, health_verified=False)
+            return json.dumps(result)
+
         # The supervised-gateway identity probe ends in a kernel process query
         # (psutil create_time) that has wedged for the better part of an hour on
         # macOS; ``env.execute`` is already behind ``run_bounded_sync`` but this
