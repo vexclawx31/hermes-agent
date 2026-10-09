@@ -950,7 +950,13 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             await _execute_run_scoped(self, run, _api_server=_api_server)
         finally:
             if run.environment:
-                run.environment.close()
+                try:
+                    run.environment.close()
+                except Exception:
+                    # Terminal status is already published; a cleanup failure must not replace
+                    # the run's result or CancelledError, nor reach asyncio's handler with its
+                    # chained (unredacted) cause. Revocation is not proof of kill.
+                    logger.warning("[api_server] run %s subprocess cleanup failed; teardown unconfirmed", run.run_id)
 
 
 async def _execute_run_scoped(self, run: _RunLaunch, *, _api_server) -> None:

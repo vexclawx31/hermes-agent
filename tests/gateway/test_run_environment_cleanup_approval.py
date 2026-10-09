@@ -110,6 +110,56 @@ async def test_cleanup_failure_still_interrupts_reaps_and_unwinds(monkeypatch, c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['completed', 'cancelled'])
+async def test_execute_run_cleanup_failure_keeps_terminal_status_and_secret(monkeypatch, caplog, outcome):
+    import logging
+    caplog.set_level(logging.DEBUG)
+    adapter = _make_adapter()
+    scope, visited = failing_scope()
+    run = launch(adapter, scope)
+    persisted = []
+    monkeypatch.setattr(adapter, '_set_run_status', lambda run_id, status, **kw: persisted.append(
+        json.dumps({'status': status, **kw}, default=str)))
+    started = asyncio.Event()
+
+    async def scoped(self, run, *, _api_server):
+        assert current_environment() is scope
+        if outcome == 'completed':
+            self._set_run_status(run.run_id, 'completed', output='ok')
+            return
+        try:
+            started.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self._set_run_status(run.run_id, 'cancelled')
+            raise
+    monkeypatch.setattr(runs, '_execute_run_scoped', scoped)
+    loop_errors = []
+    asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: loop_errors.append(ctx))
+
+    task = asyncio.ensure_future(runs._execute_run(adapter, run, _api_server=api_server))
+    if outcome == 'completed':
+        assert await task is None
+    else:
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+
+    assert visited == ['failed', 'other']
+    with pytest.raises(RuntimeError, match='authority has ended'):
+        scope.spawn(lambda env: None, lambda proc: None)
+    assert [json.loads(p)['status'] for p in persisted] == [outcome]
+    assert 'teardown unconfirmed' in caplog.text
+    assert SECRET not in caplog.text
+    assert not any(r.exc_info for r in caplog.records)
+    assert SECRET not in ''.join(persisted)
+    assert not loop_errors
+    assert current_environment() is None
+
+
+@pytest.mark.asyncio
 async def test_approval_literal_redacted_before_status_and_sse(monkeypatch):
     adapter = _make_adapter()
     scope = RunEnvironment({'PAPERCLIP_API_KEY': SECRET})
