@@ -27,7 +27,15 @@ _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete",
 
 def _default_dispatch(task_id):
     from model_tools import handle_function_call
-    return lambda tool_name, tool_args: handle_function_call(tool_name, tool_args, task_id=task_id)
+    from agent.deadline import tool_budget
+
+    def dispatch(tool_name, tool_args):
+        # Per-call local and remote RPC inherit the enclosing execute_code
+        # context, whose executor budget does not cover the cell's own bound.
+        with tool_budget(None):
+            return handle_function_call(tool_name, tool_args, task_id=task_id)
+
+    return dispatch
 
 
 def _rpc_token_ok(request: dict, rpc_token: str) -> bool:

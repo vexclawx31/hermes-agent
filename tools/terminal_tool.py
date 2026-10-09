@@ -73,6 +73,9 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
 
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
+# Outer-deadline headroom a sibling rollout needs beyond its protected sink bound: admission, finalization
+# and pre-dispatch middleware.
+SIBLING_ROLLOUT_OUTER_MARGIN_S = 120
 
 # Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_GB", 500.0, float, "number")
@@ -1290,13 +1293,31 @@ def terminal_tool(
         if sibling_argv:
             if background or pty or workdir is not None or plan.promoted_from_foreground_timeout is not None:
                 raise _Rejected(_error_json('Sibling control requires foreground without PTY.', status='blocked'))
+            rollout_timeout = getattr(sibling_argv, 'timeout', None)
+            if rollout_timeout:
+                # The executor abandons a tool at its own deadline, and the root transaction would run on.
+                # Admit a rollout only if the published outer budget contains the whole sink bound plus a
+                # margin. An unknown budget (an executor that publishes none) refuses. Checked before
+                # approval, so no prompt and no subprocess.
+                from agent.deadline import current_tool_budget
+                needed = rollout_timeout + SIBLING_ROLLOUT_OUTER_MARGIN_S
+                budget = current_tool_budget()
+                if budget is None or not budget.covers(needed):
+                    have = 'unknown' if budget is None else f'{budget.remaining():.0f}s'
+                    raise _Rejected(_error_json(
+                        f'Sibling rollout needs an outer tool deadline of at least {needed:.0f}s (available: {have}); '
+                        'configure timeouts.tools.sequential_call and timeouts.tools.concurrent_batch. Command not run.',
+                        status='blocked'))
             verdict = _run_approval_guards(command, env_type, plan.config, force=force)
             import subprocess as _sp
             logger.info('Sibling control admitted argv=%r approval=%r', sibling_argv, verdict.note)
+            # status/restart keep the 60 s bound. A rollout request carries the protected policy's
+            # bound, sized to cover the whole operation; caller timeouts cannot shorten it.
+            sink_timeout = getattr(sibling_argv, 'timeout', None) or min(plan.effective_timeout, 60)
             try:
                 completed = _sp.run(
-                    sibling_argv, shell=False, capture_output=True, text=True, encoding='utf-8', errors='replace',
-                    timeout=min(plan.effective_timeout, 60), cwd='/',
+                    list(sibling_argv), shell=False, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                    timeout=sink_timeout, cwd='/',
                     env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C'},
                 )
             except _sp.TimeoutExpired:

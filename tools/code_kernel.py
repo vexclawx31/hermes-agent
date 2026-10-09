@@ -274,7 +274,11 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            # The copied context contains execute_code's executor budget, not the
+            # shorter cell deadline. Clear it INSIDE that copied context.
+            from agent.deadline import tool_budget
+            with tool_budget(None):
+                return handle_function_call(tool_name, tool_args, task_id=self.task_id)
         finally:
             if previous is not None:
                 try:

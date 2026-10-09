@@ -894,12 +894,17 @@ def _run_sequential_tool_execution_middleware(
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
+    from agent.deadline import ToolBudget, tool_budget
     if prepared is None:
         authorization_gate = _ConcurrentToolAuthorizationGate()
         worker_tid: list[int] = []
+        budget = ToolBudget(timeout_s)
+    else:
+        # The prepared worker published this object when it started; arming it below updates what it sees.
+        budget = prepared.budget if prepared.budget is not None else ToolBudget(timeout_s)
 
     def _run() -> _ManagedToolResult:
-        with _registered_tool_worker(agent) as tid:
+        with _registered_tool_worker(agent) as tid, tool_budget(budget):
             worker_tid.append(tid)
             return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
 
@@ -909,6 +914,8 @@ def _run_sequential_tool_execution_middleware(
         executor = DaemonThreadPoolExecutor(max_workers=1)
         future = executor.submit(propagate_context_to_thread(_run))
     deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+    # The tool sees exactly the deadline this loop enforces (approval waits excluded, as below).
+    budget.arm(timeout_s, deadline, authorization_gate.excluded_seconds)
     started = time.monotonic()
     abandoned = False
     try:
@@ -1262,6 +1269,7 @@ class _ConcurrentBatch:
         self.gate = _StartOrderGate(_start_order_gate_timeout(timeout_s))
         self.authorization_gate = _ConcurrentToolAuthorizationGate()
         self.timed_out_indices: set[int] = set()
+        self.deadline: float | None = None  # monotonic; set by run() before any worker is submitted
 
     def _dispatch_worker(self, index: int, ref: _ToolCallRef, scope_block, start_gate: _WorkerStartOnce) -> Optional[_ToolOutcome]:
         """Run one call through the middleware and synthesize its slot outcome; ``None`` when
@@ -1326,8 +1334,13 @@ class _ConcurrentBatch:
                 _interrupt_worker_tids(agent, [_worker_tid], reason=getattr(agent, "_tool_interrupt_reason", None))
             _set_worker_activity_callback(agent)
             start_gate = _WorkerStartOnce(self.gate, start_order, pc.name)
+            from agent.deadline import ToolBudget, tool_budget
+            # The batch deadline is shared: a worker that starts late sees only what remains of it.
+            budget = ToolBudget(self.timeout_s)
+            budget.arm(self.timeout_s, self.deadline, self.authorization_gate.excluded_seconds)
             try:
-                outcome = self._dispatch_worker(index, pc.ref(self.effective_task_id), pc.scope_block, start_gate)
+                with tool_budget(budget):
+                    outcome = self._dispatch_worker(index, pc.ref(self.effective_task_id), pc.scope_block, start_gate)
                 if outcome is not None:
                     self.results[index] = outcome
             finally:
@@ -1427,6 +1440,7 @@ class _ConcurrentBatch:
         if not runnable:
             return
         deadline = time.monotonic() + self.timeout_s if self.timeout_s is not None else None
+        self.deadline = deadline
         max_workers = _max_workers_for_tool_batch([(i, None, self.parsed_calls[i].name) for i in runnable])
         # Daemon workers: the stdlib pool's atexit join would let one wedged tool block exit.
         from tools.daemon_pool import DaemonThreadPoolExecutor
