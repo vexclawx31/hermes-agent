@@ -893,10 +893,17 @@ def handle_function_call(
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
 
+    from gateway.runtime_context import current_environment
+    run_environment = current_environment()
+
+    def _redact_run(value):
+        return run_environment.redact(value) if run_environment else value
+
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
-        _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
-                                  **asdict(ids), middleware_trace=list(trace), **extra)
+        result = _redact_run(result)
+        _emit_post_tool_call_hook(function_name=function_name, function_args=_redact_run(function_args), result=result,
+                                  **asdict(ids), middleware_trace=_redact_run(list(trace)), **_redact_run(extra))
         return result
 
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
@@ -955,8 +962,9 @@ def handle_function_call(
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
         duration_ms = _elapsed_ms(start)
-        _emit(result, duration_ms=duration_ms)
-        return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+        result = _emit(result, duration_ms=duration_ms)
+        return _redact_run(_apply_transform_tool_result_hook(
+            function_name, _redact_run(function_args), result, duration_ms, ids))
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
