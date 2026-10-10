@@ -21,6 +21,8 @@ NAME = r'[a-z][a-z0-9_-]*'
 HEX64 = r'[0-9a-f]{64}'
 # Rollout operation -> number of digest arguments (plan; plan + receipt).
 ROLLOUT_DIGESTS = {'apply': 1, 'rollback': 2}
+# Consumer operation -> number of digest arguments; a distinct verb, so a consumer request is never a rollout.
+CONSUMER_DIGESTS = {'consumers-apply': 1, 'consumers-rollback': 2}
 ROLLOUT_TIMEOUT = (60, 3600)
 
 
@@ -51,7 +53,8 @@ def validate_policy(value):
     if not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] not in (2, 3):
         raise ValueError('invalid schema')
     keys = {'schema', 'profile', 'own_target', 'helper', 'targets'} | ({'rollout'} if value['schema'] == 3 else set())
-    if set(value) != keys:
+    # Schema 3 may add the optional, closed `consumers` list; schema 2 never has it.
+    if set(value) not in (keys, keys | {'consumers'} if value['schema'] == 3 else keys):
         raise ValueError('invalid policy shape')
     if not isinstance(value['profile'], str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', value['profile']):
         raise ValueError('invalid profile')
@@ -69,10 +72,35 @@ def validate_policy(value):
         if type(timeout) is not int or not ROLLOUT_TIMEOUT[0] <= timeout <= ROLLOUT_TIMEOUT[1]:
             raise ValueError('invalid rollout timeout')
         _validate_targets(rollout['targets'], own, 'rollout targets')
-        # One registry entry per service: restartable and rollout services stay disjoint.
-        if set(rollout['targets']) & set(targets) or set(rollout['targets'].values()) & set(targets.values()):
-            raise ValueError('rollout overlaps restart targets')
+        # A service may appear in both registries only under the identical name -> identical service mapping,
+        # so one name never means two services and one service never has two names.
+        rollout_targets = rollout['targets']
+        shared_names = set(rollout_targets) & set(targets)
+        shared_services = set(rollout_targets.values()) & set(targets.values())
+        if (any(rollout_targets[name] != targets[name] for name in shared_names)
+                or shared_services != {targets[name] for name in shared_names}):
+            raise ValueError('rollout overlaps restart targets with a different mapping')
+        if 'consumers' in value:
+            _validate_consumers(value)
     return value
+
+
+def _validate_consumers(value):
+    """Consumer names are bare aliases for non-gateway runtime consumers (no launchd service is implied). They
+    must be distinct from every restart/rollout name and from the hosting profile, so a name selects exactly
+    one registry and an operation can never be mistaken for another."""
+    consumers = value['consumers']
+    if not isinstance(consumers, dict) or set(consumers) != {'names', 'timeout_seconds'}:
+        raise ValueError('invalid consumers shape')
+    names, timeout = consumers['names'], consumers['timeout_seconds']
+    if type(timeout) is not int or not ROLLOUT_TIMEOUT[0] <= timeout <= ROLLOUT_TIMEOUT[1]:
+        raise ValueError('invalid consumers timeout')
+    if (not isinstance(names, list) or not names or len(set(names)) != len(names)
+            or not all(isinstance(n, str) and re.fullmatch(NAME, n) for n in names)):
+        raise ValueError('invalid consumer names')
+    taken = set(value['targets']) | set(value['rollout']['targets']) | {value['profile']}
+    if set(names) & taken:
+        raise ValueError('consumer name collides with a service name or the hosting profile')
 
 
 def load_policy(path):
@@ -133,11 +161,24 @@ def _rollout_request(policy, operation, digests, names):
     return Request(['/usr/bin/sudo', '-n', policy['helper'], operation, *digests, ','.join(names)], rollout['timeout_seconds'])
 
 
+def _consumer_request(policy, operation, digests, names):
+    """Exact consumer argv for a name set drawn only from the protected consumers list."""
+    consumers = policy.get('consumers') if policy['schema'] == 3 else None
+    if consumers is None or operation not in CONSUMER_DIGESTS:
+        raise ValueError('unsupported request')
+    if len(digests) != CONSUMER_DIGESTS[operation] or not all(isinstance(d, str) and re.fullmatch(HEX64, d) for d in digests):
+        raise ValueError('invalid digest')
+    if not names or len(set(names)) != len(names) or any(name not in consumers['names'] for name in names):
+        raise ValueError('consumer set outside the consumers list')
+    return Request(['/usr/bin/sudo', '-n', policy['helper'], operation, *digests, ','.join(names)], consumers['timeout_seconds'])
+
+
 def _parse_rollout(policy, command):
     tokens = command.split(' ')
     if len(tokens) < 6 or tokens[:3] != ['/usr/bin/sudo', '-n', policy['helper']]:
         raise ValueError('not a rollout request')
-    request = _rollout_request(policy, tokens[3], tokens[4:-1], tokens[-1].split(','))
+    build = _consumer_request if tokens[3] in CONSUMER_DIGESTS else _rollout_request
+    request = build(policy, tokens[3], tokens[4:-1], tokens[-1].split(','))
     if ' '.join(request) != command:
         raise ValueError('non-canonical rollout request')
     return request
@@ -157,12 +198,19 @@ def canonical_rollout_request(policy_path, *, runtime_profile, runtime_service, 
     return _rollout_request(policy, operation, list(digests), list(names))
 
 
+def canonical_consumer_request(policy_path, *, runtime_profile, runtime_service, operation, digests, names):
+    policy = load_policy(policy_path)
+    if runtime_profile != policy['profile'] or runtime_service != policy['own_target']:
+        raise ValueError('runtime identity mismatch')
+    return _consumer_request(policy, operation, list(digests), list(names))
+
+
 def is_candidate(command):
     # Generic absolute sudo helper syntax; fleet paths remain in protected data.
     names = NAME + '(?:,' + NAME + ')*'
     return sys.platform == 'darwin' and bool(re.fullmatch(
-        r'/usr/bin/sudo -n /[A-Za-z0-9_./-]+ (?:(?:status|restart) ' + NAME + '|apply ' + HEX64 + ' ' + names
-        + '|rollback ' + HEX64 + ' ' + HEX64 + ' ' + names + ')', command))
+        r'/usr/bin/sudo -n /[A-Za-z0-9_./-]+ (?:(?:status|restart) ' + NAME + '|(?:consumers-)?apply ' + HEX64 + ' ' + names
+        + '|(?:consumers-)?rollback ' + HEX64 + ' ' + HEX64 + ' ' + names + ')', command))
 
 
 def _hosting_identity(own):

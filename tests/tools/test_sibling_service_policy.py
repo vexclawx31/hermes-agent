@@ -553,6 +553,129 @@ def test_real_prepared_terminal_slot_publishes_and_arms_budget(executors, monkey
     assert prepared.budget.timeout_s == 700 and 690 < prepared.budget.remaining() <= 700
 
 
+SHARED = {**POLICY3, 'rollout': {'targets': {'one': 'gui/501/example.one', 'sibling': 'system/example.sibling'},
+                                  'timeout_seconds': 1500}}
+
+
+def test_identical_overlap_is_valid_and_admits_both_operations(rollout, admission):
+    assert p.validate_policy(copy.deepcopy(SHARED))['rollout']['targets']['sibling'] == POLICY['targets']['sibling']
+    admission.return_value = copy.deepcopy(SHARED)
+    json.loads(t.terminal_tool(COMMAND))                                    # restart sibling: unchanged scope
+    json.loads(t.terminal_tool(HELPER + 'apply ' + PLAN + ' one,sibling'))   # the same service, now rollout-eligible
+    assert [c.args[0][3:] for c in rollout.sink.call_args_list] == [['restart', 'sibling'], ['apply', PLAN, 'one,sibling']]
+    assert rollout.approval.call_count == 2
+
+
+@pytest.mark.parametrize('rollout_targets', [
+    {'sibling': 'gui/501/example.other'},                                     # same name, different service
+    {'alias': 'system/example.sibling'},                                      # same service, different name
+    {'sibling': 'system/example.sibling', 'alias': 'system/example.sibling'},  # one service, two names
+    {'sibling': 'system/example.sibling', 'host': 'gui/501/example.host'}])    # hosting label still refused
+def test_conflicting_overlap_refused(rollout_targets):
+    with pytest.raises(ValueError):
+        p.validate_policy({**POLICY3, 'rollout': {'targets': rollout_targets, 'timeout_seconds': 600}})
+
+
+def test_shared_name_does_not_widen_mixed_or_unknown_sets(rollout, admission):
+    admission.return_value = copy.deepcopy(SHARED)
+    for command in (HELPER + 'apply ' + PLAN + ' sibling,unknown', HELPER + 'apply ' + PLAN + ' sibling,host',
+                    HELPER + 'apply ' + PLAN + ' sibling,sibling', HELPER + 'restart one'):
+        assert json.loads(t.terminal_tool(command, force=True))['status'] == 'blocked'
+    rollout.sink.assert_not_called()
+
+
+# ---- schema 3 optional consumers list ----
+
+CONSUMED = {**POLICY3, 'consumers': {'names': ['viewer', 'tool-cli'], 'timeout_seconds': 1500}}
+
+
+@pytest.mark.parametrize('command,argv', [
+    (HELPER + 'consumers-apply ' + PLAN + ' viewer,tool-cli', ['consumers-apply', PLAN, 'viewer,tool-cli']),
+    (HELPER + 'consumers-rollback ' + PLAN + ' ' + RECEIPT + ' tool-cli', ['consumers-rollback', PLAN, RECEIPT, 'tool-cli'])])
+def test_consumer_requests_admitted_with_protected_timeout(rollout, admission, command, argv):
+    admission.return_value = copy.deepcopy(CONSUMED)
+    result = json.loads(t.terminal_tool(command))
+    rollout.sink.assert_called_once_with(['/usr/bin/sudo', '-n', POLICY['helper'], *argv],
+        shell=False, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=1500, cwd='/', env=p.ENV)
+    rollout.approval.assert_called_once()
+    assert result['service_control'] and not result['health_verified']
+
+
+@pytest.mark.parametrize('command', [
+    HELPER + 'consumers-apply ' + PLAN + ' viewer,unknown',      # mixed
+    HELPER + 'consumers-apply ' + PLAN + ' one',                 # a rollout name is not a consumer
+    HELPER + 'apply ' + PLAN + ' viewer',                        # a consumer name is not a rollout target
+    HELPER + 'restart viewer',                                   # nor restartable
+    HELPER + 'consumers-apply ' + PLAN + ' viewer,viewer',
+    HELPER + 'consumers-apply ' + PLAN + ' fixture',             # the hosting profile
+    HELPER + 'consumers-rollback ' + PLAN + ' viewer',           # missing receipt digest
+    HELPER + 'consumers-apply ' + PLAN.upper() + ' viewer'])
+def test_consumer_refusals_use_original_guard(rollout, admission, command):
+    admission.return_value = copy.deepcopy(CONSUMED)
+    assert json.loads(t.terminal_tool(command, force=True))['status'] == 'blocked'
+    rollout.sink.assert_not_called()
+
+
+def test_policies_without_consumers_never_admit_consumer_requests(rollout, admission):
+    for policy in (POLICY3, POLICY):
+        admission.return_value = copy.deepcopy(policy)
+        assert json.loads(t.terminal_tool(HELPER + 'consumers-apply ' + PLAN + ' viewer', force=True))['status'] == 'blocked'
+    rollout.sink.assert_not_called()
+
+
+@pytest.mark.parametrize('status', ['blocked', 'pending_approval'])
+def test_consumer_denial_and_pending_never_execute(rollout, admission, status):
+    admission.return_value = copy.deepcopy(CONSUMED)
+    rollout.approval.side_effect = t._Rejected(json.dumps({'status': status}))
+    assert json.loads(t.terminal_tool(HELPER + 'consumers-apply ' + PLAN + ' viewer'))['status'] == status
+    rollout.sink.assert_not_called()
+
+
+def test_consumer_request_needs_an_outer_budget_and_refuses_credential_runs(pipeline, admission):
+    admission.return_value = copy.deepcopy(CONSUMED)
+    command = HELPER + 'consumers-apply ' + PLAN + ' viewer'
+    assert 'outer tool deadline' in json.loads(t.terminal_tool(command))['error']          # unknown budget
+    from gateway.runtime_context import bind_environment, validate_environment
+    scope = validate_environment({'PAPERCLIP_API_KEY': 'synthetic-consumer-unit-12345'},
+        {'gateway': {'api_server': {'run_environment_allowlist': ['PAPERCLIP_API_KEY']}}}, 'local')
+    with bind_environment(scope), tool_budget(ToolBudget(None)):
+        assert 'credential runs' in json.loads(t.terminal_tool(command))['error']
+    pipeline.approval.assert_not_called()
+    pipeline.sink.assert_not_called()
+
+
+@pytest.mark.parametrize('consumers', [
+    {'names': ['viewer'], 'timeout_seconds': 59},
+    {'names': ['viewer']},
+    {'names': [], 'timeout_seconds': 600},
+    {'names': ['viewer', 'viewer'], 'timeout_seconds': 600},
+    {'names': ['Viewer'], 'timeout_seconds': 600},
+    {'names': ['sibling'], 'timeout_seconds': 600},     # restart name
+    {'names': ['one'], 'timeout_seconds': 600},         # rollout name
+    {'names': ['fixture'], 'timeout_seconds': 600},     # hosting profile
+    {'names': ['viewer'], 'timeout_seconds': 600, 'services': {}}])
+def test_consumers_list_rejections(consumers):
+    with pytest.raises(ValueError):
+        p.validate_policy({**POLICY3, 'consumers': consumers})
+
+
+def test_consumers_key_is_schema3_only_and_optional():
+    assert p.validate_policy(copy.deepcopy(CONSUMED))['consumers']['names'] == ['viewer', 'tool-cli']
+    assert p.validate_policy(copy.deepcopy(POLICY3)) and p.validate_policy(copy.deepcopy(POLICY))
+    with pytest.raises(ValueError):
+        p.validate_policy({**POLICY, 'consumers': CONSUMED['consumers']})
+
+
+def test_canonical_consumer_request_binds_runtime_identity(monkeypatch):
+    monkeypatch.setattr(p, 'load_policy', lambda path: copy.deepcopy(CONSUMED))
+    request = p.canonical_consumer_request('/fixture', runtime_profile='fixture', runtime_service=POLICY['own_target'],
+                                           operation='consumers-apply', digests=[PLAN], names=['viewer'])
+    assert ' '.join(request) == HELPER + 'consumers-apply ' + PLAN + ' viewer' and request.timeout == 1500
+    with pytest.raises(ValueError, match='identity'):
+        p.canonical_consumer_request('/fixture', runtime_profile='other', runtime_service=POLICY['own_target'],
+                                     operation='consumers-apply', digests=[PLAN], names=['viewer'])
+
+
 def test_canonical_rollout_request_binds_runtime_identity(monkeypatch):
     monkeypatch.setattr(p, 'load_policy', lambda path: copy.deepcopy(POLICY3))
     request = p.canonical_rollout_request('/fixture', runtime_profile='fixture', runtime_service=POLICY['own_target'],
