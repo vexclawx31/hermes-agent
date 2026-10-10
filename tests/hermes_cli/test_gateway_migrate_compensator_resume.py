@@ -68,6 +68,11 @@ def stranded(tmp_path, monkeypatch):
 
     import gateway.status as status
     monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
+    # Stand-in only: a bare argv is identified by its LAUNCH environment, and for this pytest PID that is
+    # whatever launched pytest, not the HERMES_HOME set above. Pin it to the default launch home.
+    real_launch_home = status._read_process_launch_home
+    monkeypatch.setattr(status, "_read_process_launch_home",
+                        lambda pid: ("absent", None) if pid == os.getpid() else real_launch_home(pid))
     monkeypatch.setattr(gm, "_installed_services", lambda home: [])
     monkeypatch.setattr(gm, "_service_op", _service_op)
     monkeypatch.setattr(gm, "_host_supports_migration", lambda: None)

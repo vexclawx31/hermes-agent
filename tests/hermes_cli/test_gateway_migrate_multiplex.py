@@ -73,6 +73,11 @@ def fleet(tmp_path, monkeypatch):
     import gateway.status as status
     # The default gateway the fixture "starts" is this process; the served probe verifies identity.
     monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
+    # ...and by its LAUNCH environment, which for this pytest PID is whatever launched pytest, not the
+    # fixture's HERMES_HOME. Pin the stand-in to the default launch home; other PIDs are read for real.
+    real_launch_home = status._read_process_launch_home
+    monkeypatch.setattr(status, "_read_process_launch_home",
+                        lambda pid: ("absent", None) if pid == os.getpid() else real_launch_home(pid))
     monkeypatch.setattr(gm, "_installed_services", lambda home: _units(state.services.get(_name(home))))
     monkeypatch.setattr(gm, "_live_gateway_pid", lambda home: state.pids.get(_name(home)))
     monkeypatch.setattr(gm, "_service_op", _service_op)

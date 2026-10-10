@@ -640,6 +640,42 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     return not hermes_home_assignments(command_lc) or command_line_names_hermes_home(command_lc, home_lc)
 
 
+def _read_process_launch_home(pid: int) -> tuple[str, Optional[str]]:
+    """``("home", value)``, ``("absent", None)`` or ``("unreadable", None)`` for the live process's
+    ``HERMES_HOME``. Only that one value is ever taken from the environment; nothing else is kept or
+    logged. ``environ()`` can be denied even for the same user, and an unreadable environment proves
+    nothing."""
+    try:
+        import psutil  # type: ignore
+        value = (psutil.Process(pid).environ() or {}).get("HERMES_HOME")
+    except Exception:
+        return "unreadable", None
+    if value is None:
+        return "absent", None
+    return ("home", value) if value.strip() else ("unreadable", None)
+
+
+def _live_gateway_belongs_to_profile(pid: int, command: str, profile_home: Path) -> bool:
+    """Profile ownership of a live gateway PID.
+
+    An explicit argv selector (``-p``/``--profile`` or ``HERMES_HOME=``) is authoritative, as before.
+    A bare argv says nothing about the home: a peer launched as ``python -m hermes_cli.main gateway
+    run`` with ``HERMES_HOME`` in its launch environment is identified by that environment — it
+    belongs to exactly that home, and the default home cannot claim it. No ``HERMES_HOME`` means the
+    default launch home. An unreadable environment keeps the argv-only rule, which never lets a bare
+    argv claim a named profile."""
+    command_lc = command.lower().replace("\\", "/")
+    if profile_flag_value(command_lc) is not None or hermes_home_assignments(command_lc):
+        return _command_line_belongs_to_profile(command, profile_home)
+    state, launch_home = _read_process_launch_home(pid)
+    if state == "home":
+        try:
+            return _same_hermes_home(launch_home, profile_home)
+        except Exception:
+            return False
+    return _command_line_belongs_to_profile(command, profile_home)
+
+
 def _host_gateway_serves_home(pid: int, profile_home: Path) -> bool:
     """Does the ONE host gateway — PID ``pid`` — serve ``profile_home``'s profile?
 
@@ -671,7 +707,7 @@ def _record_matches_live_gateway_pid(
         return False
     if expected_home is not None and _host_gateway_serves_home(pid, expected_home):
         return True
-    return expected_home is None or _command_line_belongs_to_profile(live_cmdline, expected_home)
+    return expected_home is None or _live_gateway_belongs_to_profile(pid, live_cmdline, expected_home)
 
 
 def _build_pid_record() -> dict:

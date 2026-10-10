@@ -35,6 +35,11 @@ def served_root(tmp_path, monkeypatch):
     # Liveness is a verified identity; this pytest process passes as the default gateway only by
     # wearing a gateway command line.
     monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
+    # ...and by its LAUNCH environment, which for this pytest PID is whatever launched pytest, not the
+    # HERMES_HOME set above. Pin the stand-in to the default launch home; other PIDs are read for real.
+    real_launch_home = status._read_process_launch_home
+    monkeypatch.setattr(status, "_read_process_launch_home",
+                        lambda pid: ("absent", None) if pid == os.getpid() else real_launch_home(pid))
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
     return root
 
