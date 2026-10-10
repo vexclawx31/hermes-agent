@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MAX_SAFE_TIMEOUT_S", "BoundedResult", "DeadlineExpired", "clamp_timeout", "resolve_timeout",
     "run_bounded_async", "run_bounded_sync", "kill_process_tree",
+    "ToolBudget", "tool_budget", "current_tool_budget",
 ]
 
 # One year: semantically "unbounded" yet far below any platform time_t limit (#83220).
@@ -161,6 +162,59 @@ def resolve_timeout(key: str, *, default: Optional[float], env_var: Optional[str
                 logger.warning("invalid %s=%r; ignoring", env_var, env_raw)
 
     return clamp_timeout(default)
+
+
+# --- Outer tool-call budget -----------------------------------------------------
+# Trusted execution context: only the tool executors publish it, on the worker that runs the tool. A tool
+# that must finish inside the executor's deadline (instead of being abandoned mid-operation) reads it.
+
+
+class ToolBudget:
+    """The executor's deadline for the current tool call.
+
+    ``timeout_s`` is the outer bound the executor enforces (None = it arms no deadline). ``arm()`` binds
+    the monotonic deadline and the approval-wait exclusion once the executor starts its clock. Before
+    that, the whole bound is still ahead. ``remaining()`` mirrors the executors' own expiry test:
+    ``deadline + excluded() - now``. Human approval waits extend it, and None means unbounded."""
+
+    def __init__(self, timeout_s: Optional[float]):
+        self.timeout_s = clamp_timeout(timeout_s)
+        self._deadline: Optional[float] = None
+        self._excluded: Callable[[], float] = lambda: 0.0
+
+    def arm(self, timeout_s: Optional[float], deadline: Optional[float], excluded: Callable[[], float]) -> None:
+        self.timeout_s = clamp_timeout(timeout_s)
+        self._deadline = deadline if self.timeout_s is not None else None
+        self._excluded = excluded
+
+    def remaining(self) -> Optional[float]:
+        if self.timeout_s is None:
+            return None
+        if self._deadline is None:
+            return self.timeout_s
+        return self._deadline + self._excluded() - time.monotonic()
+
+    def covers(self, seconds: float) -> bool:
+        remaining = self.remaining()
+        return remaining is None or remaining >= seconds
+
+
+_TOOL_BUDGET: contextvars.ContextVar[Optional[ToolBudget]] = contextvars.ContextVar("hermes_tool_budget", default=None)
+
+
+@contextmanager
+def tool_budget(budget: Optional[ToolBudget]):
+    """Publish an executor budget, or clear it at a nested caller with a different bound."""
+    token = _TOOL_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _TOOL_BUDGET.reset(token)
+
+
+def current_tool_budget() -> Optional[ToolBudget]:
+    """The executor's budget for this tool call, or None when the caller publishes none (unknown bound)."""
+    return _TOOL_BUDGET.get()
 
 
 # --- Bounded execution — async flavor ------------------------------------------

@@ -36,6 +36,7 @@ class _TerminalSlot:
         self.decision = None
         self.guard_key = None
         self.claimed = False
+        self.budget = None  # agent.deadline.ToolBudget, published to the worker; armed by the sequential runner
 
     def check_cancelled(self):
         if self.batch.cancelled.is_set() or self.batch.agent._interrupt_requested:
@@ -70,11 +71,12 @@ class _TerminalSlot:
 
     def run(self):
         from agent import tool_executor as te
+        from agent.deadline import tool_budget
         token = _slot.set(self)
         pc, batch = self.parsed, self.batch
         ref = pc.ref(batch.task_id)
         try:
-            with te._registered_tool_worker(batch.agent) as tid:
+            with te._registered_tool_worker(batch.agent) as tid, tool_budget(self.budget):
                 self.tids.append(tid)
                 self.check_cancelled()
                 dispatch = te._resolve_sequential_dispatch(batch.agent, ref, batch.messages)
@@ -100,11 +102,13 @@ class _TerminalBatch:
         self.slots = [_TerminalSlot(self, pc, i) for i, pc in enumerate(parsed)]
 
     def start(self):
+        from agent.deadline import ToolBudget
         from agent.tool_executor import _resolve_sequential_tool_timeout
         for slot in self.slots:
             slot.check_cancelled()
-            slot.future = self.executor.submit(propagate_context_to_thread(slot.run))
             timeout = _resolve_sequential_tool_timeout()
+            slot.budget = ToolBudget(timeout)
+            slot.future = self.executor.submit(propagate_context_to_thread(slot.run))
             started = time.monotonic()
             baseline = self.authorization_gate.excluded_seconds()
             # Proceed once the worker publishes a human request OR completes
