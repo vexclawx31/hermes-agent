@@ -168,6 +168,11 @@ def test_live_record_outranks_the_raw_flag_for_other_processes(fleet, monkeypatc
     root, _services, _pids = fleet
     import gateway.status as status
     monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
+    # Stand-in only: a bare argv is identified by its LAUNCH environment, and for this pytest PID that is
+    # whatever launched pytest, not the fixture's HERMES_HOME. Pin it to the default launch home.
+    real_launch_home = status._read_process_launch_home
+    monkeypatch.setattr(status, "_read_process_launch_home",
+                        lambda pid: ("absent", None) if pid == os.getpid() else real_launch_home(pid))
     (root / "gateway.pid").write_text(json.dumps({"pid": os.getpid(), "hermes_home": str(root)}))
     record = {"pid": os.getpid(), "hermes_home": str(root), "gateway_state": "running", "served_profiles": []}
     (root / "gateway_state.json").write_text(json.dumps(record))

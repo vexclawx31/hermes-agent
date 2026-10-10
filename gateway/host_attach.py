@@ -137,6 +137,22 @@ def _identity_matches(identity, record, home: Path) -> bool:
     """
     if not isinstance(identity, dict) or identity.get("pid") != record.pid:
         return False
+    # A reported start time must be this PID's live incarnation (a recycled PID never answers for it).
+    reported_start = identity.get("start_time")
+    if reported_start is not None:
+        try:
+            from gateway.status import get_process_start_time, start_time_fingerprints_match
+
+            live_start = get_process_start_time(record.pid)
+            if live_start is None or not start_time_fingerprints_match(reported_start, live_start):
+                return False
+        except Exception:
+            return False
+    # An answer without a served set (a standalone gateway, or one predating the field) is taken as
+    # serving its own profile only when that profile is the one this home belongs to.
+    if not isinstance(identity.get("served_profiles"), list) and identity.get("profile") is not None:
+        if _normalize(str(identity.get("profile"))) != _normalize(profile_name_for_home(home)):
+            return False
     reported = identity.get("hermes_home")
     if not reported:
         return True  # older gateway: PID + a socket keyed by this home is all it can prove

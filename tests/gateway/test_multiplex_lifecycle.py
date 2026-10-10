@@ -99,6 +99,12 @@ class TestNamedProfileMultiplexerGuard:
         (tmp_path / "gateway_state.json").write_text(json.dumps(
             {"pid": os.getpid(), "hermes_home": str(tmp_path), "gateway_state": "running"}))
         monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
+        # Stand-in only: a bare argv is identified by its LAUNCH environment, and for this pytest PID that
+        # is whatever launched pytest (an exported HERMES_HOME), not the per-test HERMES_HOME. Pin the
+        # stand-in's launch home to "absent" (the default launch home); every other PID is read for real.
+        real_launch_home = status._read_process_launch_home
+        monkeypatch.setattr(status, "_read_process_launch_home",
+                            lambda pid: ("absent", None) if pid == os.getpid() else real_launch_home(pid))
 
     def test_unset_allowlist_preserves_historical_guard(self, monkeypatch, tmp_path):
         self._fake_running_default_gateway(monkeypatch, tmp_path)
