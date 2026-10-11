@@ -26,7 +26,8 @@ SECRET = 'synthetic-sibling-refusal-12345'
 
 
 @pytest.mark.asyncio
-async def test_credential_run_refuses_sibling_control_end_to_end(monkeypatch):
+@pytest.mark.parametrize('admin', [False, True])
+async def test_credential_run_refuses_sibling_control_end_to_end(monkeypatch, admin):
     import model_tools
     import hermes_cli.config
     import tools.terminal_tool as terminal
@@ -43,10 +44,21 @@ async def test_credential_run_refuses_sibling_control_end_to_end(monkeypatch):
     monkeypatch.setattr(policy, '_hosting_identity', lambda own: True)
     monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: 'fixture')
     monkeypatch.setattr('gateway.status.get_running_pid', lambda **kw: os.getpid())
-    approval = Mock(return_value=terminal._ApprovalVerdict())
+    original_approval = terminal._run_approval_guards
+    approval = Mock(side_effect=(original_approval if admin else None),
+                    return_value=terminal._ApprovalVerdict())
     monkeypatch.setattr(terminal, '_run_approval_guards', approval)
     sink = Mock(return_value=SimpleNamespace(stdout='ok', stderr='', returncode=0))
     monkeypatch.setattr(subprocess, 'run', sink)
+    if admin:
+        import sys
+        from tools import run_admin_policy, run_admin_sink
+        monkeypatch.setattr(run_admin_policy, 'admit_run', lambda scope: not scope._closed)
+        original_helper = run_admin_sink.run_helper
+        def harmless_helper(scope, argv, **kwargs):
+            return original_helper(scope, [sys.executable, '-c',
+                'import os,sys; print("PAPERCLIP_API_KEY" in os.environ); sys.exit(3)'], **kwargs)
+        monkeypatch.setattr(run_admin_sink, 'run_helper', harmless_helper)
     results, scopes = {}, {}
 
     class Agent:
@@ -79,12 +91,19 @@ async def test_credential_run_refuses_sibling_control_end_to_end(monkeypatch):
             await wait_for(lambda: 'scoped' in results)
             refused = json.loads(results['scoped'])
             assert scopes['scoped'] is not None
-            assert refused['status'] == 'blocked'
-            assert 'credential runs' in refused['error']
-            assert 'service_control' not in refused
-            # Refusal precedes protected-policy admission, approval and the helper sink.
-            loader.assert_not_called()
-            approval.assert_not_called()
+            if admin:
+                assert refused['service_control'] and refused['exit_code'] == 3
+                assert refused['output'].strip() == 'False'
+                loader.assert_called_once()
+                approval.assert_called_once()
+                assert not scopes['scoped']._processes
+                loader.reset_mock(); approval.reset_mock()
+            else:
+                assert refused['status'] == 'blocked'
+                assert 'credential runs' in refused['error']
+                assert 'service_control' not in refused
+                loader.assert_not_called()
+                approval.assert_not_called()
             sink.assert_not_called()
 
             # Same command, no credential scope: sibling admission still runs the helper.

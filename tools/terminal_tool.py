@@ -1282,8 +1282,11 @@ def terminal_tool(
         # Fail closed: sibling service control never runs under run credential authority, and the
         # refusal precedes admission so the helper's fixed-env early return is never reached.
         if sibling_candidate and run_scope:
-            raise _Rejected(_error_json('Sibling control is unavailable in credential runs; command not run.',
-                                        status='blocked'))
+            from tools.run_admin_policy import admit_run
+            trusted = run_bounded_sync(lambda: admit_run(run_scope), 8, label='terminal.run-admin')
+            if trusted.timed_out or not trusted.value:
+                raise _Rejected(_error_json('Sibling control is unavailable in credential runs without authenticated admin admission; command not run.',
+                                            status='blocked'))
         admission = (run_bounded_sync(lambda: admit_terminal_command(command), 10,
                                       label='terminal.sibling-admission')
                      if sibling_candidate else None)
@@ -1315,11 +1318,21 @@ def terminal_tool(
             # bound, sized to cover the whole operation; caller timeouts cannot shorten it.
             sink_timeout = getattr(sibling_argv, 'timeout', None) or min(plan.effective_timeout, 60)
             try:
-                completed = _sp.run(
-                    list(sibling_argv), shell=False, capture_output=True, text=True, encoding='utf-8', errors='replace',
-                    timeout=sink_timeout, cwd='/',
-                    env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C'},
-                )
+                kwargs = dict(shell=False, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              timeout=sink_timeout, cwd='/',
+                              env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C'})
+                if run_scope:
+                    # Approval may outlive server authority; revalidate at the sink.
+                    from tools.run_admin_policy import admit_run
+                    trusted = run_bounded_sync(lambda: admit_run(run_scope), 8,
+                                               label='terminal.run-admin-final')
+                    if trusted.timed_out or not trusted.value:
+                        raise _Rejected(_error_json(
+                            'Admin authority no longer valid; command not run.', status='blocked'))
+                    from tools.run_admin_sink import run_helper
+                    completed = run_helper(run_scope, list(sibling_argv), **kwargs)
+                else:
+                    completed = _sp.run(list(sibling_argv), **kwargs)
             except _sp.TimeoutExpired:
                 logger.warning('Sibling control timed out argv=%r; outcome unknown', sibling_argv)
                 return json.dumps({'output': '', 'exit_code': None, 'timed_out': True,
