@@ -19,8 +19,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 def load_policy():
-    from tools.sibling_service_policy import load_policy as unused
-    path = Path(POLICY_PATH)
+    from tools.sibling_service_policy import profile_policy_path
+    path = profile_policy_path('run-admin.json', POLICY_PATH)
     directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
     try:
         for component in path.parts[1:-1]:

@@ -15,6 +15,28 @@ import subprocess
 import sys
 
 POLICY_PATH = '/Library/Hermes/managed/sibling-services.json'
+PROFILE_POLICY_ROOT = '/Library/Hermes/managed/profiles'
+
+
+def profile_policy_path(filename, legacy_path):
+    """Select protected profile data, never a path supplied by a task.
+
+    Existing default installations retain their legacy binding. Named profiles
+    require their own file and never inherit the default administrator policy.
+    An existing but unsafe profile file is selected and then refused by the
+    no-follow protected loader; it must never trigger a permissive fallback.
+    """
+    from hermes_cli.profiles import get_active_profile_name
+    profile = get_active_profile_name()
+    if not isinstance(profile, str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', profile):
+        raise ValueError('invalid runtime profile')
+    if filename not in {'sibling-services.json', 'run-admin.json'}:
+        raise ValueError('invalid policy filename')
+    path = Path(PROFILE_POLICY_ROOT) / profile / filename
+    if os.path.lexists(path) or profile != 'default':
+        return path
+    return Path(legacy_path)
+
 PATTERN = re.compile(r'(?:system|gui/(?:0|[1-9][0-9]*))/[A-Za-z0-9_.-]+')
 ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C'}
 NAME = r'[a-z][a-z0-9_-]*'
@@ -243,7 +265,7 @@ def admit_terminal_command(command):
     if not is_candidate(command):
         return False
     try:
-        policy = load_policy(POLICY_PATH)
+        policy = load_policy(profile_policy_path('sibling-services.json', POLICY_PATH))
         argv = next((_request(policy, name, op)
                      for name in policy['targets'] for op in ('status', 'restart')
                      if command == ' '.join(_request(policy, name, op))), None)
