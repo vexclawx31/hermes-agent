@@ -80,12 +80,12 @@ def _get_smart_policy() -> str:
 
 def _get_smart_policy_mode() -> str:
     """``approvals.smart_policy_mode``: ``append`` (default) or ``replace``."""
-    mode = _ctx._get_approval_config().get("smart_policy_mode", "append")
-    mode = mode.strip().lower() if isinstance(mode, str) else ""
+    raw = _ctx._get_approval_config().get("smart_policy_mode", "append")
+    mode = raw.strip().lower() if isinstance(raw, str) else ""
     if mode in _POLICY_MODES:
         return mode
     logger.warning("Smart approvals: approvals.smart_policy_mode=%r is not one of %s; using 'append'",
-                   mode, "/".join(_POLICY_MODES))
+                   raw, "/".join(_POLICY_MODES))
     return "append"
 
 

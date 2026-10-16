@@ -145,3 +145,26 @@ def test_running_background_work_suppresses_the_nudge(agent, monkeypatch):
     monkeypatch.setattr(stop_guard, "_work_still_running", lambda _agent: True)
     _result, seen = _run(instance, iter(["Tests started in the background. Shall I continue?"]))
     assert len(seen) == 1
+
+
+def test_unknown_session_identity_counts_as_running():
+    assert stop_guard._work_still_running(SimpleNamespace(session_id=None, _current_task_id="t")) is True
+
+
+def test_unbound_default_session_key_is_not_this_session(monkeypatch):
+    """An unbound context resolves to the shared "default" key; another session's live work
+    under that key must not be read as (or hide behind) this session's."""
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+    seen = {}
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setattr(process_registry, "has_active_processes", lambda _tid: False)
+    monkeypatch.setattr(process_registry, "has_active_for_session",
+                        lambda key: seen.setdefault("process_key", key) == "default")
+    monkeypatch.setattr(async_delegation, "has_live_for_session",
+                        lambda session_key="", parent_session_id="", **_: seen.update(
+                            delegation=(session_key, parent_session_id)) or False)
+    agent = SimpleNamespace(session_id="sess-1", _current_task_id="task-1")
+    assert stop_guard._work_still_running(agent) is False
+    assert "process_key" not in seen
+    assert seen["delegation"] == ("", "sess-1")

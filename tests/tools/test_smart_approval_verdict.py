@@ -75,9 +75,10 @@ def test_replace_mode_swaps_rules_but_keeps_trust_boundary(mock_call_llm, mock_c
 @patch("tools.approval_context._get_approval_config")
 @patch("agent.auxiliary_client.call_llm")
 def test_unknown_policy_mode_warns_and_appends(mock_call_llm, mock_cfg):
-    mock_cfg.return_value = {"smart_policy": "X", "smart_policy_mode": "overwrite"}
+    mock_cfg.return_value = {"smart_policy": "X", "smart_policy_mode": " Overwrite "}
     mock_call_llm.return_value = _response("ESCALATE")
     with patch("tools.approval_smart.logger") as mock_logger:
         _smart_approve("make test", "flagged")
     assert mock_logger.warning.called
+    assert " Overwrite " in mock_logger.warning.call_args.args  # the raw value, as configured
     assert approval_smart._DEFAULT_RULES in _system_prompt(mock_call_llm)

@@ -1280,7 +1280,7 @@ The guard is conservative. It does **not** fire when:
 - anywhere in the reply mentions a red-tier decision: credentials or OAuth consent, live deploy or restart, production, money or billing, sending email or messages, publishing, deletion or other irreversible actions, force-push or merge, other tenants, sudo, or disabling or bypassing safety controls;
 - the turn made no tool calls (a plain question to you stays a question);
 - an approval prompt this turn was denied or timed out (the agent was told to wait for you);
-- a background process or async delegation for the session is still running;
+- a background process or async delegation for the session is still running, or the session cannot be identified (then Hermes assumes work may be running);
 - it already nudged once this turn.
 
 The nudge is internal scaffolding: it is not saved to the session transcript, and the agent's question is still shown to you as an interim message.

@@ -122,21 +122,25 @@ def turn_hit_approval_block(messages: Iterable[dict] | None) -> bool:
 
 
 def _work_still_running(agent: Any) -> bool:
-    """A background process or async delegation for this session is still live. Probe
-    failures count as running — the guard then stays out of the way."""
+    """A background process or async delegation for THIS session is still live. Uses the agent's
+    own session id and a BOUND session key only — ``get_current_session_key()`` falls back to the
+    shared ``"default"`` key when unbound, which is not this session. Unknown identity or a probe
+    failure counts as running, so the guard stays out of the way."""
+    session_id = getattr(agent, "session_id", None) or ""
+    if not session_id:
+        return True
     try:
         from tools.approval_context import get_current_session_key
         from tools.async_delegation import has_live_for_session
         from tools.process_registry import process_registry
 
-        session_key = get_current_session_key() or ""
+        session_key = get_current_session_key(default="")
         task_id = getattr(agent, "_current_task_id", None) or ""
         if task_id and process_registry.has_active_processes(task_id):
             return True
         if session_key and process_registry.has_active_for_session(session_key):
             return True
-        return has_live_for_session(session_key=session_key,
-                                    parent_session_id=getattr(agent, "session_id", "") or "")
+        return has_live_for_session(session_key=session_key, parent_session_id=session_id)
     except Exception:
         logger.debug("stop guard: running-work probe failed", exc_info=True)
         return True
