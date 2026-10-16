@@ -2863,6 +2863,19 @@ approvals:
   denial_breaker_threshold: 3   # 0 disables the breaker
 ```
 
+### Late approvals
+
+On messaging platforms an approval card that nobody answers within `approvals.timeout` is a deny: the waiting command does not run (silence is not consent). If you then send `/approve` within `approvals.late_approval_window` seconds (default `1800`), Hermes records a one-shot approval for that exact command and wakes the agent with a new message so it re-runs it once and continues. The late approval:
+
+- covers only the most recent timed-out command, byte-for-byte, once;
+- never persists a session or permanent allowlist entry;
+- never overrides the hardline blocklist, the sudo stdin guard, or your `approvals.deny` rules.
+
+```yaml
+approvals:
+  late_approval_window: 1800   # seconds; 0 disables late approvals
+```
+
 ### Deny rules
 
 `approvals.deny` is a list of glob patterns that block matching terminal commands unconditionally — even under `--yolo`, `/yolo`, or `mode: off`. It's the user-editable counterpart to the built-in hardline blocklist:
