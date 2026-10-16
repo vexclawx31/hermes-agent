@@ -1267,7 +1267,7 @@ For a user/plugin policy gate at the same point — keep the agent going with yo
 
 ## Stop guard (keep approved work moving)
 
-When enabled, Hermes does not let a working turn end on a routine permission question. If the agent has already used tools this turn and its reply ends with something like "Shall I proceed?", "Want me to continue with step 2?" or "Should I open the PR?", Hermes sends it one follow-up — continue the approved work and ask only for red-tier decisions — and the turn goes on.
+When enabled, Hermes does not let a working turn end on a routine request for permission to continue. If the agent has already used tools this turn and its reply ends with "Shall I proceed?", "Should I go ahead?", "Do you want me to continue?" or "Approve?", Hermes sends it one follow-up — continue the approved work and ask only for red-tier decisions — and the turn goes on.
 
 ```yaml
 agent:
@@ -1276,7 +1276,8 @@ agent:
 
 The guard is conservative. It does **not** fire when:
 
-- the last paragraph of the reply mentions a red-tier decision: credentials or OAuth consent, live deploy or restart, production, money or billing, sending email or messages, publishing, deletion or other irreversible actions, force-push or merge, other tenants, sudo, or disabling or bypassing safety controls;
+- the final question offers a choice or asks for clarification (it contains "or", "which", "what should" or "either", or the last paragraph lists options);
+- anywhere in the reply mentions a red-tier decision: credentials or OAuth consent, live deploy or restart, production, money or billing, sending email or messages, publishing, deletion or other irreversible actions, force-push or merge, other tenants, sudo, or disabling or bypassing safety controls;
 - the turn made no tool calls (a plain question to you stays a question);
 - an approval prompt this turn was denied or timed out (the agent was told to wait for you);
 - a background process or async delegation for the session is still running;

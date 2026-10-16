@@ -16,26 +16,30 @@ from agent.stop_guard import ends_with_permission_question, turn_did_tool_work
 
 
 @pytest.mark.parametrize("text", [
-    "Tests pass on the branch.\n\nShall I open the PR next?",
+    "Tests pass on the branch.\n\nShall I proceed with opening the PR?",
     "Step 1 is done. Want me to continue with step 2?",
     "Refactor applied. Should I proceed?",
-    "I updated the parser. Would you like me to also update the docs?",
+    "Parser updated. Should I go ahead?",
+    "Docs drafted. Do you want me to continue?",
+    "Plan is ready. Approve?",
 ])
-def test_routine_permission_questions_are_detected(text):
+def test_permission_to_continue_is_detected(text):
     assert ends_with_permission_question(text)
 
 
 @pytest.mark.parametrize("text", [
-    "Done. All 42 tests pass.",                                     # no question
-    "Which of the two config files did you mean?",                  # clarifying, not permission
-    "Branch is ready. Shall I deploy it to production?",            # live deploy
-    "Should I restart the gateway service now?",                    # live restart
-    "Want me to email the customer the summary?",                   # external comms
-    "May I delete the old backups permanently?",                    # irreversible deletion
-    "The CLI needs your API key. Shall I continue once you add it?",  # credentials
+    "Done. All 42 tests pass.",                                       # no question
+    "Should I use Postgres or SQLite?",                               # a choice
+    "Which of the two config files did you mean?",                    # clarification
+    "Both work. What should the default timeout be?",                 # asks for a value
+    "Two ways forward:\n1. patch it\n2. rewrite it\nShall I proceed?",  # enumerated options
+    "Next step drops the production users table and recreates it.\n\nShall I proceed?",
+    "This removes the old backups permanently.\n\nShall I proceed?",   # red tier earlier in reply
+    "Branch is ready. Shall I proceed to deploy it?",                 # live deploy
+    "Would you like me to also update the docs?",                     # new scope, not continuation
     "Shall I continue?\n\nNote: this question is followed by more text.",  # question not final
 ])
-def test_non_routine_or_non_permission_endings_do_not_fire(text):
+def test_choices_scope_and_red_tier_do_not_fire(text):
     assert not ends_with_permission_question(text)
 
 
@@ -139,5 +143,5 @@ def test_running_background_work_suppresses_the_nudge(agent, monkeypatch):
     instance, home = agent
     _enable(home)
     monkeypatch.setattr(stop_guard, "_work_still_running", lambda _agent: True)
-    _result, seen = _run(instance, iter(["Tests started in the background. Shall I wait for them?"]))
+    _result, seen = _run(instance, iter(["Tests started in the background. Shall I continue?"]))
     assert len(seen) == 1

@@ -4,9 +4,10 @@ Opt-in and deliberately conservative. It fires only when ALL hold:
 
 * this turn already did tool work (the agent was mid-task, not answering a fresh question)
   and no tool result this turn was an approval BLOCKED (then waiting for the human is right);
-* the reply's final paragraph is a permission/continuation question ("Shall I…?",
-  "Want me to…?", "Should I proceed?");
-* that paragraph cites no red-tier decision (credentials/OAuth, live deploy/restart, money,
+* the reply's final question asks permission to CONTINUE ("Shall I proceed?", "Should I go
+  ahead?", "Do you want me to continue?", "Approve?") — not a choice or clarification
+  ("Postgres or SQLite?", "Which file?", enumerated options);
+* the WHOLE reply cites no red-tier decision (credentials/OAuth, live deploy/restart, money,
   external communication, irreversible deletion, cross-tenant access, disabling safety);
 * nothing is still running for the session (background process or async delegation), since
   then stopping to wait is correct;
@@ -21,10 +22,11 @@ import logging
 import re
 from typing import Any, Iterable
 
+from agent.session_persistence import _is_ephemeral_scaffolding
+
 logger = logging.getLogger("agent.conversation_loop")
 
 _MAX_NUDGES = 1
-_TAIL_CHARS = 600
 
 STOP_GUARD_NUDGE = (
     "[System: Continue the approved work now; do not stop to ask permission for routine "
@@ -34,24 +36,26 @@ STOP_GUARD_NUDGE = (
     "of those, name it and stop.]"
 )
 
-_PERMISSION_QUESTION = re.compile(
-    r"\b(?:shall|should|may|can|could)\s+i\b"
-    r"|\b(?:shall|should)\s+we\s+(?:proceed|continue|go\s+ahead|start)\b"
-    r"|\b(?:do\s+you\s+)?want\s+me\s+to\b"
-    r"|\bwould\s+you\s+like\s+me\s+to\b"
-    r"|\b(?:ok(?:ay)?|good)\s+to\s+(?:proceed|continue|go\s+ahead)\b"
-    r"|\b(?:proceed|continue|go\s+ahead)\s*\?"
-    r"|\bapprove\b[^?\n]*\?",
+_CONTINUE = r"(?:continue|proceed|start|go\s+ahead|keep\s+going|carry\s+on)"
+_PERMISSION_TO_CONTINUE = re.compile(
+    rf"\b(?:shall|should|may|can)\s+(?:i|we)\s+{_CONTINUE}\b"
+    rf"|\b(?:do\s+you\s+)?want\s+me\s+to\s+{_CONTINUE}\b"
+    rf"|\bwould\s+you\s+like\s+me\s+to\s+{_CONTINUE}\b"
+    rf"|\b(?:ok(?:ay)?|good)\s+to\s+{_CONTINUE}\b"
+    r"|\bapprove\s*\?",
     re.IGNORECASE,
 )
+# A choice or clarification is a real question for the human, never a stall.
+_CHOICE = re.compile(r"\bor\b|\bwhich\b|\bwhat\s+should\b|\beither\b", re.IGNORECASE)
+_ENUMERATED = re.compile(r"^\s*(?:\d+[.)]|[a-z][.)]|[-*•]|option\b)", re.IGNORECASE | re.MULTILINE)
 
 _RED_TIER = re.compile(
     r"red[\s-]?tier|credential|oauth|password|api[\s_-]?key|\btoken|secret|\bconsent\b"
     r"|\bdeploy|\brestart|\bproduction\b|\bprod\b|\blive\s+(?:service|server|system|site)"
     r"|\bpay(?:ment)?\b|\bmoney\b|\bpurchase|\bbilling|\bcharge|\$\s?\d"
     r"|\bsend\b[^.?\n]*\b(?:email|message|tweet|post)|\bpublish|\bemail\b|\bpost\s+(?:to|on)\b"
-    r"|\birreversibl|\bpermanent(?:ly)?\b|\bdelet|\bwipe|\bdrop\s+(?:the\s+)?(?:table|database)"
-    r"|force[\s-]push|\btenant|\bdisabl|\bbypass|\bsudo\b|\bmerge\b",
+    r"|\birreversibl|\bpermanent(?:ly)?\b|\bdelet|\bwipe|\bdrop(?:s|ping)?\b[^.?\n]*\b(?:table|database|schema)"
+    r"|\btruncat|force[\s-]push|\btenant|\bdisabl|\bbypass|\bsudo\b|\bmerge\b",
     re.IGNORECASE,
 )
 
@@ -69,39 +73,43 @@ def stop_guard_enabled(config: dict[str, Any] | None = None) -> bool:
     return isinstance(agent_cfg, dict) and agent_cfg.get("stop_guard") is True
 
 
-def _final_paragraph(text: str) -> str:
-    tail = (text or "").strip()[-_TAIL_CHARS:]
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", tail) if p.strip()]
-    return paragraphs[-1] if paragraphs else ""
+def _final_question(text: str) -> tuple[str, str]:
+    """``(final_paragraph, question_sentence)`` — the last sentence ending in ``?`` within the
+    final paragraph, or ``""`` when the reply does not end on a question."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+    para = paragraphs[-1] if paragraphs else ""
+    if not para.rstrip("*_`) ").endswith("?"):
+        return para, ""
+    sentences = re.split(r"(?<=[.!?])\s+", para)
+    return para, next((s for s in reversed(sentences) if "?" in s), "")
 
 
 def ends_with_permission_question(text: str) -> bool:
-    """The last paragraph asks for permission to continue and cites no red-tier decision."""
-    para = _final_paragraph(text)
-    if "?" not in para or not _PERMISSION_QUESTION.search(para):
+    """The reply ends on a permission-to-continue question that offers no choice, and nothing
+    anywhere in it cites a red-tier decision."""
+    para, question = _final_question(text)
+    if not question or not _PERMISSION_TO_CONTINUE.search(question):
         return False
-    return not _RED_TIER.search(para)
-
-
-def _is_synthetic(msg: dict) -> bool:
-    return any(k.startswith("_") and k.endswith(("_synthetic", "_nudge")) and msg.get(k) for k in msg)
-
-
-def turn_did_tool_work(messages: Iterable[dict] | None) -> bool:
-    """An assistant tool call since the last real (non-synthetic) user message."""
-    rows = [m for m in (messages or ()) if isinstance(m, dict)]
-    if not any(m.get("role") == "user" and not _is_synthetic(m) for m in rows):
+    if _CHOICE.search(question) or _ENUMERATED.search(para):
         return False
-    return any(m.get("role") == "assistant" and m.get("tool_calls") for m in _this_turn(rows))
+    return not _RED_TIER.search(text)
 
 
 def _this_turn(messages: Iterable[dict] | None) -> list[dict]:
     """Messages after the last real (non-synthetic) user message."""
     rows = [m for m in (messages or ()) if isinstance(m, dict)]
     for i in range(len(rows) - 1, -1, -1):
-        if rows[i].get("role") == "user" and not _is_synthetic(rows[i]):
+        if rows[i].get("role") == "user" and not _is_ephemeral_scaffolding(rows[i]):
             return rows[i + 1:]
     return rows
+
+
+def turn_did_tool_work(messages: Iterable[dict] | None) -> bool:
+    """An assistant tool call since the last real (non-scaffolding) user message."""
+    rows = [m for m in (messages or ()) if isinstance(m, dict)]
+    if not any(m.get("role") == "user" and not _is_ephemeral_scaffolding(m) for m in rows):
+        return False
+    return any(m.get("role") == "assistant" and m.get("tool_calls") for m in _this_turn(rows))
 
 
 def turn_hit_approval_block(messages: Iterable[dict] | None) -> bool:
