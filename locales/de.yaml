@@ -67,6 +67,7 @@ gateway:
     always_singular:       "✅ Befehl genehmigt (Muster dauerhaft genehmigt). Der Agent wird fortgesetzt..."
     always_plural:         "✅ Befehle genehmigt (Muster dauerhaft genehmigt) ({count} Befehle). Der Agent wird fortgesetzt..."
     late_granted:          "✅ Späte Genehmigung für `{command}` erfasst. Der Agent führt ihn einmal erneut aus."
+    late_not_woken:        "⚠️ Späte Genehmigung für `{command}` nicht angewendet: Der Agent konnte nicht geweckt werden. Bitte ihn, den Befehl erneut auszuführen."
 
   background:
     usage:                 "Verwendung: /bg <prompt>\nBeispiel: /bg Fasse die Top-HN-Storys von heute zusammen\n\nFührt den Prompt in einer separaten Sitzung aus. Sie können weiter chatten — das Ergebnis erscheint hier, wenn es fertig ist."

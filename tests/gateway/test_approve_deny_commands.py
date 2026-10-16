@@ -665,14 +665,13 @@ class TestCrossSessionApprovalIsolation:
 
 
 class TestLateApprovalAfterTimeout:
-    """/approve after the card timed out grants that command once and wakes the agent."""
+    """/approve after the card timed out grants that command once, bound to the wake it queues."""
 
     def setup_method(self):
         _clear_approval_state()
 
     @pytest.mark.asyncio
-    async def test_late_approve_grants_and_wakes_agent(self):
-        import asyncio
+    async def test_late_approve_queues_bound_wake(self):
         from tools import approval_late
 
         runner = _make_runner()
@@ -690,11 +689,32 @@ class TestLateApprovalAfterTimeout:
         approval_late.record_timeout(session_key, "rm -rf ./build", "recursive delete")
 
         result = await runner._handle_approve_command(_make_event("/approve"))
-        await asyncio.gather(*list(runner._background_tasks))
 
-        assert "rm -rf ./build" in result
+        assert "rm -rf ./build" in result and "re-run" in result
         assert len(woken) == 1 and woken[0].internal is True
-        assert "rm -rf ./build" in woken[0].text
+        token = woken[0].metadata["late_approval_token"]
+        assert approval_late.consume_grant(session_key, "rm -rf ./build") is False  # not armed yet
+        assert approval_late.arm(token)
         assert approval_late.consume_grant(session_key, "rm -rf ./build") is True
-        # A second /approve has nothing left to grant.
         assert await runner._handle_approve_command(_make_event("/approve")) == "No pending command to approve."
+
+    @pytest.mark.asyncio
+    async def test_unqueued_wake_withdraws_grant_and_says_so(self):
+        from tools import approval_late
+
+        runner = _make_runner()
+        adapter = runner.adapters[Platform.TELEGRAM]
+        adapter.supports_async_delivery = True
+
+        async def _refuse(event):
+            event._gateway_accepted = False
+
+        adapter.handle_message = _refuse
+        session_key = runner._session_key_for_source(_make_source())
+        approval_late.clear(session_key)
+        approval_late.record_timeout(session_key, "rm -rf ./build", "recursive delete")
+
+        result = await runner._handle_approve_command(_make_event("/approve"))
+
+        assert "could not be woken" in result
+        assert approval_late.grant_latest(session_key) is None

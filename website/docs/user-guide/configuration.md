@@ -2865,11 +2865,13 @@ approvals:
 
 ### Late approvals
 
-On messaging platforms an approval card that nobody answers within `approvals.timeout` is a deny: the waiting command does not run (silence is not consent). If you then send `/approve` within `approvals.late_approval_window` seconds (default `1800`), Hermes records a one-shot approval for that exact command and wakes the agent with a new message so it re-runs it once and continues. The late approval:
+On messaging platforms an approval card that nobody answers within `approvals.timeout` is a deny: the waiting command does not run (silence is not consent). If you then send `/approve` within `approvals.late_approval_window` seconds of that timeout (default `1800`), Hermes grants that exact command once and wakes the agent with a new message so it re-runs it and continues. If the wake cannot be queued, Hermes says so and the grant is withdrawn. The late approval:
 
-- covers only the most recent timed-out command, byte-for-byte, once;
+- covers only the most recent timed-out command in the session; a second `/approve` does not reach older ones;
+- is usable only in the wake turn it starts, by the byte-identical command, and is dropped when that turn ends;
 - never persists a session or permanent allowlist entry;
-- never overrides the hardline blocklist, the sudo stdin guard, or your `approvals.deny` rules.
+- never overrides the hardline blocklist, the sudo stdin guard, or your `approvals.deny` rules;
+- is not offered on surfaces without `/approve` (ask-only API server runs).
 
 ```yaml
 approvals:

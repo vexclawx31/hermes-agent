@@ -22,7 +22,7 @@ from typing import Optional, Union
 from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
@@ -1183,7 +1183,7 @@ class GatewaySlashCommandsMixin(
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
         if stale:
-            return self._grant_late_approval(event, session_key) or stale
+            return await self._grant_late_approval(event, session_key) or stale
         # Args: "all", "all session", "all always", "session", "always" ("always" beats "session").
         args = event.get_command_args().strip().lower().split()
         choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
@@ -1195,38 +1195,41 @@ class GatewaySlashCommandsMixin(
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         return await self._deliver_approval_confirmation(event, confirmation_text, "approve")
 
-    def _grant_late_approval(self, event: MessageEvent, session_key: str) -> Optional[str]:
-        """/approve after the card timed out: grant the timed-out command once
-        (``tools/approval_late.py``) and wake the agent so it re-runs it. None when nothing qualifies."""
+    async def _grant_late_approval(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """/approve after the card timed out: grant the session's most recent timed-out command once
+        (``tools/approval_late.py``) and queue a wake turn that may use it. The grant is bound to that
+        turn through the wake event's metadata, so it is withdrawn when no wake could be queued.
+        None when nothing qualifies."""
         from agent.redact import redact_sensitive_text
-        from gateway.wake import adapter_supports_push
+        from gateway.wake import adapter_supports_push, deliver_wake
         from tools import approval_late
         slot = approval_late.grant_latest(session_key)
         if slot is None:
             return None
         shown = redact_sensitive_text(slot.command)[:200]
         adapter = self._delivery_adapter_for(event.source)
+        # The binding rides on the push-path event; a non-push self-post cannot carry it (and
+        # ask-only surfaces never record a timed-out slot in the first place).
+        queued = False
         if adapter is not None and adapter_supports_push(adapter):
-            self._track_background_task(self._wake_for_late_approval(adapter, event.source, shown))
+            source = event.source
+            if getattr(source, "message_id", None):
+                source = dataclasses.replace(source, message_id=None)
+            text = ("[Late approval] The user has now approved the command whose approval timed out "
+                    "earlier. Re-run that exact command once, unchanged (copy it from your earlier tool "
+                    "call), then continue the approved work. Approval is valid for that one command, "
+                    f"in this turn only.\nCommand: {shown}")
+            try:
+                await deliver_wake(adapter, text=text, source=source,
+                                   metadata={"late_approval_token": slot.token})
+                queued = True
+            except Exception as exc:
+                logger.warning("Late-approval wake was not queued: %s", exc)
+        if not queued:
+            approval_late.revoke(session_key, slot.token)
+            return t("gateway.approve.late_not_woken", command=shown)
         logger.info("User late-approved a timed-out command via /approve (session %s)", session_key)
         return t("gateway.approve.late_granted", command=shown)
-
-    async def _wake_for_late_approval(self, adapter, source, shown_command: str) -> None:
-        """A new internal turn (queued behind a running one) telling the agent it may re-run the
-        exact timed-out command once. The command text is redacted for display only; the agent
-        re-issues it verbatim from its own earlier tool call, and only a byte-identical command
-        consumes the grant."""
-        from gateway.wake import admit_internal_event
-        text = ("[Late approval] The user has now approved the command whose approval timed out "
-                "earlier. Re-run that exact command once, unchanged (copy it from your earlier tool "
-                "call), then continue the approved work. Approval is valid for that one command only.\n"
-                f"Command: {shown_command}")
-        source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
-        try:
-            await admit_internal_event(adapter, MessageEvent(
-                text=text, message_type=MessageType.TEXT, source=source, internal=True))
-        except Exception as exc:
-            logger.warning("Late-approval wake was not delivered: %s", exc)
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
         """Handle /deny — reject pending dangerous command(s) with a definitive BLOCKED result, as in

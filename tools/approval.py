@@ -890,7 +890,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                             reason_addendum="", timeout_addendum="", deny_reason=None)
             if not decision["resolved"]:
                 timeout_addendum = " Silence is not consent."
-                if spec is _COMMAND_GATE and approval_late.record_timeout(session_key, command, description):
+                # Only where a human can still send /approve: never on ask-only surfaces
+                # (HERMES_EXEC_ASK / api_server), which have no late-approval path.
+                if (spec is _COMMAND_GATE and is_gateway
+                        and approval_late.record_timeout(session_key, command, description)):
                     timeout_addendum += _LATE_APPROVAL_ADDENDUM
                 return deny(spec.gateway_refused, "timeout", reason="timed out without user response",
                             reason_addendum="", timeout_addendum=timeout_addendum,

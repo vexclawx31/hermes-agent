@@ -67,6 +67,7 @@ gateway:
     always_singular:       "✅ Comando aprobado (patrón aprobado permanentemente). El agente se está reanudando..."
     always_plural:         "✅ Comandos aprobados (patrón aprobado permanentemente) ({count} comandos). El agente se está reanudando..."
     late_granted:          "✅ Aprobación tardía registrada para `{command}`. El agente lo volverá a ejecutar una vez."
+    late_not_woken:        "⚠️ La aprobación tardía de `{command}` no se aplicó: no se pudo despertar al agente. Pídele que vuelva a ejecutar el comando."
 
   background:
     usage:                 "Uso: /bg <prompt>\nEjemplo: /bg Resume las principales historias de HN de hoy\n\nEjecuta el prompt en una sesión separada. Puedes seguir chateando — el resultado aparecerá aquí cuando termine."
