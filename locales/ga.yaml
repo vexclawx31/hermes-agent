@@ -70,6 +70,8 @@ gateway:
     session_plural:        "✅ Orduithe ceadaithe (patrún ceadaithe don seisiún seo) ({count} ordú). Tá an gníomhaire ag atosú..."
     always_singular:       "✅ Ordú ceadaithe (patrún ceadaithe go buan). Tá an gníomhaire ag atosú..."
     always_plural:         "✅ Orduithe ceadaithe (patrún ceadaithe go buan) ({count} ordú). Tá an gníomhaire ag atosú..."
+    late_granted:          "✅ Taifeadadh ceadú déanach do `{command}`. Rithfidh an gníomhaire arís é uair amháin."
+    late_not_woken:        "⚠️ Níor cuireadh an ceadú déanach do `{command}` i bhfeidhm: níorbh fhéidir an gníomhaire a dhúiseacht. Iarr air an t-ordú a rith arís."
 
   background:
     usage:                 "Úsáid: /bg <leid>\nSampla: /bg Déan achoimre ar phríomhscéalta HN inniu\n\nRitheann an leid i seisiún ar leith. Is féidir leat leanúint leis an gcomhrá — taispeánfar an toradh anseo nuair a bheidh sé críochnaithe."

@@ -20,7 +20,7 @@ import threading
 from typing import Optional
 
 from utils import env_var_enabled, is_truthy_value
-from tools import approval_context
+from tools import approval_context, approval_late
 from tools.approval_context import (
     _get_session_platform, _is_cron_approval_context,
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
@@ -295,6 +295,7 @@ def clear_session(session_key: str) -> None:
             # the prompt was withdrawn, nobody denied it.
             entry.cancelled = "the session ended before the prompt was answered"
             entry.event.set()
+    approval_late.clear(session_key)
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.
@@ -706,6 +707,12 @@ _STOP_ACTION = (
     "rephrase it, and do NOT attempt the same outcome via a different path."
 )
 
+# A late /approve wakes the agent with a new message naming the command (gateway/slash_commands.py).
+_LATE_APPROVAL_ADDENDUM = (
+    " If the user approves it later, Hermes will tell you in a new message; only then re-run this "
+    "exact command once (unchanged) and continue the approved work."
+)
+
 _COMMAND_GATE = _GateSpec(
     noun="command", transport=True, user_approved=True, redact_cli=False, pending_keys=True,
     notify_failed="BLOCKED: Failed to send approval request to user. Do NOT retry.",
@@ -882,8 +889,14 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                             reason=f"approval was withdrawn before the user answered ({decision['cancelled']})",
                             reason_addendum="", timeout_addendum="", deny_reason=None)
             if not decision["resolved"]:
+                timeout_addendum = " Silence is not consent."
+                # Only where a human can still send /approve: never on ask-only surfaces
+                # (HERMES_EXEC_ASK / api_server), which have no late-approval path.
+                if (spec is _COMMAND_GATE and is_gateway
+                        and approval_late.record_timeout(session_key, command, description)):
+                    timeout_addendum += _LATE_APPROVAL_ADDENDUM
                 return deny(spec.gateway_refused, "timeout", reason="timed out without user response",
-                            reason_addendum="", timeout_addendum=" Silence is not consent.",
+                            reason_addendum="", timeout_addendum=timeout_addendum,
                             deny_reason=deny_reason)
             if choice is None or choice == "deny":
                 return deny(spec.gateway_refused, "denied", reason="denied by user",
@@ -1209,6 +1222,10 @@ def check_all_command_guards(command: str, env_type: str,
         return _approved()
 
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    # A human's late /approve of this exact timed-out command (floors already passed above).
+    if approval_late.consume_grant(session_key, command):
+        logger.info("Late approval consumed for session %s: %s", session_key, command[:120])
+        return _user_approved(session_key, combined_desc)
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
 

@@ -66,6 +66,8 @@ gateway:
     session_plural:        "✅ Parancsok jóváhagyva (minta jóváhagyva ehhez a munkamenethez) ({count} parancs). Az ügynök folytatja..."
     always_singular:       "✅ Parancs jóváhagyva (minta véglegesen jóváhagyva). Az ügynök folytatja..."
     always_plural:         "✅ Parancsok jóváhagyva (minta véglegesen jóváhagyva) ({count} parancs). Az ügynök folytatja..."
+    late_granted:          "✅ Késői jóváhagyás rögzítve: `{command}`. Az ügynök egyszer újra lefuttatja."
+    late_not_woken:        "⚠️ A késői jóváhagyás nem lépett életbe ehhez: `{command}`. Az ügynököt nem sikerült felébreszteni. Kérd meg, hogy futtassa újra a parancsot."
 
   background:
     usage:                 "Használat: /bg <prompt>\nPélda: /bg Foglald össze a mai legjobb HN sztorikat\n\nKülön munkamenetben futtatja a promptot. Folytathatod a beszélgetést — az eredmény itt jelenik meg, amint elkészül."

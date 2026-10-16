@@ -66,6 +66,8 @@ gateway:
     session_plural:        "✅ Comandos aprovados (padrão aprovado para esta sessão) ({count} comandos). O agente está a retomar..."
     always_singular:       "✅ Comando aprovado (padrão aprovado permanentemente). O agente está a retomar..."
     always_plural:         "✅ Comandos aprovados (padrão aprovado permanentemente) ({count} comandos). O agente está a retomar..."
+    late_granted:          "✅ Aprovação tardia registrada para `{command}`. O agente vai executá-lo novamente uma vez."
+    late_not_woken:        "⚠️ A aprovação tardia de `{command}` não foi aplicada: não foi possível acordar o agente. Peça para ele executar o comando novamente."
 
   background:
     usage:                 "Uso: /bg <prompt>\nExemplo: /bg Resume as principais histórias do HN de hoje\n\nExecuta o prompt numa sessão separada. Podes continuar a conversar — o resultado aparecerá aqui quando estiver concluído."

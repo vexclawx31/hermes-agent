@@ -66,6 +66,8 @@ gateway:
     session_plural:        "✅ 命令已批准（本次会话内允许该模式）（{count} 条命令）。代理正在恢复…"
     always_singular:       "✅ 命令已批准（永久允许该模式）。代理正在恢复…"
     always_plural:         "✅ 命令已批准（永久允许该模式）（{count} 条命令）。代理正在恢复…"
+    late_granted:          "✅ 已记录对 `{command}` 的延迟批准。代理将重新执行一次。"
+    late_not_woken:        "⚠️ 对 `{command}` 的延迟批准未生效：无法唤醒代理。请让它重新执行该命令。"
 
   background:
     usage:                 "用法：/bg <提示>\n示例：/bg 总结今天 HN 上热门的故事\n\n在独立会话中运行该提示。你可以继续聊天 — 结果完成后将在此显示。"

@@ -2127,7 +2127,21 @@ class GatewayTurnMixin:
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
-        """Inner handler that runs under the _running_agents sentinel guard."""
+        """Inner handler that runs under the _running_agents sentinel guard. A late-approval wake
+        (``gateway/slash_commands.py::_grant_late_approval``) arms its one-shot grant for exactly
+        this turn and drops it when the turn ends, used or not."""
+        token = ((getattr(event, "metadata", None) or {}).get("late_approval_token")
+                 if getattr(event, "internal", False) else None)
+        if not token:
+            return await self._handle_message_with_agent_turn(event, source, _quick_key, run_generation)
+        from tools import approval_late
+        approval_late.arm(token)
+        try:
+            return await self._handle_message_with_agent_turn(event, source, _quick_key, run_generation)
+        finally:
+            approval_late.disarm(token)
+
+    async def _handle_message_with_agent_turn(self, event, source, _quick_key: str, run_generation: int):
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(

@@ -1183,7 +1183,7 @@ class GatewaySlashCommandsMixin(
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
         if stale:
-            return stale
+            return await self._grant_late_approval(event, session_key) or stale
         # Args: "all", "all session", "all always", "session", "always" ("always" beats "session").
         args = event.get_command_args().strip().lower().split()
         choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
@@ -1194,6 +1194,42 @@ class GatewaySlashCommandsMixin(
         confirmation_text = t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         return await self._deliver_approval_confirmation(event, confirmation_text, "approve")
+
+    async def _grant_late_approval(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """/approve after the card timed out: grant the session's most recent timed-out command once
+        (``tools/approval_late.py``) and queue a wake turn that may use it. The grant is bound to that
+        turn through the wake event's metadata, so it is withdrawn when no wake could be queued.
+        None when nothing qualifies."""
+        from agent.redact import redact_sensitive_text
+        from gateway.wake import adapter_supports_push, deliver_wake
+        from tools import approval_late
+        slot = approval_late.grant_latest(session_key)
+        if slot is None:
+            return None
+        shown = redact_sensitive_text(slot.command)[:200]
+        adapter = self._delivery_adapter_for(event.source)
+        # The binding rides on the push-path event; a non-push self-post cannot carry it (and
+        # ask-only surfaces never record a timed-out slot in the first place).
+        queued = False
+        if adapter is not None and adapter_supports_push(adapter):
+            source = event.source
+            if getattr(source, "message_id", None):
+                source = dataclasses.replace(source, message_id=None)
+            text = ("[Late approval] The user has now approved the command whose approval timed out "
+                    "earlier. Re-run that exact command once, unchanged (copy it from your earlier tool "
+                    "call), then continue the approved work. Approval is valid for that one command, "
+                    f"in this turn only.\nCommand: {shown}")
+            try:
+                await deliver_wake(adapter, text=text, source=source,
+                                   metadata={"late_approval_token": slot.token})
+                queued = True
+            except Exception as exc:
+                logger.warning("Late-approval wake was not queued: %s", exc)
+        if not queued:
+            approval_late.revoke(session_key, slot.token)
+            return t("gateway.approve.late_not_woken", command=shown)
+        logger.info("User late-approved a timed-out command via /approve (session %s)", session_key)
+        return t("gateway.approve.late_granted", command=shown)
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
         """Handle /deny — reject pending dangerous command(s) with a definitive BLOCKED result, as in

@@ -1657,6 +1657,9 @@ DEFAULT_CONFIG = {
         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",
+        # Seconds after a gateway approval card times out during which a late /approve still grants
+        # that exact command once (the agent is woken to re-run it); 0 disables.
+        "late_approval_window": 1800,
         # After this many consecutive guardian DENYs in a session, the deny message escalates to a
         # hard-stop (report to user / ask for /approve). Approval resets; 0 off.
         "denial_breaker_threshold": 3,
@@ -1743,6 +1746,10 @@ DEFAULT_CONFIG = {
         # globs on the basename (e.g. "*.mdc").
         "protected_instruction_files": True,
         "protected_instruction_extra_patterns": [],
+        # Opt-in: skip that approval for instruction FILES (not .hermes dirs, not .git metadata)
+        # whose input path AND realpath are under one of own_worktree_roots (explicit roots only).
+        "protected_instruction_files_allow_own_worktrees": False,
+        "own_worktree_roots": [],
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
