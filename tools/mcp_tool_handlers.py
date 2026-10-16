@@ -188,12 +188,27 @@ def _retry_once(server_name: str, retry_call, op_description: str, what: str):
     return _record_call_outcome(server_name, result)
 
 
-def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str):
+def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str,
+                                 *, call_may_have_side_effects: bool = False):
     """OAuth recovery + one retry; None when *exc* is not an auth error. ``handle_401`` decides
     viability; if viable, signal a reconnect (fresh credentials), wait ready, retry once. Any
-    failure returns the structured ``needs_reauth`` error so the model stops refreshing."""
+    failure returns the structured ``needs_reauth`` error so the model stops refreshing.
+
+    ``auth: client_credentials`` servers skip the OAuth manager: the auth layer already re-minted
+    (bounded) on the 401, so only a positively read-only call is retried once; a write is reported
+    as not replayed so the model reconciles state first."""
     if not _is_auth_error(exc):
         return None
+    srv = _lookup_reconnectable_server(server_name)
+    from tools.mcp_client_credentials import AUTH_FAILED_MSG, NOT_REPLAYED_MSG, is_client_credentials
+    if is_client_credentials(getattr(srv, "_config", None)):
+        if call_may_have_side_effects:
+            return _strike(server_name, NOT_REPLAYED_MSG.format(s=server_name, t=op_description),
+                           outcome_uncertain=True, server=server_name)
+        result = _retry_once(server_name, retry_call, op_description, "client_credentials re-mint")
+        if result is not None:
+            return result
+        return _strike(server_name, AUTH_FAILED_MSG.format(s=server_name), auth_failed=True, server=server_name)
     from tools.mcp_oauth_manager import get_manager
     try:
         recovered = _loop._run_on_mcp_loop(lambda: get_manager().handle_401(server_name, None), timeout=10)
@@ -201,7 +216,6 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
         logger.warning("MCP OAuth '%s': recovery attempt failed: %s", server_name, rec_exc)
         recovered = False
     if recovered:
-        srv = _lookup_reconnectable_server(server_name)
         # Recovery + reconnect is independent evidence of viability: close the breaker here, not only on
         # retry success (else a failing retry pins it open forever).
         if srv is not None and _loop._signal_reconnect_and_wait(
@@ -583,9 +597,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _core._bump_server_error(server_name)
             logger.error("MCP tool %s/%s call failed: %s", server_name, tool_name, exc)
         session_expired = partial(_handle_session_expired_and_retry, call_may_have_side_effects=not read_only)
+        auth_error = partial(_handle_auth_error_and_retry, call_may_have_side_effects=not read_only)
         return _dispatch(
             server_name, server, op, _call, tool_timeout,
-            (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, session_expired),
+            (_handle_stdio_child_exited_and_retry, auth_error, session_expired),
             _on_failure, record_outcome=True)
     return _handler
 

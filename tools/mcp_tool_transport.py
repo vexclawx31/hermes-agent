@@ -448,6 +448,9 @@ class MCPServerTransportMixin:
     def _build_oauth_auth(self, url: str, config: dict):
         """OAuth 2.1 PKCE via the central MCPOAuthManager (one provider reused across reconnects and
         CLI paths). Setup failures re-raise (after a warning) so only this server is reported failed."""
+        if self._auth_type == "client_credentials":  # config/mint errors propagate: fail closed, park as auth
+            from tools.mcp_client_credentials import build_mcp_auth
+            return build_mcp_auth(self.name, config)
         if self._auth_type != "oauth":
             return None
         try:
