@@ -382,6 +382,26 @@ that run commands, so the write is never silent. Non-interactive callers (ACP
 file bridge, background jobs with no human channel) fail closed. Private keys,
 `authorized_keys`, and everything else under `~/.ssh/` remain hard-blocked.
 
+### Protected agent-instruction files (always ask)
+
+Writes to files that steer future agent behaviour — `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `.cursorrules` (any directory, case-insensitive), any basename matched by `security.protected_instruction_extra_patterns`, and project-local `.hermes/` config — ask a human every time, even under `--yolo`, and fail closed without a human channel. `security.protected_instruction_files: false` turns the gate off.
+
+When the agent works on its own branch in a separate checkout, you can let it edit those instruction files there without a prompt:
+
+```yaml
+security:
+  protected_instruction_files_allow_own_worktrees: true   # default: false
+  own_worktree_roots:                                      # optional extra roots
+    - ~/scratch/agent-worktrees
+```
+
+With the opt-in on, an instruction file is exempt when its resolved path is:
+
+- inside a **linked** git worktree (created by `git worktree add`; its `.git` is a file that git links back to from `<repo>/.git/worktrees/<name>/gitdir`). The main checkout — the one with a real `.git` directory — is never exempt; or
+- under one of `own_worktree_roots`.
+
+Project-local `.hermes/` config inside those worktrees stays gated, and the Hermes home itself keeps its own guards.
+
 ### HERMES_WRITE_SAFE_ROOT (optional sandbox)
 
 When set, `write_file` and `patch` may only target paths inside the listed directory prefix(es). Anything outside is **hard-blocked** — not routed through dangerous-command approval.

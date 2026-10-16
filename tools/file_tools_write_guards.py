@@ -202,6 +202,66 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     return enabled, [str(p) for p in extra if p]
 
 
+def _own_worktree_exemption_config() -> tuple[bool, list[str]]:
+    """``(allow, roots)`` from ``security.protected_instruction_files_allow_own_worktrees`` and
+    ``security.own_worktree_roots``. Anything but a literal ``true`` — or a failed read — keeps
+    the exemption OFF."""
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        cfg = load_config()
+        allow = cfg_get(cfg, "security", "protected_instruction_files_allow_own_worktrees", default=False)
+        roots = cfg_get(cfg, "security", "own_worktree_roots", default=[])
+    except Exception:
+        return False, []
+    if allow is not True:
+        return False, []
+    if not isinstance(roots, list):
+        roots = []
+    return True, [os.path.realpath(_expand_tilde(str(r))) for r in roots if r]
+
+
+def _linked_worktree_root(path: str) -> str | None:
+    """Root of the LINKED git worktree (``git worktree add``) containing *path*, else ``None``.
+
+    The nearest ancestor holding ``.git`` decides: a ``.git`` directory is a main checkout (never
+    exempt); a ``.git`` file must name ``<common>/.git/worktrees/<name>`` whose ``gitdir`` file
+    links back to this ``.git`` — the two-way link git itself writes, so a lone hand-written
+    ``.git`` file does not qualify."""
+    current = os.path.dirname(path)
+    while True:
+        marker = os.path.join(current, ".git")
+        if os.path.isdir(marker):
+            return None
+        if os.path.isfile(marker):
+            try:
+                with open(marker, encoding="utf-8") as fh:
+                    first = fh.readline().strip()
+                if not first.startswith("gitdir:"):
+                    return None
+                gitdir = first[len("gitdir:"):].strip()
+                gitdir = os.path.realpath(gitdir if os.path.isabs(gitdir) else os.path.join(current, gitdir))
+                if os.path.basename(os.path.dirname(gitdir)) != "worktrees":
+                    return None
+                with open(os.path.join(gitdir, "gitdir"), encoding="utf-8") as fh:
+                    back = fh.readline().strip()
+            except OSError:
+                return None
+            back = back if os.path.isabs(back) else os.path.join(gitdir, back)
+            return current if os.path.realpath(back) == os.path.realpath(marker) else None
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _in_own_worktree(resolved: str, roots: list[str]) -> bool:
+    """*resolved* is under a configured ``own_worktree_roots`` entry, or inside a linked git
+    worktree (not a main checkout)."""
+    if any(resolved == r or resolved.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+        return True
+    return _linked_worktree_root(resolved) is not None
+
+
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
                                   extra_patterns: list[str] | None = None) -> str | None:
@@ -232,11 +292,16 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
+    # Opt-in: the agent's own work branch (a linked worktree / configured scratch root) may edit
+    # its instruction files. Basename rules only — project-local ``.hermes`` config stays gated.
+    allow_own, own_roots = _own_worktree_exemption_config()
+    own_worktree = allow_own and _in_own_worktree(resolved, own_roots)
+
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
-        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
+        if not own_worktree and (base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
+                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns)):
             return base
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
