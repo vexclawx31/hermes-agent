@@ -1265,6 +1265,25 @@ The evidence that feeds this guard (which test/lint/build commands ran, which fi
 
 For a user/plugin policy gate at the same point — keep the agent going with your own checks — see the [`pre_verify` hook](./features/hooks.md#pre_verify).
 
+## Stop guard (keep approved work moving)
+
+When enabled, Hermes does not let a working turn end on a routine permission question. If the agent has already used tools this turn and its reply ends with something like "Shall I proceed?", "Want me to continue with step 2?" or "Should I open the PR?", Hermes sends it one follow-up — continue the approved work and ask only for red-tier decisions — and the turn goes on.
+
+```yaml
+agent:
+  stop_guard: false   # default; true enables the nudge
+```
+
+The guard is conservative. It does **not** fire when:
+
+- the last paragraph of the reply mentions a red-tier decision: credentials or OAuth consent, live deploy or restart, production, money or billing, sending email or messages, publishing, deletion or other irreversible actions, force-push or merge, other tenants, sudo, or disabling or bypassing safety controls;
+- the turn made no tool calls (a plain question to you stays a question);
+- an approval prompt this turn was denied or timed out (the agent was told to wait for you);
+- a background process or async delegation for the session is still running;
+- it already nudged once this turn.
+
+The nudge is internal scaffolding: it is not saved to the session transcript, and the agent's question is still shown to you as an interim message.
+
 ## Standing Goals (`/goal`)
 
 When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.
