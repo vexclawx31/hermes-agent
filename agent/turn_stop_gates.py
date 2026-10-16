@@ -1,8 +1,9 @@
 """Text-response stop gates for the conversation turn loop.
 
-When the model stops with a text answer, three gates may instead append the answer as an
+When the model stops with a text answer, four gates may instead append the answer as an
 interim row plus a synthetic user-role nudge and continue the turn: verify-on-stop (#65919),
-the ``pre_verify`` plugin hook after code edits, and the kanban worker terminal-tool guard.
+the ``pre_verify`` plugin hook after code edits, the kanban worker terminal-tool guard, and the
+opt-in ``agent.stop_guard`` permission-question guard (``agent/stop_guard.py``).
 Each keeps the candidate answer as a budget-exhaustion fallback
 (``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
 this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
@@ -91,6 +92,17 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
         return None
 
 
+def _stop_guard_nudge(agent, final_response, messages) -> Optional[str]:
+    """``agent.stop_guard``: approved work must not end on a routine permission question."""
+    try:
+        from agent.stop_guard import build_stop_guard_nudge
+
+        return build_stop_guard_nudge(agent, final_response, messages)
+    except Exception:
+        logger.debug("stop guard check failed", exc_info=True)
+        return None
+
+
 def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
     """Real content: persist and emit as interim so the user sees the attempted answer;
     only the nudge is flagged synthetic (#65919)."""
@@ -107,7 +119,7 @@ def apply_stop_gates(
     conversation_history: Any, pending_verification_response: Any,
     pending_verification_response_previewed: Any,
 ) -> StopGateVerdict:
-    """Run verify-on-stop → pre_verify hook → kanban stop guard, in that order. Nudges
+    """Run verify-on-stop → pre_verify hook → kanban stop guard → stop guard, in that order. Nudges
     are user-role rows appended only after the assistant answer row, so role alternation
     holds. Hook lookups are imported lazily from their origin modules (tests patch them
     there)."""
@@ -167,6 +179,18 @@ def apply_stop_gates(
             "⚠️ Kanban worker tried to exit without a terminal board call "
             "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
         )
+        return verdict
+
+    _guard_nudge = _stop_guard_nudge(agent, final_response, messages)
+    if _guard_nudge:
+        agent._stop_guard_nudges = getattr(agent, "_stop_guard_nudges", 0) + 1
+        final_msg["finish_reason"] = "stop_guard_continue"
+        _append_interim_answer(
+            agent, final_msg, messages, conversation_history, "stop-guard interim flush failed"
+        )
+        verdict = _continue(_guard_nudge, "_stop_guard_synthetic")
+        logger.info("stop guard: permission question with no red-tier gate; continuation nudge "
+                    "issued (attempt %d)", agent._stop_guard_nudges)
         return verdict
     return StopGateVerdict(
         continue_turn=False, final_response=final_response,

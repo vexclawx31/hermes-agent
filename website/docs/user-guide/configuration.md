@@ -1265,6 +1265,26 @@ The evidence that feeds this guard (which test/lint/build commands ran, which fi
 
 For a user/plugin policy gate at the same point — keep the agent going with your own checks — see the [`pre_verify` hook](./features/hooks.md#pre_verify).
 
+## Stop guard (keep approved work moving)
+
+When enabled, Hermes does not let a working turn end on a routine request for permission to continue. If the agent has already used tools this turn and its reply ends with "Shall I proceed?", "Should I go ahead?", "Do you want me to continue?" or "Approve?", Hermes sends it one follow-up — continue the approved work and ask only for red-tier decisions — and the turn goes on.
+
+```yaml
+agent:
+  stop_guard: false   # default; true enables the nudge
+```
+
+The guard is conservative. It does **not** fire when:
+
+- the final question offers a choice or asks for clarification (it contains "or", "which", "what should" or "either", or the last paragraph lists options);
+- anywhere in the reply mentions a red-tier decision: credentials or OAuth consent, live deploy or restart, production, money or billing, sending email or messages, publishing, deletion or other irreversible actions, force-push or merge, other tenants, sudo, or disabling or bypassing safety controls;
+- the turn made no tool calls (a plain question to you stays a question);
+- an approval prompt this turn was denied or timed out (the agent was told to wait for you);
+- a background process or async delegation for the session is still running, or the session cannot be identified (then Hermes assumes work may be running);
+- it already nudged once this turn.
+
+The nudge is internal scaffolding: it is not saved to the session transcript, and the agent's question is still shown to you as an interim message.
+
 ## Standing Goals (`/goal`)
 
 When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.
@@ -2886,6 +2906,22 @@ approvals:
     Always ESCALATE commands that modify anything under /etc.
     APPROVE docker compose restarts in ~/deploys — they are routine here.
 ```
+
+`approvals.smart_policy_mode` controls how that text is combined with the built-in rules:
+
+- `append` (default) — the built-in APPROVE/DENY/ESCALATE rules stay, your rules are added after them.
+- `replace` — your rules replace the built-in rules entirely. The anti-injection preamble (the command text is untrusted) and the one-word answer contract are always kept; they cannot be replaced.
+
+```yaml
+approvals:
+  smart_policy_mode: replace
+  smart_policy: |
+    - APPROVE routine development work inside git worktrees under ~/work (builds, tests, git, package installs).
+    - DENY anything that deletes outside the working tree, rewrites system files, or wipes disks/databases.
+    - ESCALATE credential changes, service restarts/deploys, payments, and outbound messages.
+```
+
+The guardian must answer with a single verdict word. Reasoning models may write a short rationale first; only the last non-empty line is read, and it must be exactly `APPROVE`, `DENY`, or `ESCALATE` (markdown or punctuation around it is ignored). Anything else escalates to you.
 
 
 ## Checkpoints
