@@ -2887,6 +2887,22 @@ approvals:
     APPROVE docker compose restarts in ~/deploys — they are routine here.
 ```
 
+`approvals.smart_policy_mode` controls how that text is combined with the built-in rules:
+
+- `append` (default) — the built-in APPROVE/DENY/ESCALATE rules stay, your rules are added after them.
+- `replace` — your rules replace the built-in rules entirely. The anti-injection preamble (the command text is untrusted) and the one-word answer contract are always kept; they cannot be replaced.
+
+```yaml
+approvals:
+  smart_policy_mode: replace
+  smart_policy: |
+    - APPROVE routine development work inside git worktrees under ~/work (builds, tests, git, package installs).
+    - DENY anything that deletes outside the working tree, rewrites system files, or wipes disks/databases.
+    - ESCALATE credential changes, service restarts/deploys, payments, and outbound messages.
+```
+
+The guardian must answer with a single verdict word. Reasoning models may write a short rationale first; only the last non-empty line is read, and it must be exactly `APPROVE`, `DENY`, or `ESCALATE` (markdown or punctuation around it is ignored). Anything else escalates to you.
+
 
 ## Checkpoints
 

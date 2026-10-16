@@ -1654,9 +1654,12 @@ DEFAULT_CONFIG = {
         "cron_mode": "deny",
         "single_query_mode": "deny",
         "unattended_mode": "deny",
-        # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
+        # Extra rules for the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",
+        # "append" adds smart_policy after the built-in rules; "replace" swaps the built-in rules
+        # for it (the untrusted-input preamble and APPROVE/DENY/ESCALATE contract always stay).
+        "smart_policy_mode": "append",
         # After this many consecutive guardian DENYs in a session, the deny message escalates to a
         # hard-stop (report to user / ask for /approve). Approval resets; 0 off.
         "denial_breaker_threshold": 3,
