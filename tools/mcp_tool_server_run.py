@@ -283,11 +283,11 @@ class MCPServerRunMixin:
             _errors._validate_remote_mcp_url(self.name, config.get("url"))
             # Content-type preflight (Streamable HTTP only; SSE serves text/event-stream): a
             # web-app root returns HTML and would hang the SDK for connect_timeout. Skipped once
-            # _ready was ever set and for OAuth servers (a token-less probe sees HTML/401).
+            # _ready was ever set and for OAuth / app-token servers (a token-less probe sees HTML/401).
             from tools.mcp_liveness import liveness_for
             if (config.get("transport") != "sse" and not config.get("skip_preflight")
                     and liveness_for(self.name).kind != "server_json"
-                    and not self._ready.is_set() and self._auth_type != "oauth"):
+                    and not self._ready.is_set() and self._auth_type not in ("oauth", "client_credentials")):
                 await self._preflight_content_type(
                     config["url"], headers=dict(config.get("headers") or {}),
                     ssl_verify=config.get("ssl_verify", True),

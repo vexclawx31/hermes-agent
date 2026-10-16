@@ -65,7 +65,7 @@ mcp_servers:
 | `idle_timeout_seconds` | number | stdio | Optional stdio server recycle after idle time (`0` disables). May also live under a `lifecycle:` mapping |
 | `max_lifetime_seconds` | number | stdio | Optional stdio server recycle after age (`0` disables). May also live under a `lifecycle:` mapping |
 | `tools` | mapping | both | Filtering and utility-tool policy |
-| `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
+| `auth` | string | HTTP | Authentication method. `oauth` enables OAuth 2.1 with PKCE; `client_credentials` sends a run-bound app token (see [App tokens](#app-tokens-auth-client_credentials)) |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. The same hint decides whether a call is transparently retried after the transport session expires mid-call: only `readOnlyHint: true` tools are replayed, while unannotated (write-capable) tools return an `outcome_uncertain` error — on a Streamable-HTTP server that expires idle sessions this means the first unannotated call after an idle period may fail and must be verified before re-invoking. Unrecognized values are treated as `untrusted` (fail-closed) |
@@ -420,6 +420,60 @@ mcp_servers:
 `user_agent` replaces the default `User-Agent` on **token-endpoint requests only** (authorization-code exchange, refresh and the device-flow token poll). Without it Hermes sends `Hermes-Agent/<version>` — never a header-less request, which WAF-fronted authorization servers answer with `403`. It never applies to MCP traffic, and no other token-request headers are configurable. Empty or null values are ignored. A failed exchange reports the status plus a short, redacted excerpt of the error body (a WAF's "Request blocked" page vs the issuer's `invalid_grant`), so the cause is visible without packet captures. `hermes mcp login` clears the stale grant and client registration before re-authorizing but keeps the cached authorization-server metadata, so the announced authorize URL stays the discovered one even when the metadata document cannot be re-fetched.
 
 OAuth discovery and dynamic-client-registration requests (the `/.well-known/...` metadata documents and the `registration_endpoint` POST) always carry `User-Agent: Hermes-Agent/<version>`. The MCP SDK builds those requests without any client default headers, and WAF-fronted authorization servers answer a header-less request with `403` — the metadata document then looks unreadable, registration falls back to a guessed `/register` on the MCP host, and the login fails with `Registration failed: 404`. When every metadata fetch does fail, the error now leads with those statuses (`Could not read authorization-server metadata (403 from https://…/.well-known/oauth-authorization-server; …)`) before the registration fallback's own error.
+
+## App tokens (`auth: client_credentials`)
+
+For a Streamable HTTP server that accepts an app access token minted by an OAuth 2.0
+`client_credentials` grant at a token endpoint other than the one its own metadata advertises
+(Linear's hosted MCP accepts app tokens from `https://api.linear.app/oauth/token`):
+
+```yaml
+mcp_servers:
+  linear_aligned:
+    url: https://mcp.linear.app/mcp
+    auth: client_credentials
+    client_credentials:
+      token_url: https://api.linear.app/oauth/token
+      client_id: ${LINEAR_CLIENT_ID}          # secrets stay in the profile's .env
+      client_secret: ${LINEAR_CLIENT_SECRET}
+      scope: read,write                       # exactly the app's approved scopes
+      verify:                                 # required
+        kind: linear_graphql
+        url: https://api.linear.app/graphql
+        actor_id: <app user id>
+        organization_id: <workspace id>
+        team_keys: [WEB2]                     # at least one required team
+```
+
+- **One token per agent run.** Each `run_conversation` turn is an admitted run. Before the run's
+  first request to the server a fresh token is minted and verified for that run (keyed by profile,
+  run identity, URL and app config). It is reused for that run's calls and reconnects, held only in
+  memory, and dropped when the run ends, including on error, interrupt or cancellation. Concurrent
+  runs and profiles never share a token. A call made outside an admitted run, or from a profile
+  other than the one owning the run and connection, fails closed (`no_run_binding`,
+  `profile_mismatch`). Each connect also mints a separate connection token. It is used only for
+  protocol upkeep (handshake, discovery, keepalive, session close) and never for a run's
+  requests.
+- **Fail-closed verification.** The token response must state the granted `scope` (an omitted
+  scope is `scope_unverified`). That scope must equal the configured one. `expires_in` must be a
+  finite positive number of at least 10 seconds. The verifier must confirm the actor, the
+  workspace and every required team in a bounded, paginated GraphQL query with no `errors`.
+  Otherwise the token is discarded before use. Missing pins are a `config_error` at startup.
+- **401 recovery.** Each tool call gets one recovery: the rejected token is never sent again,
+  one fresh token is minted, and only a request that is replay-safe (or a `readOnlyHint: true`
+  tool) is sent again. A write-capable tool is never replayed. It returns `outcome_uncertain`
+  with `readback_required`, so read the state back before any manual retry. A failed re-mint, or
+  a 401 for a freshly minted token, ends the integration for that run (`auth_failed` with a
+  stable `code`). The next run starts fresh.
+- Requires the Streamable HTTP transport and `mcp >= 2.0`, which passes the sending task's context
+  to each request. `transport: sse` and the automatic SSE fallback are refused.
+- Errors carry fixed text and a stable `code`. They never include a token, the client secret or a
+  response body.
+
+Rollout: add the block and secrets to the target profile, restart the gateway and check that the
+connect log shows `minted client_credentials token for connection`. To roll back, remove the
+`auth`/`client_credentials` keys (or `enabled: false` the server) and restart. Tokens are only in
+memory, so there is nothing on disk to clean up.
 
 ## Add to Hermes link
 
