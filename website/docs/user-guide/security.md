@@ -384,23 +384,18 @@ file bridge, background jobs with no human channel) fail closed. Private keys,
 
 ### Protected agent-instruction files (always ask)
 
-Writes to files that steer future agent behaviour — `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `.cursorrules` (any directory, case-insensitive), any basename matched by `security.protected_instruction_extra_patterns`, and project-local `.hermes/` config — ask a human every time, even under `--yolo`, and fail closed without a human channel. `security.protected_instruction_files: false` turns the gate off.
+Writes to files that steer future agent behaviour — `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `.cursorrules` (any directory, case-insensitive), any basename matched by `security.protected_instruction_extra_patterns`, project-local `.hermes/` config, and git metadata (anything inside a `.git` directory or a `.git` file, and `worktrees/<name>/gitdir` links) — ask a human every time, even under `--yolo`, and fail closed without a human channel. `security.protected_instruction_files: false` turns the gate off.
 
-When the agent works on its own branch in a separate checkout, you can let it edit those instruction files there without a prompt:
+When the agent works on its own branch in a separate checkout, you can let it edit the instruction files there without a prompt by naming the directories that hold its worktrees:
 
 ```yaml
 security:
   protected_instruction_files_allow_own_worktrees: true   # default: false
-  own_worktree_roots:                                      # optional extra roots
+  own_worktree_roots:                                      # required; nothing is exempt without a root
     - ~/scratch/agent-worktrees
 ```
 
-With the opt-in on, an instruction file is exempt when its resolved path is:
-
-- inside a **linked** git worktree (created by `git worktree add`; its `.git` is a file that git links back to from `<repo>/.git/worktrees/<name>/gitdir`). The main checkout — the one with a real `.git` directory — is never exempt; or
-- under one of `own_worktree_roots`.
-
-Project-local `.hermes/` config inside those worktrees stays gated, and the Hermes home itself keeps its own guards.
+An instruction file is exempt only when both the path as written and its resolved real path are under one of `own_worktree_roots`, so a symlink crossing the root boundary in either direction stays gated. Hermes does not auto-detect git worktrees: the agent could forge the `.git` files such a check would trust. Git metadata and project-local `.hermes/` config stay gated inside the roots too, and the Hermes home keeps its own guards.
 
 ### HERMES_WRITE_SAFE_ROOT (optional sandbox)
 

@@ -202,69 +202,57 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     return enabled, [str(p) for p in extra if p]
 
 
-def _own_worktree_exemption_config() -> tuple[bool, list[str]]:
-    """``(allow, roots)`` from ``security.protected_instruction_files_allow_own_worktrees`` and
-    ``security.own_worktree_roots``. Anything but a literal ``true`` — or a failed read — keeps
-    the exemption OFF."""
+def _own_worktree_roots() -> list[str]:
+    """Realpaths of ``security.own_worktree_roots`` when
+    ``security.protected_instruction_files_allow_own_worktrees`` is a literal ``true``, else ``[]``.
+    Only explicitly configured roots count — no git auto-detection, because the agent can write
+    the ``.git`` / ``gitdir`` files any detector would trust. A failed read keeps protection."""
     try:
         from hermes_cli.config import load_config, cfg_get
         cfg = load_config()
         allow = cfg_get(cfg, "security", "protected_instruction_files_allow_own_worktrees", default=False)
         roots = cfg_get(cfg, "security", "own_worktree_roots", default=[])
     except Exception:
-        return False, []
-    if allow is not True:
-        return False, []
-    if not isinstance(roots, list):
-        roots = []
-    return True, [os.path.realpath(_expand_tilde(str(r))) for r in roots if r]
+        return []
+    if allow is not True or not isinstance(roots, list):
+        return []
+    # Both spellings: the lexical one matches an input path written through a symlinked prefix
+    # (``/tmp`` on macOS), the realpath one matches the resolved target.
+    out: list[str] = []
+    for raw in (str(r) for r in roots if r):
+        for form in (os.path.normpath(_expand_tilde(raw)), os.path.realpath(_expand_tilde(raw))):
+            if os.path.isabs(form) and form not in out:
+                out.append(form)
+    return out
 
 
-def _linked_worktree_root(path: str) -> str | None:
-    """Root of the LINKED git worktree (``git worktree add``) containing *path*, else ``None``.
-
-    The nearest ancestor holding ``.git`` decides: a ``.git`` directory is a main checkout (never
-    exempt); a ``.git`` file must name ``<common>/.git/worktrees/<name>`` whose ``gitdir`` file
-    links back to this ``.git`` — the two-way link git itself writes, so a lone hand-written
-    ``.git`` file does not qualify."""
-    current = os.path.dirname(path)
-    while True:
-        marker = os.path.join(current, ".git")
-        if os.path.isdir(marker):
-            return None
-        if os.path.isfile(marker):
-            try:
-                with open(marker, encoding="utf-8") as fh:
-                    first = fh.readline().strip()
-                if not first.startswith("gitdir:"):
-                    return None
-                gitdir = first[len("gitdir:"):].strip()
-                gitdir = os.path.realpath(gitdir if os.path.isabs(gitdir) else os.path.join(current, gitdir))
-                if os.path.basename(os.path.dirname(gitdir)) != "worktrees":
-                    return None
-                with open(os.path.join(gitdir, "gitdir"), encoding="utf-8") as fh:
-                    back = fh.readline().strip()
-            except OSError:
-                return None
-            back = back if os.path.isabs(back) else os.path.join(gitdir, back)
-            return current if os.path.realpath(back) == os.path.realpath(marker) else None
-        parent = os.path.dirname(current)
-        if parent == current:
-            return None
-        current = parent
+def _under_any_root(path: str, roots: list[str]) -> bool:
+    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
-def _in_own_worktree(resolved: str, roots: list[str]) -> bool:
-    """*resolved* is under a configured ``own_worktree_roots`` entry, or inside a linked git
-    worktree (not a main checkout)."""
-    if any(resolved == r or resolved.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+def _is_git_metadata(parts: list[str]) -> bool:
+    """A path inside a ``.git`` dir / a ``.git`` file, or a ``worktrees/<n>/gitdir`` back-link
+    (bare repos keep those outside a ``.git`` component). Hooks and config there steer what runs."""
+    if any(p.lower() == ".git" for p in parts):
         return True
-    return _linked_worktree_root(resolved) is not None
+    return len(parts) >= 3 and parts[-1] == "gitdir" and parts[-3] == "worktrees"
+
+
+def _in_own_worktree(normalized: str, resolved: str, own_roots: list[str] | None) -> bool:
+    """Opt-in exemption for instruction files in the agent's own work area. BOTH the input path
+    (when absolute) and its realpath must sit under a configured root, so a symlink in either
+    direction keeps protection. Roots load lazily: only after a basename matched."""
+    roots = _own_worktree_roots() if own_roots is None else own_roots
+    if not roots:
+        return False
+    paths = [resolved] + ([normalized] if os.path.isabs(normalized) else [])
+    return all(_under_any_root(p, roots) for p in paths)
 
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None,
+                                  own_roots: list[str] | None = None) -> str | None:
     """Return a short label when ``filepath`` targets a protected instruction file, else ``None``.
     Matches BOTH the normalized input and its realpath so no symlink direction escapes.
 
@@ -292,21 +280,20 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
-    # Opt-in: the agent's own work branch (a linked worktree / configured scratch root) may edit
-    # its instruction files. Basename rules only — project-local ``.hermes`` config stays gated.
-    allow_own, own_roots = _own_worktree_exemption_config()
-    own_worktree = allow_own and _in_own_worktree(resolved, own_roots)
-
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
-        if not own_worktree and (base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns)):
-            return base
+        parts = candidate.replace("\\", "/").rstrip("/").split("/")
+        if _is_git_metadata(parts):
+            return candidate
+        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
+                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
+            if not _in_own_worktree(normalized, resolved, own_roots):
+                return base
+            continue
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
         # would gate every write inside a checkout living under ~/.hermes.
-        parts = candidate.replace("\\", "/").rstrip("/").split("/")
         if len(parts) >= 2 and parts[-2] == ".hermes":
             return candidate
     return None
@@ -397,7 +384,9 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
-    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
+    own_roots = _own_worktree_roots()
+    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra,
+                                                         own_roots=own_roots)
                            for p in paths) if r]
     if not reasons:
         return None

@@ -1746,9 +1746,8 @@ DEFAULT_CONFIG = {
         # globs on the basename (e.g. "*.mdc").
         "protected_instruction_files": True,
         "protected_instruction_extra_patterns": [],
-        # Opt-in: skip that approval for instruction FILES (not .hermes dirs) inside the agent's own
-        # work area — a linked git worktree (`git worktree add`, never a main checkout) or a path
-        # under one of own_worktree_roots.
+        # Opt-in: skip that approval for instruction FILES (not .hermes dirs, not .git metadata)
+        # whose input path AND realpath are under one of own_worktree_roots (explicit roots only).
         "protected_instruction_files_allow_own_worktrees": False,
         "own_worktree_roots": [],
         "tirith_enabled": True,
