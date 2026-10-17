@@ -27,6 +27,17 @@ memory:
                       # (plugin catalog — run `hermes plugins install <name>` first)
 ```
 
+### Providers that moved to the plugin catalog
+
+Honcho, Hindsight, Mem0, Supermemory, OpenViking and Holographic used to ship inside Hermes and now come from the plugin catalog. If `memory.provider` names one of them and its plugin is not installed, Hermes does **not** fetch it by default: agent start and `hermes update` print one warning with the exact `hermes plugins install <name>` command for that profile, and the agent runs without that memory provider until you install it. No network request is made.
+
+To have Hermes install the catalog plugin for you on agent start and `hermes update` (the behaviour the "Migrating from bundled …" sections below describe), opt in per profile:
+
+```yaml
+memory:
+  auto_install_provider: true
+```
+
 ## How It Works
 
 When a memory provider is active, Hermes automatically:
@@ -287,7 +298,7 @@ See the [plugin README](https://github.com/plastic-labs/honcho/tree/main/hermes-
 
 #### Upgrading from the bundled Honcho
 
-Earlier Hermes releases shipped Honcho in-tree. If a profile still has `memory.provider: honcho`, Hermes installs the catalog plugin automatically the next time it starts or runs `hermes update` — your `~/.honcho/config.json` (or `$HERMES_HOME/honcho.json`), host blocks, peers and session mappings are read exactly as before, so no memory is lost. To do it by hand, or on a machine without network access at startup, run `hermes plugins install honcho`.
+Earlier Hermes releases shipped Honcho in-tree. If a profile still has `memory.provider: honcho`, run `hermes plugins install honcho` (or opt in with `memory.auto_install_provider: true` and Hermes installs it the next time it starts or runs `hermes update`) — your `~/.honcho/config.json` (or `$HERMES_HOME/honcho.json`), host blocks, peers and session mappings are read exactly as before, so no memory is lost.
 
 
 ---
@@ -374,6 +385,8 @@ requests. This standard harness identifier contains no per-user identifier and
 does not add a separate request.
 
 ### Migrating from bundled OpenViking
+
+The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install openviking` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 OpenViking used to ship inside the Hermes tree. If your `config.yaml` already has `memory.provider: openviking`, there is nothing to do for most users:
 
@@ -472,6 +485,8 @@ The plugin authenticates with `X-API-Key` and uses the server's `/search` / `/me
 
 ### Migrating from bundled Mem0
 
+The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install mem0` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
+
 Mem0 used to ship inside the Hermes tree (and as the `hermes-agent[mem0]` pip extra). If your `config.yaml` already has `memory.provider: mem0`, there is nothing to do for most users:
 
 - `hermes update` installs the catalog plugin into every profile home that names the provider.
@@ -534,6 +549,8 @@ See the [upstream Hermes integration docs](https://hindsight.vectorize.io/sdks/i
 
 #### Migrating from bundled Hindsight
 
+The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install hindsight` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
+
 Hindsight used to ship inside the Hermes tree (and as the `hermes-agent[hindsight]` pip extra). If your `config.yaml` already has `memory.provider: hindsight`, there is nothing to do for most users:
 
 - `hermes update` installs the catalog plugin into every profile home that names the provider. Each line names the profile it is about. In a terminal it asks before preparing the plugin's Python dependencies; when several profiles use the provider, the questions are asked once and the answers apply to all of them. Without a terminal (the Desktop app, a script, a service) nobody can answer, so each profile prepares them unattended when its `security.allow_lazy_installs` is on (the default); a profile with it off gets the exact `hermes -p <profile> plugins install hindsight` command instead, and the other profiles still migrate.
@@ -591,6 +608,8 @@ hermes config set memory.provider holographic
 The catalog plugin has its own release notes and options beyond this list; see its [README](https://github.com/itpartypattaya/hermes-plugin-holographic) for the current tool actions and settings.
 
 #### Migrating from bundled Holographic
+
+The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install holographic` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 Holographic used to ship inside the Hermes tree. If your `config.yaml` already has `memory.provider: holographic`, there is nothing to do:
 
@@ -747,6 +766,8 @@ Base URL precedence is `supermemory.json` → `SUPERMEMORY_BASE_URL` → `https:
 **Support:** [Discord](https://supermemory.link/discord) · [support@supermemory.com](mailto:support@supermemory.com)
 
 ### Migrating from bundled Supermemory
+
+The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install supermemory` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 Supermemory used to ship inside the Hermes tree (and as the `hermes-agent[supermemory]` pip extra). If your `config.yaml` already has `memory.provider: supermemory`, there is nothing to do for most users:
 

@@ -1010,6 +1010,12 @@ memory:
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
 
+  # A memory.provider that moved out of core into the plugin catalog (honcho,
+  # hindsight, mem0, ...) and is not installed: true installs its catalog plugin
+  # from the network on agent start and `hermes update`. false (default) warns
+  # with the `hermes plugins install <name>` command and runs without it.
+  auto_install_provider: false
+
 # =============================================================================
 # Session Continuity (Messaging Platforms)
 # =============================================================================
