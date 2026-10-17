@@ -191,8 +191,14 @@ def _retry_once(server_name: str, retry_call, op_description: str, what: str):
 def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str):
     """OAuth recovery + one retry; None when *exc* is not an auth error. ``handle_401`` decides
     viability; if viable, signal a reconnect (fresh credentials), wait ready, retry once. Any
-    failure returns the structured ``needs_reauth`` error so the model stops refreshing."""
+    failure returns the structured ``needs_reauth`` error so the model stops refreshing.
+    ``auth: client_credentials`` servers never reach the OAuth manager: their run-bound recovery
+    is :func:`_handle_client_credentials_outcome`."""
     if not _is_auth_error(exc):
+        return None
+    srv = _lookup_reconnectable_server(server_name)
+    from tools.mcp_client_credentials import is_client_credentials
+    if is_client_credentials(getattr(srv, "_config", None)):
         return None
     from tools.mcp_oauth_manager import get_manager
     try:
@@ -201,7 +207,6 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
         logger.warning("MCP OAuth '%s': recovery attempt failed: %s", server_name, rec_exc)
         recovered = False
     if recovered:
-        srv = _lookup_reconnectable_server(server_name)
         # Recovery + reconnect is independent evidence of viability: close the breaker here, not only on
         # retry success (else a failing retry pins it open forever).
         if srv is not None and _loop._signal_reconnect_and_wait(
@@ -211,6 +216,51 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
         if result is not None:
             return result
     return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name), needs_reauth=True, server=server_name)
+
+
+def _client_credentials_operation(server: Any, server_name: str, *, read_only: bool):
+    """``(operation, None)`` binding this call to the current agent run for an ``auth:
+    client_credentials`` server, ``(None, error)`` when it cannot be bound (fail closed, before any
+    transport work), ``(None, None)`` for every other server."""
+    from tools.mcp_client_credentials import ClientCredentialsError, begin_operation, is_client_credentials
+    if not is_client_credentials(getattr(server, "_config", None)):
+        return None, None
+    try:
+        return begin_operation(server, read_only=read_only), None
+    except ClientCredentialsError as exc:
+        return None, tool_error(str(exc), auth_failed=True, code=exc.code, server=server_name)
+
+
+def _bind_operation(cc_op, server: Any, call):
+    """*call* (a coroutine function) run under *cc_op* on every attempt, retries included."""
+    if cc_op is None:
+        return call
+    from tools.mcp_client_credentials import run_operation
+    return lambda: run_operation(cc_op, server, call)
+
+
+def _handle_client_credentials_outcome(server_name: str, exc: BaseException, retry_call, op_description: str,
+                                       *, cc_op):
+    """Map a failed client_credentials operation from the outcome its auth flow recorded — never
+    from the SDK's generic error text, which also covers unrelated 4xx/5xx. Nothing is replayed
+    here: the auth flow already spent the operation's one recovery (and replayed a read-only
+    request). Run-local outcomes are not breaker strikes: other runs share the connection."""
+    from tools.mcp_client_credentials import AUTH_FAILED_MSG, NOT_REPLAYED_MSG, ClientCredentialsError
+    if isinstance(exc, ClientCredentialsError):
+        return tool_error(AUTH_FAILED_MSG.format(s=server_name, code=exc.code), auth_failed=True,
+                          code=exc.code, server=server_name)
+    if cc_op.unauthorized and not cc_op.read_only:
+        # Any 401 on a write-capable call leaves its outcome unconfirmed, whatever recovery did next.
+        code = None if cc_op.outcome in ("write_unconfirmed", "recovered", None) else cc_op.outcome
+        logger.warning("MCP server '%s': %s got HTTP 401; write-capable call NOT replayed (outcome unconfirmed%s)",
+                       server_name, op_description, f", {code}" if code else "")
+        return tool_error(NOT_REPLAYED_MSG.format(s=server_name, t=op_description), outcome_uncertain=True,
+                          readback_required=True, server=server_name, **({"code": code} if code else {}))
+    if cc_op.unauthorized and cc_op.outcome != "recovered":
+        code = cc_op.outcome or "token_rejected"
+        return tool_error(AUTH_FAILED_MSG.format(s=server_name, code=code), auth_failed=True, code=code,
+                          server=server_name)
+    return None
 
 
 def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str,
@@ -567,6 +617,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # Only a tool annotated readOnlyHint=True is replayed after session expiry; a 401 is always
         # pre-dispatch so the auth recoverer keeps its retry for every tool.
         read_only = _tool_is_read_only(server_name, tool_name)
+        cc_op, error = _client_credentials_operation(server, server_name, read_only=read_only)
+        if error is not None:
+            return error
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
@@ -583,9 +636,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _core._bump_server_error(server_name)
             logger.error("MCP tool %s/%s call failed: %s", server_name, tool_name, exc)
         session_expired = partial(_handle_session_expired_and_retry, call_may_have_side_effects=not read_only)
+        cc_outcome = () if cc_op is None else (partial(_handle_client_credentials_outcome, cc_op=cc_op),)
         return _dispatch(
-            server_name, server, op, _call, tool_timeout,
-            (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, session_expired),
+            server_name, server, op, _bind_operation(cc_op, server, _call), tool_timeout,
+            (_handle_stdio_child_exited_and_retry, *cc_outcome, _handle_auth_error_and_retry, session_expired),
             _on_failure, record_outcome=True)
     return _handler
 
@@ -602,14 +656,18 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
                 return tool_error(f"MCP server '{server_name}' is not connected")
             if required and not args.get(required):
                 return tool_error(f"Missing required parameter '{required}'")
+            cc_op, error = _client_credentials_operation(server, server_name, read_only=True)
+            if error is not None:
+                return error
 
             async def _call():
                 async with server._rpc_lock:
                     result = await rpc(server.session, args, server_name)
                 return json.dumps(render(result, server_name), ensure_ascii=False)
+            cc_outcome = () if cc_op is None else (partial(_handle_client_credentials_outcome, cc_op=cc_op),)
             return _dispatch(
-                server_name, server, op, _call, tool_timeout,
-                (_handle_auth_error_and_retry, _handle_session_expired_and_retry),
+                server_name, server, op, _bind_operation(cc_op, server, _call), tool_timeout,
+                (*cc_outcome, _handle_auth_error_and_retry, _handle_session_expired_and_retry),
                 lambda exc: logger.error("MCP %s/%s failed: %s", server_name, log_label, exc))
         return _handler
     return _factory

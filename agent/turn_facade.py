@@ -51,6 +51,7 @@ class TurnFacadeMixin:
         from agent.subagent_lifecycle import bind_subagent_parent
         from agent.interrupt_scope import track_in_interrupt_scope
         from agent.turn_facade_lease import admit_durable_turn_lease, carry_unadmitted_user_message
+        from tools.mcp_client_credentials import agent_run as mcp_agent_run
         from hermes_cli.observability.relay_shared_metrics import finish_task_run, start_task_run
 
         effective_task_id = task_id or str(uuid.uuid4())
@@ -130,7 +131,10 @@ class TurnFacadeMixin:
 
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
+            # mcp_agent_run: MCP ``auth: client_credentials`` tokens are owned by this admitted run
+            # (identity relay_turn_id, current profile) and released on every exit.
+            with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self), \
+                    mcp_agent_run(relay_turn_id):
                 try:
                     if lease is not None:
                         lease.start()

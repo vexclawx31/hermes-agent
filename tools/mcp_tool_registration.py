@@ -419,8 +419,10 @@ def _connection_identity(config: dict) -> tuple:
     def _frozen(value):
         return json.dumps(value or {}, sort_keys=True, default=str)
 
+    cc = config.get("client_credentials") if isinstance(config.get("client_credentials"), dict) else {}
+    cc_identity = _frozen({k: cc.get(k) for k in ("token_url", "client_id", "scope")})  # never the secret
     return (config_fingerprint(config), _frozen(config.get("env")), _frozen(config.get("headers")),
-            _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")))
+            _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")), cc_identity)
 
 
 def _auth_type(config: dict) -> str:
@@ -436,7 +438,7 @@ def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False
     if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
         return False
     # Identities match, so both sides carry the same normalised auth type.
-    return not (cross_profile and _auth_type(config) == "oauth")
+    return not (cross_profile and _auth_type(config) in ("oauth", "client_credentials"))
 
 
 def register_connected_into_current_scope(servers: dict) -> int:

@@ -445,9 +445,21 @@ class MCPServerTransportMixin:
                      "(%r) — reconnecting immediately instead of backing off", self.name, eg)
         return "reconnect"
 
+    def _close_cc_connection(self) -> None:
+        """Drop this connect's ``client_credentials`` maintenance token (run tokens are run-owned)."""
+        binding = getattr(self, "_cc_connection", None)
+        if binding is not None:
+            self._cc_connection = None
+            binding.close()
+
     def _build_oauth_auth(self, url: str, config: dict):
         """OAuth 2.1 PKCE via the central MCPOAuthManager (one provider reused across reconnects and
         CLI paths). Setup failures re-raise (after a warning) so only this server is reported failed."""
+        if self._auth_type == "client_credentials":  # config errors propagate: fail closed, park as auth
+            from tools.mcp_client_credentials import open_connection
+            self._close_cc_connection()
+            self._cc_connection = open_connection(self.name, url, config)
+            return self._cc_connection.auth()
         if self._auth_type != "oauth":
             return None
         try:
@@ -523,6 +535,12 @@ class MCPServerTransportMixin:
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP (or SSE) transport."""
+        try:
+            return await self._run_http_connect(config)
+        finally:
+            self._close_cc_connection()
+
+    async def _run_http_connect(self, config: dict):
         _core._ensure_mcp_sdk()
         if not _core._MCP_HTTP_AVAILABLE:
             raise ImportError(f"MCP server '{self.name}' requires HTTP transport but "
@@ -547,9 +565,17 @@ class MCPServerTransportMixin:
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
         common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
+        cc_connection = getattr(self, "_cc_connection", None) if self._auth_type == "client_credentials" else None
+        if cc_connection is not None:
+            # client_credentials: run-bound tokens need the context-carrying Streamable HTTP client;
+            # mint + verify this connect's maintenance token before anything is sent.
+            if not _core._MCP_NEW_HTTP:
+                from tools.mcp_client_credentials import ClientCredentialsError
+                raise ClientCredentialsError(self.name, "config_error", "requires mcp >= 2.0 Streamable HTTP")
+            await cc_connection.provider.token()
         if config.get("transport") == "sse":
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
-        if self._sse_fallback:
+        if self._sse_fallback and cc_connection is None:
             # A prior connect already proved this server SSE-only: skip the doomed Streamable
             # HTTP attempt on reconnects instead of flapping into the retry budget.
             logger.info("MCP server '%s': using latched SSE fallback transport", self.name)
@@ -571,7 +597,8 @@ class MCPServerTransportMixin:
             # transport must not silently switch transports), never on a timeout (not a
             # transport mismatch — ``_is_streamable_http_rejection`` matches neither), and never
             # with ``strict_redirect_headers`` (SSE cannot enforce that boundary).
-            if (self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc)):
+            if (self._ever_connected or common[-1] or cc_connection is not None
+                    or not _is_streamable_http_rejection(exc)):
                 if http_detail != str(_unwrap_exception_group(exc)):  # opaque SDK error + a recorded rejection
                     raise ConnectionError(f"MCP server '{self.name}': Streamable HTTP connect failed "
                                           f"({http_detail})") from exc
