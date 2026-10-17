@@ -44,11 +44,11 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
+import plugins.platforms.slack.adapter as _slack_mod
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter, _apply_yaml_config  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter, _apply_yaml_config
 
 BOT_USER_ID = "U_BOT"
 CHANNEL_ID = "C_FORCED"
@@ -149,6 +149,8 @@ async def test_forced_channel_wake_checks_still_apply(adapter):
     adapter.config.extra["require_mention"] = False
     adapter.config.extra["require_mention_channels"] = CHANNEL_ID
     adapter._mentioned_threads.add("100.000")
+    # Fork SL1: the local marker counts only under a known (human) thread root.
+    adapter._thread_root_owner_and_mentions = AsyncMock(return_value=("human", False))
 
     await adapter._handle_slack_message(
         _event("follow-up", ts="101.000", thread_ts="100.000")

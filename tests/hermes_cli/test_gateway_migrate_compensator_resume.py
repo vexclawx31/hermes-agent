@@ -66,7 +66,7 @@ def stranded(tmp_path, monkeypatch):
         if verb in ("start", "restart") and name == "default" and state.start_succeeds:
             _write_live_gateway(root, ["default", "coder", "ops"])
 
-    import gateway.status as status
+    from gateway import status
     monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
     # Stand-in only: a bare argv is identified by its LAUNCH environment, and for this pytest PID that is
     # whatever launched pytest, not the HERMES_HOME set above. Pin it to the default launch home.

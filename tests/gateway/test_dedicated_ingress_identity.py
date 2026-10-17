@@ -246,10 +246,7 @@ async def test_native_key_and_pending_merge_preserve_receipt():
     assert e.source.to_dict() == wire
 
 
-def test_real_constructor_captures_launch(monkeypatch):
-    from gateway.config import GatewayConfig
-    from gateway.ingress_identity import _LAUNCHES
-
+def _stub_unrelated_init(monkeypatch, profile):
     # Execute the constructor and its real cache/launch initialization. Mock only
     # unrelated startup, persistence and environment-loading side effects.
     for name in (
@@ -257,18 +254,45 @@ def test_real_constructor_captures_launch(monkeypatch):
         "_init_runtime_settings",
         "_init_session_store",
         "_init_lifecycle_state",
-        "_init_startup_checks",
         "_init_session_db",
         "_init_registries_and_clocks",
     ):
         monkeypatch.setattr(GatewayRunner, name, lambda self: None)
-    monkeypatch.setattr(GatewayRunner, "_active_profile_name", lambda self: "alpha")
+    monkeypatch.setattr(GatewayRunner, "_active_profile_name", lambda self: profile)
+
+
+def test_real_constructor_captures_launch(monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway.ingress_identity import _LAUNCHES
+
+    _stub_unrelated_init(monkeypatch, "alpha")
     runner = GatewayRunner(config=GatewayConfig())
     assert _LAUNCHES[runner].owner == "alpha"
     original = _LAUNCHES[runner]
     runner._primary_profile_name = "beta"
     capture_launch(runner)
     assert _LAUNCHES[runner] is original
+
+
+def test_real_multiplex_constructor_launch_owner_is_default(monkeypatch):
+    """Upstream #121478: a multiplex host's primary map is the default profile even when a
+    named profile launched it. The launch snapshot must record that owner, so the named
+    launcher's adapters bind only as their own (secondary) owner, never as the primary."""
+    from gateway.config import GatewayConfig
+    from gateway.ingress_identity import _LAUNCHES
+
+    _stub_unrelated_init(monkeypatch, "alpha")
+    runner = GatewayRunner(config=GatewayConfig(multiplex_profiles=True))
+    assert runner._primary_profile_name == "default"
+    assert runner._kanban_notifier_profile == "alpha"
+    launch = _LAUNCHES[runner]
+    assert launch.owner == "default"
+    assert launch.multiplexed is True
+    # Re-entry never replaces the snapshot, and drift from it is detectable.
+    runner._primary_profile_name = "alpha"
+    capture_launch(runner)
+    assert _LAUNCHES[runner] is launch
+    assert runner._primary_profile_name != launch.owner
 
 
 @pytest.mark.asyncio

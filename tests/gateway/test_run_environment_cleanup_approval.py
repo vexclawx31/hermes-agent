@@ -18,7 +18,8 @@ SECRET = 'synthetic-approval-literal-012345'
 
 
 def launch(adapter, scope):
-    q = asyncio.Queue()
+    # Same transport the handler builds: a _RunStream carrying the scoped redactor.
+    q = runs._RunStream(scope.redact if scope else None)
     adapter._run_streams['run_cleanup'] = q
     return runs._RunLaunch(
         owner=adapter, run_id='run_cleanup', queue=q, session_id='session_cleanup',
@@ -191,7 +192,39 @@ async def test_approval_literal_redacted_before_status_and_sse(monkeypatch):
         assert 'approval.request' in text and '[REDACTED]' in text
         assert SECRET not in text
     # A late callback must not publish into transport it no longer owns.
+    published = run.queue.next_seq
     adapter._run_streams.pop(run.run_id, None)
     notify(event)
     await asyncio.sleep(0)
-    assert run.queue.empty()
+    assert run.queue.next_seq == published
+
+
+def test_run_stream_redacts_every_writer_and_the_replay_backlog():
+    """Writers that bypass _RunLaunch.put_event (control-plane marks, progress callbacks)
+    still land redacted, and a late subscriber's replay never holds the literal."""
+    adapter = _make_adapter()
+    scope = RunEnvironment({'PAPERCLIP_API_KEY': SECRET})
+    stream = adapter._run_streams['run_mark'] = runs._RunStream(scope.redact)
+    adapter._run_statuses['run_mark'] = {'status': 'running'}
+    runs._mark_run_event(adapter, 'run_mark', 'run.note', detail='token ' + SECRET)
+    stream.put_nowait({'event': 'tool.progress', 'preview': [SECRET]})
+    stream.put_nowait(None)
+    _, replay = stream.attach()
+    assert len(replay) == 3 and replay[-1] == (2, None)
+    assert SECRET not in json.dumps([event for _, event in replay])
+    assert '[REDACTED]' in json.dumps(replay[0][1])
+
+
+def test_shared_approval_builder_redacts_for_a_bound_scope():
+    """The builder the session stream and chat-completions surfaces share redacts the
+    run's literals whether the scope is passed or only bound in context."""
+    from gateway.runtime_context import bind_environment
+    scope = RunEnvironment({'PAPERCLIP_API_KEY': SECRET})
+    data = {'command': 'echo ' + SECRET, 'description': 'uses ' + SECRET}
+    explicit = api_server._approval_request_event('run_x', data, environment=scope)
+    with bind_environment(scope):
+        bound = api_server._approval_request_event('run_x', data)
+    unscoped = api_server._approval_request_event('run_x', {'description': 'plain'})
+    for event in (explicit, bound):
+        assert SECRET not in json.dumps(event) and event['event'] == 'approval.request'
+    assert unscoped['description'] == 'plain'

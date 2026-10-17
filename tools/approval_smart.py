@@ -115,6 +115,18 @@ def _parse_verdict(answer: str) -> str:
     if word == "ESCALATE":
         return "escalate"
     return _VERDICTS.get(word, "escalate")
+def _verdict_reasoning() -> dict | None:
+    """Thinking off for the verdict, unless the operator set reasoning for the approval task
+    (``auxiliary.approval.reasoning_effort`` or ``extra_body.reasoning``). A one-word verdict needs
+    no thinking, and a reasoning model otherwise spends the whole 16-token budget thinking and
+    returns nothing (a local Qwen 27B: 45 of 45 verdicts came back empty)."""
+    from agent.auxiliary_task_config import _get_auxiliary_task_config
+
+    config = _get_auxiliary_task_config("approval")
+    extra_body = config.get("extra_body")
+    if config.get("reasoning_effort") not in (None, "") or (isinstance(extra_body, dict) and "reasoning" in extra_body):
+        return None
+    return {"enabled": False}
 
 
 def _smart_approve(command: str, description: str) -> str:
@@ -148,6 +160,7 @@ def _smart_approve(command: str, description: str) -> str:
         response = call_llm(
             task="approval", temperature=0, max_tokens=_GUARDIAN_MAX_TOKENS, timeout=smart_timeout,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            reasoning_config=_verdict_reasoning(),
         )
         logger.debug("Smart approvals: LLM call completed in %.1fs", time.monotonic() - _smart_t0)
         answer = (response.choices[0].message.content or "").strip()

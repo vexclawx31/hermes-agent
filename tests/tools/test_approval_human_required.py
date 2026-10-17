@@ -21,8 +21,6 @@ def _clean(monkeypatch):
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-    monkeypatch.setattr("tools.tirith_security.check_command_security",
-                        lambda _command: {"action": "allow", "findings": [], "summary": ""})
     yield
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
@@ -210,3 +208,68 @@ class TestReviewFindings:
         prompts, callback = _recorder("once")
         assert check_all_command_guards("git push -f origin x && sudo -s", "local",
                                         approval_callback=callback)["approved"] is False
+
+
+class TestPreparedTerminalBatch:
+    """A desktop batch prepares each terminal decision ahead of its turn and
+    consumes it at execution. The floor must hold across that hand-off."""
+
+    CALL_ID = "call-red"
+
+    def _slot(self):
+        import threading
+        from types import SimpleNamespace
+        from agent.terminal_approval_batch import _TerminalSlot
+
+        batch = SimpleNamespace(cancelled=threading.Event(), failure_seen=False, task_id="task",
+                                agent=SimpleNamespace(_interrupt_requested=False))
+        parsed = SimpleNamespace(ref=lambda task_id: SimpleNamespace(call_id=self.CALL_ID))
+        return _TerminalSlot(batch, parsed, 0)
+
+    def _run(self, slot, prepared_command, executed_command, **kwargs):
+        """Prepare like _TerminalSlot.prepare, then execute in the same slot."""
+        from agent import terminal_approval_batch as tab
+
+        slot_token = tab._slot.set(slot)
+        call_token = approval_context._approval_tool_call_id.set(self.CALL_ID)
+        try:
+            slot.preparing = True
+            try:
+                slot.guard_key = (prepared_command, "local", False)
+                slot.decision = check_all_command_guards(prepared_command, "local", **kwargs)
+            finally:
+                slot.preparing = False
+            return slot.decision, check_all_command_guards(executed_command, "local", **kwargs)
+        finally:
+            approval_context._approval_tool_call_id.reset(call_token)
+            tab._slot.reset(slot_token)
+
+    def test_unattended_batch_cannot_run_a_red_command(self, monkeypatch):
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        _config(monkeypatch, mode="manual")
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        prepared, executed = self._run(self._slot(), RED, RED)
+        assert prepared["approved"] is False and prepared.get("human_required") is True
+        assert executed["approved"] is False and executed.get("human_required") is True
+
+    def test_smart_mode_batch_skips_guardian_and_stays_floored(self, monkeypatch):
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        _config(monkeypatch, mode="smart")
+        calls = _smart(monkeypatch, "approve")
+        prepared, executed = self._run(self._slot(), RED, RED)
+        assert calls == []
+        assert prepared["approved"] is False and prepared.get("human_required") is True
+        assert executed["approved"] is False and executed.get("human_required") is True
+
+    def test_smart_approval_prepared_for_green_is_not_reused_for_red(self, monkeypatch):
+        # Guardian approvals are the only policy decisions a batch reuses, so
+        # this runs attended: the person is asked about RED and says no.
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        _config(monkeypatch, mode="smart")
+        calls = _smart(monkeypatch, "approve")
+        prompts, callback = _recorder("deny")
+        prepared, executed = self._run(self._slot(), GREEN, RED, approval_callback=callback)
+        assert prepared["approved"] is True and prepared.get("smart_approved") is True
+        assert calls == [GREEN]
+        assert len(prompts) == 1
+        assert executed["approved"] is False

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from agent import stop_guard
 from agent.stop_guard import ends_with_permission_question, turn_did_tool_work

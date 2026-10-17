@@ -24,7 +24,7 @@ SECRET = "synthetic-launch-secret-value"
 @pytest.fixture
 def fleet(tmp_path, monkeypatch):
     root = tmp_path / "home" / ".hermes"
-    homes = {"default": root, "lynx": root / "profiles" / "lynx", "opix": root / "profiles" / "opix"}
+    homes = {"default": root, "alpha": root / "profiles" / "alpha", "beta": root / "profiles" / "beta"}
     for home in homes.values():
         home.mkdir(parents=True, exist_ok=True)
     children = {}
@@ -63,52 +63,52 @@ def live(fleet, name):
 
 
 def test_bare_peer_is_its_launch_home_gateway_and_never_the_default(fleet):
-    lynx = fleet.spawn("lynx", fleet.homes["lynx"])
-    opix = fleet.spawn("opix", fleet.homes["opix"])
-    fleet.commands.update({lynx: BARE_ARGV, opix: BARE_ARGV})
-    fleet.record(fleet.homes["lynx"], lynx)
-    fleet.record(fleet.homes["opix"], opix)
-    fleet.record(fleet.homes["default"], lynx)          # stale/spoofed default record naming a peer PID
-    assert live(fleet, "lynx") == lynx
-    assert live(fleet, "opix") == opix
+    alpha = fleet.spawn("alpha", fleet.homes["alpha"])
+    beta = fleet.spawn("beta", fleet.homes["beta"])
+    fleet.commands.update({alpha: BARE_ARGV, beta: BARE_ARGV})
+    fleet.record(fleet.homes["alpha"], alpha)
+    fleet.record(fleet.homes["beta"], beta)
+    fleet.record(fleet.homes["default"], alpha)          # stale/spoofed default record naming a peer PID
+    assert live(fleet, "alpha") == alpha
+    assert live(fleet, "beta") == beta
     assert live(fleet, "default") is None                # the default home cannot claim a named peer
 
 
 def test_wrong_home_records_and_stale_start_are_refused(fleet):
-    lynx = fleet.spawn("lynx", fleet.homes["lynx"])
-    fleet.commands[lynx] = BARE_ARGV
-    fleet.record(fleet.homes["opix"], lynx)              # opix's record names lynx's process
-    assert live(fleet, "opix") is None
-    fleet.record(fleet.homes["lynx"], lynx, start_time=(status.get_process_start_time(lynx) or 0) + 10_000)
-    assert live(fleet, "lynx") is None                   # PID-reuse guard still wins
+    alpha = fleet.spawn("alpha", fleet.homes["alpha"])
+    fleet.commands[alpha] = BARE_ARGV
+    fleet.record(fleet.homes["beta"], alpha)              # beta's record names alpha's process
+    assert live(fleet, "beta") is None
+    fleet.record(fleet.homes["alpha"], alpha, start_time=(status.get_process_start_time(alpha) or 0) + 10_000)
+    assert live(fleet, "alpha") is None                   # PID-reuse guard still wins
 
 
 def test_explicit_argv_selector_stays_authoritative_over_environment(fleet):
-    pid = fleet.spawn("mixed", fleet.homes["lynx"])
-    fleet.commands[pid] = BARE_ARGV + " --profile opix"
-    fleet.record(fleet.homes["lynx"], pid)
-    fleet.record(fleet.homes["opix"], pid)
-    assert live(fleet, "lynx") is None
-    assert live(fleet, "opix") == pid
-    fleet.commands[pid] = "HERMES_HOME=" + str(fleet.homes["opix"]) + " " + BARE_ARGV
-    assert live(fleet, "lynx") is None and live(fleet, "opix") == pid
+    pid = fleet.spawn("mixed", fleet.homes["alpha"])
+    fleet.commands[pid] = BARE_ARGV + " --profile beta"
+    fleet.record(fleet.homes["alpha"], pid)
+    fleet.record(fleet.homes["beta"], pid)
+    assert live(fleet, "alpha") is None
+    assert live(fleet, "beta") == pid
+    fleet.commands[pid] = "HERMES_HOME=" + str(fleet.homes["beta"]) + " " + BARE_ARGV
+    assert live(fleet, "alpha") is None and live(fleet, "beta") == pid
 
 
 def test_absent_launch_home_is_the_default_gateway_only(fleet):
     pid = fleet.spawn("default", None)
     fleet.commands[pid] = BARE_ARGV
     fleet.record(fleet.homes["default"], pid)
-    fleet.record(fleet.homes["lynx"], pid)
+    fleet.record(fleet.homes["alpha"], pid)
     assert live(fleet, "default") == pid
-    assert live(fleet, "lynx") is None
+    assert live(fleet, "alpha") is None
 
 
 @pytest.mark.parametrize("environ", ["denied", "empty"])
 def test_unreadable_or_empty_environment_never_authorizes_a_named_peer(fleet, monkeypatch, environ):
     import psutil
-    pid = fleet.spawn("lynx", fleet.homes["lynx"])
+    pid = fleet.spawn("alpha", fleet.homes["alpha"])
     fleet.commands[pid] = BARE_ARGV
-    fleet.record(fleet.homes["lynx"], pid)
+    fleet.record(fleet.homes["alpha"], pid)
     real = psutil.Process
 
     class Denied(real):
@@ -118,14 +118,14 @@ def test_unreadable_or_empty_environment_never_authorizes_a_named_peer(fleet, mo
             return {"HERMES_HOME": " "}
     monkeypatch.setattr(psutil, "Process", Denied)
     assert status._read_process_launch_home(pid) == ("unreadable", None)
-    assert live(fleet, "lynx") is None
+    assert live(fleet, "alpha") is None
 
 
 def test_only_the_launch_home_value_is_read_from_the_environment(fleet, caplog):
-    pid = fleet.spawn("lynx", fleet.homes["lynx"])
+    pid = fleet.spawn("alpha", fleet.homes["alpha"])
     with caplog.at_level("DEBUG"):
         state, value = status._read_process_launch_home(pid)
-    assert (state, Path(value)) == ("home", fleet.homes["lynx"])
+    assert (state, Path(value)) == ("home", fleet.homes["alpha"])
     assert SECRET not in caplog.text
 
 
@@ -136,43 +136,43 @@ def _older_identify(fleet, answers):
 
 def test_coexisting_scan_sees_bare_standalone_peers_with_their_own_profile(fleet, monkeypatch):
     from hermes_cli import profiles
-    lynx = fleet.spawn("lynx", fleet.homes["lynx"])
-    opix = fleet.spawn("opix", fleet.homes["opix"])
-    fleet.commands.update({lynx: BARE_ARGV, opix: BARE_ARGV})
-    for name, pid in (("lynx", lynx), ("opix", opix)):
+    alpha = fleet.spawn("alpha", fleet.homes["alpha"])
+    beta = fleet.spawn("beta", fleet.homes["beta"])
+    fleet.commands.update({alpha: BARE_ARGV, beta: BARE_ARGV})
+    for name, pid in (("alpha", alpha), ("beta", beta)):
         fleet.record(fleet.homes[name], pid)
-    fleet.record(fleet.homes["default"], lynx)
+    fleet.record(fleet.homes["default"], alpha)
     answers = {fleet.homes[n]: {"pid": p, "start_time": status.get_process_start_time(p),
                                 "hermes_home": str(fleet.homes[n]), "profile": n}
-               for n, p in (("lynx", lynx), ("opix", opix))}
+               for n, p in (("alpha", alpha), ("beta", beta))}
     monkeypatch.setattr(host_attach, "_identify", _older_identify(fleet, answers))
     monkeypatch.setattr(profiles, "profiles_to_serve", lambda *a, **kw: list(fleet.homes.items()))
     peers = list(host_attach._coexisting_gateways(None))
     assert sorted((p.pid, p.home, p.profiles, p.served_known) for p in peers) == sorted([
-        (lynx, fleet.homes["lynx"], ("lynx",), True), (opix, fleet.homes["opix"], ("opix",), True)])
+        (alpha, fleet.homes["alpha"], ("alpha",), True), (beta, fleet.homes["beta"], ("beta",), True)])
     assert all(not p.standalone for p in peers)   # absent `multiplex` is not a claimed standalone flag
 
 
 @pytest.mark.parametrize("change", ["start", "profile", "home", "pid"])
 def test_identify_answer_must_be_the_same_process_and_home(fleet, change):
-    lynx = fleet.spawn("lynx", fleet.homes["lynx"])
-    answer = {"pid": lynx, "start_time": status.get_process_start_time(lynx),
-              "hermes_home": str(fleet.homes["lynx"]), "profile": "lynx"}
-    peer = host_attach.HostGateway(lynx, fleet.homes["lynx"], (), served_known=False)
-    assert host_attach._identity_matches(answer, peer, fleet.homes["lynx"])
+    alpha = fleet.spawn("alpha", fleet.homes["alpha"])
+    answer = {"pid": alpha, "start_time": status.get_process_start_time(alpha),
+              "hermes_home": str(fleet.homes["alpha"]), "profile": "alpha"}
+    peer = host_attach.HostGateway(alpha, fleet.homes["alpha"], (), served_known=False)
+    assert host_attach._identity_matches(answer, peer, fleet.homes["alpha"])
     answer = {**answer, **{"start": {"start_time": answer["start_time"] + 10_000},
-                           "profile": {"profile": "opix"},
-                           "home": {"hermes_home": str(fleet.homes["opix"])},
-                           "pid": {"pid": lynx + 1}}[change]}
-    assert not host_attach._identity_matches(answer, peer, fleet.homes["lynx"])
+                           "profile": {"profile": "beta"},
+                           "home": {"hermes_home": str(fleet.homes["beta"])},
+                           "pid": {"pid": alpha + 1}}[change]}
+    assert not host_attach._identity_matches(answer, peer, fleet.homes["alpha"])
 
 
 def test_unknown_peer_answer_keeps_served_set_unknown(fleet, monkeypatch):
     from hermes_cli import profiles
-    lynx = fleet.spawn("lynx", fleet.homes["lynx"])
-    fleet.commands[lynx] = BARE_ARGV
-    fleet.record(fleet.homes["lynx"], lynx)
+    alpha = fleet.spawn("alpha", fleet.homes["alpha"])
+    fleet.commands[alpha] = BARE_ARGV
+    fleet.record(fleet.homes["alpha"], alpha)
     monkeypatch.setattr(host_attach, "_identify", lambda home: None)   # socket unreadable / silent
-    monkeypatch.setattr(profiles, "profiles_to_serve", lambda *a, **kw: [("lynx", fleet.homes["lynx"])])
+    monkeypatch.setattr(profiles, "profiles_to_serve", lambda *a, **kw: [("alpha", fleet.homes["alpha"])])
     (peer,) = list(host_attach._coexisting_gateways(None))
-    assert (peer.pid, peer.served_known) == (lynx, False)
+    assert (peer.pid, peer.served_known) == (alpha, False)

@@ -24,6 +24,7 @@ import threading
 from collections import deque
 
 import pytest
+from unittest.mock import patch
 
 from tools import mcp_client_credentials as cc
 from tools import mcp_tool as _core
@@ -723,3 +724,64 @@ def test_errors_and_logs_never_carry_secret_tokens_or_bodies(caplog):
     text = "\n".join(messages) + caplog.text
     assert SECRET not in text and "tok-1" not in text and "upstream body" not in text
     assert "client_secret" not in repr(_cfg()) and SECRET not in repr(_cfg())
+
+
+# --- Cross-profile adoption (v0.22.2 merge, security-critical) ---------------------------------
+# Upstream v0.22.2 lets a profile adopt another profile's live connection when the resolved
+# connection inputs hash equal. A client_credentials connection's tokens are bound to the
+# owner's runs and secret source, so it must never be adopted, even with identical digests.
+
+
+def _route_server(config, digest):
+    from types import SimpleNamespace
+    return SimpleNamespace(_config=config, _resolved_identity=digest)
+
+
+from tests.tools.test_mcp_multiplex_connection_keys import two_profiles  # the multiplex-registry fixture
+
+
+def test_same_server_route_refuses_cross_profile_client_credentials():
+    from tools.mcp_tool_registration import _same_server_route
+    config = _server_config()
+    server = _route_server(_server_config(), "digest-1")
+    assert not _same_server_route(server, config, cross_profile=True, resolved_identity="digest-1")
+    # Upper-case / padded auth spelling normalises to the same type and is refused too.
+    loud = {**_server_config(), "auth": " Client_Credentials "}
+    assert not _same_server_route(_route_server(loud, "digest-1"), loud, cross_profile=True,
+                                  resolved_identity="digest-1")
+    # The owning profile keeps using its own connection.
+    assert _same_server_route(server, config, cross_profile=False)
+
+
+def test_same_server_route_cross_profile_control_without_client_credentials():
+    """Control: the same comparison on an unauthenticated route adopts only on an equal digest,
+    so the refusal above comes from the auth type, not from a mismatched fixture."""
+    from tools.mcp_tool_registration import _same_server_route
+    plain = {"url": MCP_URL}
+    server = _route_server(plain, "digest-1")
+    assert _same_server_route(server, dict(plain), cross_profile=True, resolved_identity="digest-1")
+    assert not _same_server_route(server, dict(plain), cross_profile=True, resolved_identity="digest-2")
+    assert not _same_server_route(server, dict(plain), cross_profile=True, resolved_identity=None)
+
+
+def test_client_credentials_connection_is_not_adopted_by_another_profile(two_profiles):  # health: allow F811 -- pytest injects the imported two_profiles fixture by parameter name
+    """End to end through the multiplex registry: profile B never sees A's client_credentials
+    tools, so B must open (and authenticate) its own connection."""
+    from tests.tools.test_mcp_multiplex_connection_keys import _server
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_registration as reg
+    from tools.registry import registry
+
+    config = _server_config()
+    two_profiles("a")
+    owner = _server("x", config)
+    owner._resolved_identity = "same-digest"
+    disc._adopt_server("x", owner)
+    owner._registered_tool_names = reg._register_server_tools("x", owner, config)
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
+
+    two_profiles("b")
+    # Even an adopter that resolves the identical digest is refused.
+    with patch.object(reg, "_adopter_identity_digest", lambda name, cfg: "same-digest"):
+        assert reg.register_connected_into_current_scope({"x": _server_config()}) == 0
+    assert registry.get_tool_names_for_toolset("mcp-x") == []
