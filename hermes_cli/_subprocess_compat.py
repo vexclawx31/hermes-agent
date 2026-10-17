@@ -282,6 +282,18 @@ def windows_detach_popen_kwargs() -> dict:
 NO_LAZY_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1"}
 
 
+def safe_directory_args(repo_dir: Path | str) -> list[str]:
+    """``-c safe.directory=<repo_dir>`` for a read-only provenance probe of exactly that checkout.
+
+    A sealed release checkout is owned by root but run as the service user, so git refuses every
+    call with "detected dubious ownership" and the version/commit identity silently degrades to
+    unknown. Trusting the one directory being queried, for that one read-only child, restores it.
+    Scoped to *repo_dir* (resolved, as git resolves the worktree it checks); never ``*``, never
+    written to any config file. Read-only probes only -- writers keep git's ownership check.
+    """
+    return ["-c", f"safe.directory={Path(repo_dir).resolve().as_posix()}"]
+
+
 # GIT_CONFIG_KEY_n/VALUE_n overrides for internal git children: no credential/askpass prompts, no
 # repo-configured fsmonitor/hooks/pager/editor/external-diff programs.
 _GIT_CONFIG_INJECT_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")

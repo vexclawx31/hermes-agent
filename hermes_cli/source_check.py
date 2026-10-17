@@ -59,12 +59,14 @@ _GIT_TEXT_KW = {"text": True, "encoding": "utf-8", "errors": "replace"}
 def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, text: bool = True,
              git: str = "git"):
     """Read Git state without prompts, optional index writes, or inherited targeting."""
-    from hermes_cli._subprocess_compat import windows_hide_flags
+    from hermes_cli._subprocess_compat import safe_directory_args, windows_hide_flags
 
     kwargs: dict = {"creationflags": windows_hide_flags(), "env": source_git_env(), "stdin": subprocess.DEVNULL}
+    # Probes read the checkout at cwd; a root-sealed release is not owned by the service user.
+    trust = safe_directory_args(cwd) if cwd is not None else []
     try:
         return subprocess.run(
-            [git, *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
+            [git, *trust, *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
             **(_GIT_TEXT_KW if text else {}), **kwargs, check=False)
     except Exception:
         return None

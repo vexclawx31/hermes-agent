@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+from hermes_cli._subprocess_compat import safe_directory_args
 from hermes_cli.steward import UPDATE_MECHANISMS
 from hermes_cli.update_channel import STABLE_TAG_RE
 
@@ -61,7 +62,8 @@ def _derived_version(
 def _run_git(repo_dir: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(
-            ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, cwd=str(repo_dir),
+            ["git", *safe_directory_args(repo_dir), *args], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=3, cwd=str(repo_dir),
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -222,7 +224,7 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
         # scanned disk), and a status killed while refreshing the index strands .git/index.lock:
         # the update's own merge then dies on "File exists" (#132089). A read-only probe takes
         # no optional lock.
-        status_command = ["git", "--no-optional-locks", "status", "--porcelain"]
+        status_command = ["git", *safe_directory_args(repo_dir), "--no-optional-locks", "status", "--porcelain"]
         if not include_untracked:
             status_command.append("-uno")
         dirty_result = subprocess.run(

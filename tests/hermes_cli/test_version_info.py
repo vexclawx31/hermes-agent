@@ -12,6 +12,7 @@ from hermes_cli.version_info import (
     _reset_version_info_cache,
     _resolve_stamp_file,
     _stamp_version_info,
+    get_code_identity,
     get_version_info,
 )
 
@@ -300,3 +301,45 @@ def test_a_timed_out_status_probe_never_strands_index_lock(tmp_path):
     _git_version_info(tmp_path, include_untracked=True)
 
     assert not (tmp_path / ".git" / "index.lock").exists()
+
+
+def test_provenance_resolves_in_a_checkout_the_running_user_does_not_own(tmp_path, monkeypatch):
+    """A sealed release is owned by root and run as the service user. git refuses every call there
+    with "detected dubious ownership", which left `hermes --version` at vunknown and the code
+    identity's sha at None. GIT_TEST_ASSUME_DIFFERENT_OWNER is git's own switch for that case."""
+    from hermes_cli import banner
+
+    repo = tmp_path / "release"
+    repo.mkdir()
+    base_env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"],
+                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def git(*args: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", *args],
+                              cwd=repo, text=True, capture_output=True, env={**base_env, **env}, check=False)
+
+    for args in (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "release"), ("tag", "v0.22.2"),
+                 ("update-ref", "refs/remotes/origin/main", "HEAD"),
+                 ("commit", "-q", "--allow-empty", "-m", "fork carry")):
+        assert git(*args).returncode == 0
+    head = git("rev-parse", "HEAD").stdout.strip()
+    # The simulation is live: an unscoped probe is refused exactly as on the sealed release.
+    refused = git("rev-parse", "HEAD", GIT_TEST_ASSUME_DIFFERENT_OWNER="1")
+    assert refused.returncode != 0 and "dubious ownership" in refused.stderr
+
+    for key, value in {**base_env, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
+    monkeypatch.setattr(banner, "_latest_release_cache", None)
+
+    info = get_version_info()
+    assert (info.base_version, info.distance, info.commit) == ("0.22.2", 1, head)
+    assert info.derived_version == f"0.22.2+1.g{head[:7]}"
+    identity = get_code_identity(refresh=True)
+    assert (identity["sha"], identity["version"], identity["source"]) == (head, "0.22.2", "git")
+    assert banner.get_git_banner_state(repo) == {"upstream": git("rev-parse", "--short=8", "HEAD~1").stdout.strip(),
+                                                 "local": head[:8], "ahead": 1}
+    assert banner.get_latest_release_tag(repo)[0] == "v0.22.2"
+    # Trust is scoped to the probed checkout only and never persisted to any config file.
+    assert "safe" not in (repo / ".git" / "config").read_text(encoding="utf-8-sig")
