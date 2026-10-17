@@ -411,11 +411,11 @@ def _slack_mention_detection_text(event: dict) -> str:
 _SLACK_USER_MENTION_RE = re.compile(r"<@([^>|]+)(?:\|[^>]*)?>")
 
 
-def _extract_direct_slack_mention_ids(text: Any) -> list[str]:
-    """Extract native authored mentions while excluding quote and code display."""
+def _slack_authored_segments(text: Any) -> list[str]:
+    """The sender's own visible text: quoted lines, code fences and inline code removed."""
     if not isinstance(text, str) or not text:
         return []
-    mentions: list[str] = []
+    segments: list[str] = []
     in_fence = False
     for line in text.splitlines() or [text]:
         if line.lstrip().startswith((">", "&gt;")) and not in_fence:
@@ -425,9 +425,20 @@ def _extract_direct_slack_mention_ids(text: Any) -> list[str]:
             if index:
                 in_fence = not in_fence
             if not in_fence:
-                visible = re.sub(r"`[^`]*`", "", piece)
-                mentions.extend(match.group(1) for match in _SLACK_USER_MENTION_RE.finditer(visible))
-    return mentions
+                segments.append(re.sub(r"`[^`]*`", "", piece))
+    return segments
+
+
+def _extract_direct_slack_mention_ids(text: Any) -> list[str]:
+    """Extract native authored mentions while excluding quote and code display."""
+    return [match.group(1) for visible in _slack_authored_segments(text)
+            for match in _SLACK_USER_MENTION_RE.finditer(visible)]
+
+
+def _slack_authored_text(event: dict) -> str:
+    """Wake-word input: only the message's own authored text, never unfurls, attachments,
+    quotes or code, so pasted or forwarded content cannot wake the bot."""
+    return "\n".join(_slack_authored_segments(event.get("text", "")))
 
 
 def _collect_slack_block_mention_ids(blocks: Any) -> list[str]:
@@ -4738,7 +4749,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Mentions may live only in Block Kit blocks.
         # See #52387.
         routing_text = _slack_mention_detection_text(event) or original_text or ""
-        is_mentioned = _slack_event_mentions_bot(event, bot_uid or "")
+        # Configured wake words (mention_patterns, #50732) count too, on authored text only.
+        is_mentioned = (_slack_event_mentions_bot(event, bot_uid or "")
+                        or self._slack_message_matches_mention_patterns(_slack_authored_text(event)))
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
         # Internal triggers (reactions) skip the mention requirement but NOT
