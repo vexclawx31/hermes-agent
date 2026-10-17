@@ -1,4 +1,4 @@
-"""Installing a memory provider that left core is opt-in (``memory.auto_install_provider``, default
+"""Installing a memory provider that left core is opt-in (``plugins.auto_install_left_core``, default
 off). Off, a missing provider fails closed on agent init and ``hermes update``: one warning with the
 install command, no catalog lookup, no install, the agent runs without it. On, the catalog install
 runs as before. A provider bundled at ``plugins/memory/<name>`` is used with no install attempt."""
@@ -32,7 +32,7 @@ def _write_config(home, provider, auto_install=None):
     home.mkdir(parents=True, exist_ok=True)
     text = f"memory:\n  provider: {provider}\n"
     if auto_install is not None:
-        text += f"  auto_install_provider: {auto_install}\n"
+        text += f"plugins:\n  auto_install_left_core: {auto_install}\n"
     (home / "config.yaml").write_text(text, encoding="utf-8")
 
 
@@ -46,7 +46,7 @@ def no_network(monkeypatch):
     def forbidden(what):
         def _fail(*_a, **_kw):
             calls.append(what)
-            pytest.fail(f"{what} called with memory.auto_install_provider off")
+            pytest.fail(f"{what} called with plugins.auto_install_left_core off")
         return _fail
 
     monkeypatch.setattr(plugin_catalog, "load_catalog_live", forbidden("live catalog"))
@@ -86,7 +86,7 @@ def fake_installer(monkeypatch):
 def test_default_config_ships_auto_install_off():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
-    assert DEFAULT_CONFIG["memory"]["auto_install_provider"] is False
+    assert DEFAULT_CONFIG["plugins"]["auto_install_left_core"] is False
 
 
 @pytest.mark.parametrize(("value", "enabled"), [
@@ -126,7 +126,7 @@ def test_agent_init_default_off_warns_once_and_makes_no_network_call(
     assert not (tmp_path / "cache" / "left-core-hindsight.failed").exists()  # no failed-install backoff
     warnings = [r.getMessage() for r in caplog.records if r.name == mig.__name__]
     assert len(warnings) == 1
-    assert "'hindsight'" in warnings[0] and "memory.auto_install_provider" in warnings[0]
+    assert "'hindsight'" in warnings[0] and "plugins.auto_install_left_core" in warnings[0]
     assert "`hermes plugins install hindsight`" in warnings[0]
     assert any("hermes plugins install hindsight" in line for line in agent.printed)
 
@@ -147,7 +147,7 @@ def test_update_default_off_names_each_profile_and_installs_nothing(tmp_path, mo
     assert len(said) == 2
     assert said[0].startswith("  [profile 'default']") and "`hermes plugins install honcho`" in said[0]
     assert said[1].startswith("  [profile 'work']") and "`hermes -p work plugins install honcho`" in said[1]
-    assert all("memory.auto_install_provider" in line for line in said)
+    assert all("plugins.auto_install_left_core" in line for line in said)
 
 
 def test_agent_init_opt_in_installs_from_the_catalog(tmp_path, monkeypatch, fresh, fake_installer):
@@ -176,7 +176,7 @@ def test_update_installs_only_for_profiles_that_opted_in(tmp_path, monkeypatch, 
     assert mig.migrate_all_homes(say=said.append) == ["honcho"]
     assert [c["home"] for c in fake_installer] == [work]
     assert not (default / "plugins").exists()
-    assert "[profile 'default']" in said[0] and "memory.auto_install_provider" in said[0]
+    assert "[profile 'default']" in said[0] and "plugins.auto_install_left_core" in said[0]
 
 
 @pytest.fixture

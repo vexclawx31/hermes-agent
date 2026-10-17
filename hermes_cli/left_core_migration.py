@@ -6,6 +6,10 @@ plugin keeps its names, config keys and env vars, so migrating is only "install 
 contract is the one memory providers established (``memory_provider_migration``, whose helpers this
 reuses; memory is not a row because its plugin name comes from ``memory.provider``, not a table):
 
+* All of it is opt-in per home: ``plugins.auto_install_left_core`` (default off), checked before
+  anything else, so it overrides ``security.allow_lazy_installs``. With it off, ``hermes update``
+  and agent/gateway start only report each feature in use whose plugin is missing, with its install
+  command: no catalog lookup, no install and no config.yaml write (not even the toolset scope).
 * ``hermes update`` installs the plugin for every profile home sharing the venv that uses the feature.
 * Agent start and gateway start retry once per process for the active home (Desktop users update
   through the app and never run ``hermes update``), honouring ``security.allow_lazy_installs``.
@@ -33,7 +37,7 @@ from typing import Callable, Optional
 
 from hermes_cli.memory_provider_migration import (
     _failed_recently, _home_consent, _home_label, _install_command, _interactive,
-    _note_failure, _unattended_consent,
+    _note_failure, _unattended_consent, auto_install_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -379,6 +383,21 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
     return out
 
 
+def _missing(home: Path, *, process_env: bool = False) -> list[LeftCoreFeature]:
+    """Rows *home* uses whose plugin it lacks and never had. Read-only and local: no catalog, no
+    config write."""
+    config = _read_config(home)
+    return [feature for feature in LEFT_CORE
+            if not _marked(config, _INSTALLED_KEY, feature) and feature.in_use(home, process_env=process_env)
+            and not plugin_present(feature.plugin, home)]
+
+
+def _auto_install_off_notice(feature: LeftCoreFeature, home: Path) -> str:
+    return (f"⚠ {feature.label} moved out of core and its '{feature.plugin}' plugin is not installed, so "
+            f"it is off. Automatic install from the plugin catalog is off (plugins.auto_install_left_core), "
+            f"so Hermes did not fetch it: run `{_install_command(feature.plugin, home)}`.")
+
+
 def _install_into(home: Path, *, consent: Optional[bool] = None) -> Callable[[str], dict]:
     def _install(name: str) -> dict:
         from hermes_cli.plugins_cmd import dashboard_install_plugin
@@ -445,6 +464,11 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
     pending: dict[tuple[str, bool], tuple[LeftCoreFeature, list[Path]]] = {}
     for home in dependency_homes():
         try:
+            if not auto_install_enabled(home):
+                # Fail closed before the catalog and the scope write: no network, config.yaml untouched.
+                for feature in _missing(home):
+                    labelled(home)(_auto_install_off_notice(feature, home))
+                continue
             features = _pending(home, say=labelled(home))
             consent = bool(features) and _home_consent(home)
         except Exception as exc:
@@ -518,6 +542,11 @@ def recover_at_startup(*, say: Optional[Callable[[str], None]] = None) -> list[s
         deliver(message)
 
     try:
+        if not auto_install_enabled(home):
+            # Fail closed before the catalog and the scope write: no network, config.yaml untouched.
+            for feature in _missing(home, process_env=True):
+                report(_auto_install_off_notice(feature, home))
+            return []
         features = _pending(home, say=report, process_env=True, backoff=True)
         if not features:
             return []

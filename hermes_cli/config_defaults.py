@@ -1326,7 +1326,6 @@ DEFAULT_CONFIG = {
         # One external provider: bundled (retaindb, byterover) or catalog-installed (honcho,
         # hindsight, supermemory, mem0, openviking, holographic). Empty = built-in only.
         "provider": "",
-        "auto_install_provider": False,  # Install a missing catalog provider from the network on start/update.
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
@@ -1732,9 +1731,10 @@ DEFAULT_CONFIG = {
         # explicit: `hermes plugins update <name>`, or auto_apply below (git-class plugins only,
         # scan-gated by that same pipeline).
         "auto_update_check_hours": 24,
-        # Opt-in unattended apply for the cadence check. Git-row plugins ONLY; every apply runs the
-        # same security scan / consent pipeline as the manual update command.
+        # Opt-in unattended apply for the cadence check. Git-row plugins ONLY; same scan/consent as manual update.
         "auto_apply": False,
+        # Install a left-core feature's catalog plugin (memory.provider, spotify, ...) on start/`hermes update`.
+        "auto_install_left_core": False,  # off: warn with the install command; no fetch, install or config write
         # Where third-party Python plugins run. in_process: imported into Hermes (default).
         # host: one plugin-host process per profile runs them and they reach Hermes only through
         # ctx (a crashing or hanging plugin takes down its host, which restarts; Hermes keeps

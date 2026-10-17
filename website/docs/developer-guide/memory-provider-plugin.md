@@ -300,9 +300,10 @@ own directory, so a provider installed from the plugin catalog keeps all of them
 | Python dependencies | `pyproject.toml` `[project] dependencies` (or `python_dependencies` in `plugin.yaml`); installed under Hermes' own pins at install time and re-applied across `hermes update` |
 
 Your provider's name, `memory.<name>` config section, data directory and tool names are the
-contract with existing users. A provider that moves out of core keeps all four; Hermes then
-installs the catalog plugin automatically for anyone whose `memory.provider` still names it
-(on `hermes update`, and once at agent start when `security.allow_lazy_installs` is on).
+contract with existing users. A provider that moves out of core keeps all four; with
+`plugins.auto_install_left_core: true` (off by default) Hermes then installs the catalog plugin
+automatically for anyone whose `memory.provider` still names it (on `hermes update`, and once at
+agent start when `security.allow_lazy_installs` is also on). Off, it prints the install command.
 
 ## Config Schema
 

@@ -34,8 +34,8 @@ Honcho, Hindsight, Mem0, Supermemory, OpenViking and Holographic used to ship in
 To have Hermes install the catalog plugin for you on agent start and `hermes update` (the behaviour the "Migrating from bundled …" sections below describe), opt in per profile:
 
 ```yaml
-memory:
-  auto_install_provider: true
+plugins:
+  auto_install_left_core: true
 ```
 
 ## How It Works
@@ -298,7 +298,7 @@ See the [plugin README](https://github.com/plastic-labs/honcho/tree/main/hermes-
 
 #### Upgrading from the bundled Honcho
 
-Earlier Hermes releases shipped Honcho in-tree. If a profile still has `memory.provider: honcho`, run `hermes plugins install honcho` (or opt in with `memory.auto_install_provider: true` and Hermes installs it the next time it starts or runs `hermes update`) — your `~/.honcho/config.json` (or `$HERMES_HOME/honcho.json`), host blocks, peers and session mappings are read exactly as before, so no memory is lost.
+Earlier Hermes releases shipped Honcho in-tree. If a profile still has `memory.provider: honcho`, run `hermes plugins install honcho` (or opt in with `plugins.auto_install_left_core: true` and Hermes installs it the next time it starts or runs `hermes update`) — your `~/.honcho/config.json` (or `$HERMES_HOME/honcho.json`), host blocks, peers and session mappings are read exactly as before, so no memory is lost.
 
 
 ---
@@ -386,7 +386,7 @@ does not add a separate request.
 
 ### Migrating from bundled OpenViking
 
-The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install openviking` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
+The automatic steps below apply only with `plugins.auto_install_left_core: true`; by default, run `hermes plugins install openviking` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 OpenViking used to ship inside the Hermes tree. If your `config.yaml` already has `memory.provider: openviking`, there is nothing to do for most users:
 
@@ -485,7 +485,7 @@ The plugin authenticates with `X-API-Key` and uses the server's `/search` / `/me
 
 ### Migrating from bundled Mem0
 
-The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install mem0` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
+The automatic steps below apply only with `plugins.auto_install_left_core: true`; by default, run `hermes plugins install mem0` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 Mem0 used to ship inside the Hermes tree (and as the `hermes-agent[mem0]` pip extra). If your `config.yaml` already has `memory.provider: mem0`, there is nothing to do for most users:
 
@@ -549,7 +549,7 @@ See the [upstream Hermes integration docs](https://hindsight.vectorize.io/sdks/i
 
 #### Migrating from bundled Hindsight
 
-The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install hindsight` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
+The automatic steps below apply only with `plugins.auto_install_left_core: true`; by default, run `hermes plugins install hindsight` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 Hindsight used to ship inside the Hermes tree (and as the `hermes-agent[hindsight]` pip extra). If your `config.yaml` already has `memory.provider: hindsight`, there is nothing to do for most users:
 
@@ -609,7 +609,7 @@ The catalog plugin has its own release notes and options beyond this list; see i
 
 #### Migrating from bundled Holographic
 
-The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install holographic` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
+The automatic steps below apply only with `plugins.auto_install_left_core: true`; by default, run `hermes plugins install holographic` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 Holographic used to ship inside the Hermes tree. If your `config.yaml` already has `memory.provider: holographic`, there is nothing to do:
 
@@ -767,7 +767,7 @@ Base URL precedence is `supermemory.json` → `SUPERMEMORY_BASE_URL` → `https:
 
 ### Migrating from bundled Supermemory
 
-The automatic steps below apply only with `memory.auto_install_provider: true`; by default, run `hermes plugins install supermemory` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
+The automatic steps below apply only with `plugins.auto_install_left_core: true`; by default, run `hermes plugins install supermemory` (see [Providers that moved to the plugin catalog](#providers-that-moved-to-the-plugin-catalog)).
 
 Supermemory used to ship inside the Hermes tree (and as the `hermes-agent[supermemory]` pip extra). If your `config.yaml` already has `memory.provider: supermemory`, there is nothing to do for most users:
 

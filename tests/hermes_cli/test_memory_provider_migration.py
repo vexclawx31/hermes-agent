@@ -10,7 +10,7 @@ from hermes_cli import memory_provider_migration as mig
 
 @pytest.fixture(autouse=True)
 def _auto_install_opted_in(monkeypatch):
-    """These cover the install itself, which needs memory.auto_install_provider (default off; the
+    """These cover the install itself, which needs plugins.auto_install_left_core (default off; the
     off path is tests/hermes_cli/test_memory_provider_auto_install_opt_in.py)."""
     monkeypatch.setattr(mig, "auto_install_enabled", lambda home: True)
 
