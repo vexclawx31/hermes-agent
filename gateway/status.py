@@ -838,7 +838,15 @@ def _get_code_identity_fields() -> dict[str, Any]:
         from hermes_cli.version_info import get_code_identity
 
         identity = get_code_identity()
-        return {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
+        sha = identity.get("sha")
+        if not sha:
+            # A sealed, differently owned install (for example a root-owned release dir) makes the
+            # git-based identity unreadable. Fall back to the file-only HEAD reader: it never runs
+            # git, so no repository configuration can execute.
+            from gateway.code_skew import current_code_sha
+
+            sha = current_code_sha()
+        return {"code_sha": sha, "code_version": identity.get("version")}
     except Exception:
         return {}
 
