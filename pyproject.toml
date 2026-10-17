@@ -92,10 +92,12 @@ dependencies = [
   # it out of the lazy-install path that exists only for the heavy matrix deps.
   "Markdown==3.10.2; python_version >= '3.14'",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
-  "PyJWT[crypto]==2.13.0; python_version >= '3.14'",  # PYSEC-2026-175/177/178/179
+  # 2.15.x closes the HMAC/JWK key-confusion and RecursionError advisories open on 2.13.0.
+  "PyJWT[crypto]==2.15.1; python_version >= '3.14'",  # PYSEC-2026-175/177/178/179, GHSA-w2cx, GHSA-p4g4, GHSA-9j54
   # urllib3 2.7.0 fixes GHSA-mf9v-mfxr-j63j (decompression-bomb bypass)
-  # and GHSA-qccp-gfcp-xxvc (header leak across origins).
-  "urllib3>=2.7.0,<3; python_version >= '3.14'",
+  # and GHSA-qccp-gfcp-xxvc (header leak across origins); 2.8.0 fixes proxy TLS
+  # verification, the deflate loop and unbounded chunk reads.
+  "urllib3>=2.8.0,<3; python_version >= '3.14'",
   # PyJWT[crypto] pulls cryptography in transitively. Pin it here as well, so
   # that the WeCom and Weixin crypto paths cannot fall below the patched
   # version. 50.0.0 is the floor: it fixes CVE-2026-69247, a Bleichenbacher
@@ -622,6 +624,12 @@ override-dependencies = [
   # never builds a misaki G2P. The never-true marker removes it from the lock.
   # Remove this line when misaki drops it or a 3.14-capable release fits.
   "spacy-curated-transformers; sys_platform == 'never'",
+]
+# Floors for transitive packages with published advisories; no package is added by these.
+constraint-dependencies = [
+  # python-telegram-bot[webhooks]: 6.5.9 fixes the static-file symlink escape, query DoS
+  # and curl response-size advisories.
+  "tornado>=6.5.9,<7",
 ]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
