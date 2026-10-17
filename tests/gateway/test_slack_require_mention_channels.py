@@ -149,6 +149,8 @@ async def test_forced_channel_wake_checks_still_apply(adapter):
     adapter.config.extra["require_mention"] = False
     adapter.config.extra["require_mention_channels"] = CHANNEL_ID
     adapter._mentioned_threads.add("100.000")
+    # Fork SL1: the local marker counts only under a known (human) thread root.
+    adapter._thread_root_owner_and_mentions = AsyncMock(return_value=("human", False))
 
     await adapter._handle_slack_message(
         _event("follow-up", ts="101.000", thread_ts="100.000")

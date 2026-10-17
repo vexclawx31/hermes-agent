@@ -39,7 +39,11 @@ async def test_admitted_message_carries_whether_it_was_addressed(adapter, extra,
     with patch.object(adapter, "_resolve_user_name", new=AsyncMock(return_value="human")), \
             patch.object(adapter, "_fetch_thread_context", new=AsyncMock(return_value=None)), \
             patch.object(adapter, "_fetch_thread_parent_text", new=AsyncMock(return_value="")), \
-            patch.object(adapter, "_has_active_session_for_thread", return_value=False):
+            patch.object(adapter, "_has_active_session_for_thread", return_value=False), \
+            patch.object(adapter, "_thread_root_owner_and_mentions",
+                         new=AsyncMock(return_value=("human", False))):
+        # Fork SL1: an unmentioned thread reply wakes only once the root's owner is known
+        # (unknown roots fail closed); a human root lets the mentioned-thread marker count.
         await adapter._handle_slack_message(event)
     adapter.handle_message.assert_awaited_once()
     assert adapter.handle_message.await_args.args[0].reply_expected is expected

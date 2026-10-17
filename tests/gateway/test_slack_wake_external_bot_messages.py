@@ -104,6 +104,10 @@ def _make_adapter(bot_authored_root: bool = False):
     # its result without setting up the full cache path. Helper-specific
     # tests call the real method via the class instead.
     adapter._bot_authored_thread_root = AsyncMock(return_value=bot_authored_root)
+    # Fork SL1 reads root authorship through the authenticated owner lookup; a bot-authored
+    # root is "self_bot" there (still API-derived, so it survives restarts).
+    adapter._thread_root_owner_and_mentions = AsyncMock(
+        return_value=("self_bot" if bot_authored_root else "human", False))
 
     return adapter
 
