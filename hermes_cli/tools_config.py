@@ -509,8 +509,11 @@ def _composite_toolsets(toolset_names: list[str], platform: str, explicitly_conf
 
 def _enabled_plugin_toolsets(config: dict, platform: str, toolset_names: list[str], plugin_ts_keys: set[str]) -> set[str]:
     """Plugin toolsets: on by default unless default-off (catalog spotify) or "known" for this platform
-    (``known_plugin_toolsets``, written on every save) and absent from the saved list."""
+    (``known_plugin_toolsets``, written on every save, or a left-core toolset core had off here) and
+    absent from the saved list."""
+    from hermes_cli.left_core_migration import unrecorded_scope_off
     known_for_platform = set((config.get("known_plugin_toolsets", {}) or {}).get(platform, []) or [])
+    known_for_platform |= unrecorded_scope_off(config, platform, plugin_ts_keys)
     return {
         pts for pts in plugin_ts_keys
         if pts in toolset_names or (pts not in _DEFAULT_OFF_TOOLSETS and pts not in known_for_platform)

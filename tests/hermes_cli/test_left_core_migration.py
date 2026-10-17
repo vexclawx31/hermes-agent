@@ -21,6 +21,9 @@ def _fresh(monkeypatch):
     # A catalog that lists every left-core plugin; never the network.
     import hermes_cli.memory_provider_migration as mpm
     monkeypatch.setattr(mpm, "catalog_source", lambda name: name)
+    # These cover the migration itself, which needs plugins.auto_install_left_core (default off; the
+    # off path is tests/hermes_cli/test_left_core_auto_install_opt_in.py).
+    monkeypatch.setattr(lcm, "auto_install_enabled", lambda home: True)
 
 
 def _home(tmp_path: Path, name: str = "home", *, env: str = "", config: str = "") -> Path:

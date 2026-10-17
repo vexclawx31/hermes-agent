@@ -12,7 +12,12 @@ name, the settings it already read, its data directory and tool names, so the mi
   :data:`STARTUP_RETRY_MAX_SECONDS` (``hermes update`` always retries): every ``hermes chat``, cron
   run and Desktop restart otherwise paid the network round trip again and showed the same failure.
 
-Both install the catalog entry at its reviewed pin through the normal plugin install path (kill
+Both hooks are opt-in per home: ``plugins.auto_install_left_core`` (default off). With it off, a
+missing provider fails closed before any catalog lookup or install, so no network call: the hook
+reports the provider and the command that installs it, and the agent runs without that memory
+provider. A provider still bundled at ``plugins/memory/<name>`` resolves before either hook runs.
+
+With it on, both install the catalog entry at its reviewed pin through the normal plugin install path (kill
 list, dependency constraints, enable), never a custom source. Every outcome — installed, refused,
 failed, absent from the catalog — reaches the user (terminal, Desktop, chat platform), never only
 ``agent.log``: a provider that silently stays missing is lost memory.
@@ -80,6 +85,26 @@ def _note_success(home: Path, plugin: str) -> None:
     _failure_stamp(home, plugin).unlink(missing_ok=True)
 
 
+def auto_install_enabled(home: Path) -> bool:
+    """``plugins.auto_install_left_core`` of *home*'s effective config. Off by default: installing a
+    catalog plugin puts code fetched from the network into the profile, so it needs an explicit
+    opt-in. A config that cannot be read counts as off (fail closed), including the last-known-good
+    fallback the loader serves for a malformed file: that is not what the file now says."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(home)
+    try:
+        from hermes_cli.config import FailedConfigRead, cfg_get, load_config_readonly
+        config = load_config_readonly()
+        if isinstance(config, FailedConfigRead):
+            return False
+        return cfg_get(config, "plugins", "auto_install_left_core", default=False) is True
+    except Exception:  # an unreadable config grants nothing: the switch fails closed
+        logger.debug("plugins.auto_install_left_core unreadable for %s", home, exc_info=True)
+        return False
+    finally:
+        reset_hermes_home_override(token)
+
+
 def configured_provider(home: Path) -> str:
     """``memory.provider`` of *home*'s effective config, or ``""``."""
     from pm.plugins_state import read_home_selection
@@ -126,12 +151,21 @@ def catalog_install_hint(name: str, *, category: Optional[str] = None) -> Option
     return _install_command(name, get_hermes_home())
 
 
-def _pending_provider(home: Path, *, say: Callable[[str], None]) -> Optional[str]:
-    """The provider *home* needs from the catalog, or None (nothing to do, or a catalog miss already
-    reported through *say*). Read-only."""
+def _missing_provider(home: Path) -> Optional[str]:
+    """The configured external provider when it resolves nowhere for *home*, else None. Local
+    lookups only (config, bundled and user plugin dirs, entry points): never the network."""
     name = configured_provider(home)
     from agent.memory_provider import is_core_memory_provider
     if is_core_memory_provider(name) or provider_present(name, home):
+        return None
+    return name
+
+
+def _pending_provider(home: Path, *, say: Callable[[str], None]) -> Optional[str]:
+    """The provider *home* needs from the catalog, or None (nothing to do, or a catalog miss already
+    reported through *say*). Read-only."""
+    name = _missing_provider(home)
+    if name is None:
         return None
     if catalog_source(name) is None:
         say(f"  ⚠ Memory provider '{name}' is configured but not installed and not in the plugin catalog. "
@@ -150,6 +184,12 @@ def _install_command(name: str, home: Path) -> str:
     if profile is None or (profile == "default" and get_active_profile() == "default"):
         return f"hermes plugins install {name}"
     return f"hermes -p {profile} plugins install {name}"
+
+
+def _auto_install_off_notice(name: str, home: Path) -> str:
+    return (f"⚠ Memory provider '{name}' is not installed, so external memory is off for this profile. "
+            f"Automatic install from the plugin catalog is off (plugins.auto_install_left_core), so "
+            f"Hermes did not fetch it: run `{_install_command(name, home)}`.")
 
 
 def _install_pending(home: Path, name: str, *, install: Callable[[str], dict],
@@ -246,6 +286,12 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
     pending: dict[tuple[str, bool], list[Path]] = {}
     for home in dependency_homes():
         try:
+            if not auto_install_enabled(home):
+                # Fail closed before the live catalog lookup: no network call for this home.
+                missing = _missing_provider(home)
+                if missing:
+                    labelled(home)(_auto_install_off_notice(missing, home))
+                continue
             name = _pending_provider(home, say=labelled(home))
             consent = bool(name) and _home_consent(home)
         except Exception as exc:
@@ -280,7 +326,8 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
 
 def recover_at_startup(name: str, *, say: Optional[Callable[[str], None]] = None) -> bool:
     """Agent-init hook for a configured provider that resolved nowhere. One attempt per process per
-    home and name; honours ``security.allow_lazy_installs`` because it installs code. True when installed."""
+    home and name; needs ``plugins.auto_install_left_core`` and honours ``security.allow_lazy_installs``
+    because it installs code. True when installed."""
     from hermes_constants import get_hermes_home, hermes_home_key
 
     home = get_hermes_home()
@@ -297,6 +344,10 @@ def recover_at_startup(name: str, *, say: Optional[Callable[[str], None]] = None
             except Exception:
                 logger.debug("Memory migration notification failed", exc_info=True)
 
+    if not auto_install_enabled(home):
+        # Fail closed before the live catalog lookup and the install: no network call.
+        report(_auto_install_off_notice(name, home))
+        return False
     from pm.install import lazy_installs_allowed
     if not lazy_installs_allowed():
         report(f"⚠ Memory provider '{name}' is not installed, so external memory is off for this session. "

@@ -66,6 +66,13 @@ plugins:
   # Raise this for large repositories or slow connections. Maximum: 3600.
   clone_timeout_seconds: 300
 
+  # A feature that moved out of core into the plugin catalog (a memory.provider such
+  # as honcho or hindsight, or homeassistant/spotify/langfuse) and is not installed:
+  # true installs its catalog plugin from the network on agent/gateway start and
+  # `hermes update`. false (default) warns with the `hermes plugins install <name>`
+  # command, runs without it and leaves config.yaml untouched.
+  auto_install_left_core: false
+
 # =============================================================================
 # Model Configuration
 # =============================================================================
