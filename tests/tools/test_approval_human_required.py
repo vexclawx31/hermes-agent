@@ -150,3 +150,63 @@ class TestUnattended:
             clear_session_vars(tokens)
         assert red["approved"] is False and red.get("human_required") is True
         assert green["approved"] is True
+
+
+class TestReviewFindings:
+    def test_every_default_entry_matches_a_real_detector_key(self):
+        from tools import approval_detection as d
+        keys = [desc for _, desc in d.DANGEROUS_PATTERNS]
+        keys += [d._PARSER_LIMIT_DESCRIPTION, d._GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION]
+        for entry in approval_module.DEFAULT_HUMAN_REQUIRED:
+            assert any(k == entry or k.startswith(entry + " (") for k in keys), entry
+
+    @pytest.mark.parametrize("command", [
+        "rm -rf ./build && hermes gateway restart",
+        "git push -f origin x && sed -i s/a/b/ ~/.hermes/.env",
+        "rm -rf ./build; kill $(pgrep -f 'hermes gateway')",
+        'launchctl kick"start" -k gui/501/ai.hermes.gateway',
+    ])
+    def test_red_category_anywhere_in_the_command_is_floored(self, monkeypatch, command):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        _config(monkeypatch, mode="smart")
+        calls = _smart(monkeypatch, "approve")
+        for key in approval_module.detect_dangerous_keys(command):
+            approval_module.approve_permanent(key)
+        prompts, callback = _recorder("deny")
+        result = check_all_command_guards(command, "local", approval_callback=callback)
+        assert result["approved"] is False
+        assert calls == []
+        assert len(prompts) == 1 and prompts[0].get("allow_session") is False
+
+    def test_compound_red_command_blocked_under_cron_approve(self, monkeypatch):
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        _config(monkeypatch, mode="manual", cron_mode="approve")
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "approve")
+        tokens = set_session_vars(cron_session="1")
+        try:
+            result = check_all_command_guards("rm -rf ./build && hermes gateway restart", "local")
+        finally:
+            clear_session_vars(tokens)
+        assert result["approved"] is False and result.get("human_required") is True
+
+    def test_no_person_and_no_known_context_still_blocks(self, monkeypatch):
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        _config(monkeypatch, mode="manual")
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_module, "_unattended_contexts", lambda: [])
+        assert check_all_command_guards(RED, "local")["approved"] is False
+        assert check_all_command_guards(GREEN, "local")["approved"] is True
+
+    def test_parser_limit_key_is_floored(self, monkeypatch):
+        _config(monkeypatch)
+        from tools import approval_detection as d
+        assert is_human_required(d._PARSER_LIMIT_DESCRIPTION)
+
+    def test_compound_sudo_shell_is_blocked_before_any_prompt(self, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        _config(monkeypatch, mode="smart")
+        _smart(monkeypatch, "approve")
+        prompts, callback = _recorder("once")
+        assert check_all_command_guards("git push -f origin x && sudo -s", "local",
+                                        approval_callback=callback)["approved"] is False

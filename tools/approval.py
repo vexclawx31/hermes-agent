@@ -28,7 +28,7 @@ from tools.approval_context import (
     _tirith_fail_open, get_current_session_key,
 )
 from tools.approval_detection import (
-    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
+    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_dangerous_keys, detect_hardline_command,
 )
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
@@ -545,7 +545,7 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, human_required: bool = False) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
@@ -555,6 +555,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     pending["description"] = description
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
+    if human_required:
+        pending.update(human_required=True, allow_permanent=False, allow_session=False)
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
@@ -576,6 +578,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     }
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
+    if human_required:
+        result.update(human_required=True, allow_permanent=False, allow_session=False)
     return result
 
 
@@ -906,7 +910,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 display_command, display_description = command, description
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
-                pattern_keys=pattern_keys, body=pending_body, smart_denied=once_only,
+                pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                human_required=human_required,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -1051,9 +1056,12 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
 # Operator-chosen yolo / mode=off still apply; the floor only removes agent-side shortcuts.
 DEFAULT_HUMAN_REQUIRED = (
     "stop/restart hermes gateway",
+    "stop/restart hermes gateway via shell-spliced verb",
     "stop/restart hermes launchd service",
     "hermes update",
     "kill hermes/gateway process",
+    "kill process via pgrep/pidof expansion",
+    "kill process via backtick pgrep/pidof expansion",
     "in-place edit of sensitive credential/SSH/shell-rc path",
     "copy/move file into sensitive credential/SSH/shell-rc path",
     "in-place edit of Hermes config/env",
@@ -1062,9 +1070,10 @@ DEFAULT_HUMAN_REQUIRED = (
     "cloud metadata endpoint access",
     "sudo with privilege flag",
     "sudo with combined-flag privilege escalation",
-    "recursive delete of home directory",
-    "recursive delete of system directory",
     "delete backups",
+    "delete volume shadow copies",
+    # Nothing behind a parser-limit key was inspected, so it may hide any of the above.
+    "command parser limit exceeded",
 )
 
 
@@ -1227,7 +1236,8 @@ def check_all_command_guards(command: str, env_type: str,
     if _yolo_active() or approval_mode == "off":
         return _approved()
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    human_required = is_dangerous and is_human_required(pattern_key)
+    red_keys = [key for key in detect_dangerous_keys(command) if is_human_required(key)] if is_dangerous else []
+    human_required = bool(red_keys)
     if not human_required and _command_matches_permanent_allowlist(command):
         return _approved()
 
@@ -1235,10 +1245,11 @@ def check_all_command_guards(command: str, env_type: str,
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
-        if human_required and _unattended_contexts():
-            logger.warning("Human-required command blocked with nobody present: %s", description)
+        if human_required:
+            red_desc = "; ".join(red_keys)
+            logger.warning("Human-required command blocked with nobody present: %s", red_desc)
             return {"approved": False, "human_required": True, "message": (
-                f"BLOCKED: {description} needs a person's approval and nobody is present to give it. "
+                f"BLOCKED: {red_desc} needs a person's approval and nobody is present to give it. "
                 "Do NOT retry or attempt the same outcome another way; report it as a decision for the user.")}
         for ctx in _unattended_contexts():
             result = _unattended_deny(command, ctx)
@@ -1259,6 +1270,9 @@ def check_all_command_guards(command: str, env_type: str,
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
     if is_dangerous and (human_required or not is_approved(session_key, pattern_key)):
         warnings.append((pattern_key, description, False))
+    for key in red_keys:
+        if key != pattern_key:
+            warnings.append((key, key, False))
     if not warnings:
         return _approved()
 

@@ -1513,6 +1513,37 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     return contains_gateway_lifecycle_command(command)
 
 
+def detect_dangerous_keys(command: str) -> list[str]:
+    """Every dangerous-pattern key the command matches, across all variants, in detector order.
+    ``detect_dangerous_command`` reports only the first; callers that must not miss a later,
+    more serious category in a compound command (the human-required floor) use this."""
+    if _command_parser_limit_exceeded(command):
+        return [_PARSER_LIMIT_DESCRIPTION]
+    if _is_verification_artifact_cleanup(command):
+        return []
+    keys: list[str] = []
+    for command_variant in _command_detection_variants(command):
+        command_lower = _lower_preserving_flags(command_variant)
+        masked_lower: str | None = None
+        for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+            if description in keys:
+                continue
+            if description in _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS:
+                if masked_lower is None:
+                    masked_lower = _lower_preserving_flags(_mask_quoted_prose(command_variant))
+                hit = pattern_re.search(masked_lower)
+            else:
+                hit = pattern_re.search(command_lower)
+            if hit:
+                keys.append(description)
+    for description, _ in _execution_flag_findings(_normalize_command_for_detection(command)):
+        if description not in keys:
+            keys.append(description)
+    if _is_shell_token_spliced_gateway_lifecycle(command) and _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION not in keys:
+        keys.append(_GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION)
+    return keys
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check dangerous patterns -> (is_dangerous, pattern_key, description)."""
     if _command_parser_limit_exceeded(command):
