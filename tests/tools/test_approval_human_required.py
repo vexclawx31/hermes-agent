@@ -21,8 +21,6 @@ def _clean(monkeypatch):
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-    monkeypatch.setattr("tools.tirith_security.check_command_security",
-                        lambda _command: {"action": "allow", "findings": [], "summary": ""})
     yield
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")

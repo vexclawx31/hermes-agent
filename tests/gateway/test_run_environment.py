@@ -56,3 +56,28 @@ def test_revocation_blocks_worker_and_retains_cleanup_redaction(tmp_path):
         with pytest.raises(RuntimeError): scope.spawn(lambda _: None,lambda _:None)
         assert scope.redact('synthetic-cleanup-token')=='[REDACTED]'
     assert current_environment() is None
+
+
+def test_host_exit_force_kill_uses_scoped_identity_never_numeric_group(monkeypatch):
+    """Upstream's host-exit path (_force_kill_process) must not signal a scoped run
+    process by numeric PID/group: only through its spawn-time psutil identity."""
+    from unittest.mock import Mock
+    from tools.environments import local as local_env
+
+    def numeric(*args):
+        raise AssertionError(f'numeric signal path used: {args}')
+    monkeypatch.setattr(local_env.os, 'killpg', numeric)
+    monkeypatch.setattr(local_env.os, 'getpgid', numeric)
+    child = Mock()
+    identity = Mock(is_running=Mock(return_value=True), children=Mock(return_value=[child]))
+    proc = Mock(_hermes_scoped=True, _hermes_identity=identity, pid=4242)
+    env = local_env.LocalEnvironment.__new__(local_env.LocalEnvironment)
+    env._force_kill_process(proc)
+    child.kill.assert_called_once_with()
+    identity.kill.assert_called_once_with()
+    proc.kill.assert_not_called()
+    proc.wait.assert_not_called()
+    # A scoped process whose identity was never captured is left alone, not guessed at.
+    lost = Mock(_hermes_scoped=True, _hermes_identity=None, pid=4243)
+    env._force_kill_process(lost)
+    lost.kill.assert_not_called()
