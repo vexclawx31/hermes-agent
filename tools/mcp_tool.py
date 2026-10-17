@@ -316,8 +316,8 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
 
     __slots__ = (
         "_auth_park",
-        "_cc_connection",
         "_auth_type",
+        "_cc_connection",
         "_config",
         "_elicitation",
         "_error",

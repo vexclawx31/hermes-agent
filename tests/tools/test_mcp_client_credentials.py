@@ -737,7 +737,7 @@ def _route_server(config, digest):
     return SimpleNamespace(_config=config, _resolved_identity=digest)
 
 
-from tests.tools.test_mcp_multiplex_connection_keys import two_profiles  # noqa: E402,F401  (fixture)
+from tests.tools.test_mcp_multiplex_connection_keys import two_profiles  # the multiplex-registry fixture
 
 
 def test_same_server_route_refuses_cross_profile_client_credentials():
@@ -764,7 +764,7 @@ def test_same_server_route_cross_profile_control_without_client_credentials():
     assert not _same_server_route(server, dict(plain), cross_profile=True, resolved_identity=None)
 
 
-def test_client_credentials_connection_is_not_adopted_by_another_profile(two_profiles):
+def test_client_credentials_connection_is_not_adopted_by_another_profile(two_profiles):  # health: allow F811 -- pytest injects the imported two_profiles fixture by parameter name
     """End to end through the multiplex registry: profile B never sees A's client_credentials
     tools, so B must open (and authenticate) its own connection."""
     from tests.tools.test_mcp_multiplex_connection_keys import _server
