@@ -110,6 +110,23 @@ def test_unreadable_config_counts_as_off(tmp_path, monkeypatch):
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", broken)
     assert mig.auto_install_enabled(tmp_path) is False
 
+
+def test_malformed_config_counts_as_off_even_with_a_last_known_good_opt_in(tmp_path, monkeypatch):
+    """The loader does not raise on bad YAML: it serves the last-known-good config, tagged
+    FailedConfigRead. An opt-in from that fallback is not what the file says now."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "config.yaml"
+    path.write_text("plugins:\n  auto_install_left_core: true\n", encoding="utf-8")
+    assert mig.auto_install_enabled(tmp_path) is True
+    path.write_text("plugins:\n  auto_install_left_core: false\nbroken: [\n", encoding="utf-8")
+    fallback = load_config_readonly()
+    assert isinstance(fallback, FailedConfigRead)
+    assert fallback["plugins"]["auto_install_left_core"] is True  # the stale opt-in is still served
+    assert mig.auto_install_enabled(tmp_path) is False
+
 def test_agent_init_default_off_warns_once_and_makes_no_network_call(
         tmp_path, monkeypatch, caplog, fresh, no_network):
     _write_config(tmp_path, "hindsight")

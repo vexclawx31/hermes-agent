@@ -88,12 +88,16 @@ def _note_success(home: Path, plugin: str) -> None:
 def auto_install_enabled(home: Path) -> bool:
     """``plugins.auto_install_left_core`` of *home*'s effective config. Off by default: installing a
     catalog plugin puts code fetched from the network into the profile, so it needs an explicit
-    opt-in. A config that cannot be read counts as off (fail closed)."""
+    opt-in. A config that cannot be read counts as off (fail closed), including the last-known-good
+    fallback the loader serves for a malformed file: that is not what the file now says."""
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     token = set_hermes_home_override(home)
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly
-        return cfg_get(load_config_readonly(), "plugins", "auto_install_left_core", default=False) is True
+        from hermes_cli.config import FailedConfigRead, cfg_get, load_config_readonly
+        config = load_config_readonly()
+        if isinstance(config, FailedConfigRead):
+            return False
+        return cfg_get(config, "plugins", "auto_install_left_core", default=False) is True
     except Exception:  # an unreadable config grants nothing: the switch fails closed
         logger.debug("plugins.auto_install_left_core unreadable for %s", home, exc_info=True)
         return False

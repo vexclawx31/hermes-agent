@@ -166,3 +166,64 @@ def test_package_lazy_install_still_runs_with_the_switch_off(tmp_path, monkeypat
     pm.extras.ensure_import("edge-tts")
     assert synced == [["edge-tts"]]
     assert lcm.recover_at_startup(say=lambda m: None) == []  # no_network: no plugin install
+
+
+# Home Assistant's core-era scope: core never ran its toolset on ACP or webhook, nor on a platform
+# whose saved list leaves it out. The migration records that in known_plugin_toolsets; with the
+# switch off nothing is written, so the resolver applies the same scope read-only.
+_HA_PLATFORMS = {"telegram": ["web"], "acp": ["hermes-acp"], "webhook": ["hermes-webhook"],
+                 "discord": ["hermes-discord"]}
+
+
+def _ha_home(tmp_path, monkeypatch, config, *, token=True):
+    home = tmp_path / "ha"
+    (home / "plugins" / "homeassistant").mkdir(parents=True)  # installed by hand or before the update
+    (home / ".env").write_text("HASS_TOKEN=abc\n" if token else "", encoding="utf-8")
+    (home / "config.yaml").write_text(config, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def _ha_states(home):
+    from hermes_cli.tools_config import _enabled_plugin_toolsets
+
+    config = lcm._read_config(home)
+    return {platform: "homeassistant" in _enabled_plugin_toolsets(config, platform, names, {"homeassistant"})
+            for platform, names in _HA_PLATFORMS.items()}
+
+
+_CORE_SCOPE = {"telegram": False, "acp": False, "webhook": False, "discord": True}
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_preinstalled_homeassistant_keeps_core_scope_either_way(tmp_path, monkeypatch, opt_in):
+    text = (f"plugins:\n  auto_install_left_core: {str(opt_in).lower()}\n"
+            "platform_toolsets:\n  telegram: [web]\n")
+    home = _ha_home(tmp_path, monkeypatch, text)
+    said = []
+    assert lcm.recover_at_startup(say=said.append) == []
+    assert said == []
+    assert _ha_states(home) == _CORE_SCOPE
+    if not opt_in:
+        assert (home / "config.yaml").read_text(encoding="utf-8") == text
+
+
+def test_recorded_scope_is_not_overridden(tmp_path, monkeypatch):
+    """Once recorded, known_plugin_toolsets decides: a user who enabled it on ACP since keeps it."""
+    home = _ha_home(tmp_path, monkeypatch, "_left_core_scoped: [homeassistant]\n"
+                                           "platform_toolsets:\n  telegram: [web]\n"
+                                           "known_plugin_toolsets:\n  telegram: [homeassistant]\n")
+    assert _ha_states(home) == {"telegram": False, "acp": True, "webhook": True, "discord": True}
+
+
+def test_core_scope_applies_only_to_a_home_that_used_home_assistant(tmp_path, monkeypatch):
+    home = _ha_home(tmp_path, monkeypatch, "platform_toolsets:\n  telegram: [web]\n", token=False)
+    assert _ha_states(home) == dict.fromkeys(_HA_PLATFORMS, True)
+
+
+def test_a_saved_list_naming_home_assistant_keeps_it_on(tmp_path, monkeypatch):
+    home = _ha_home(tmp_path, monkeypatch, "platform_toolsets:\n  acp: [hermes-acp, homeassistant]\n")
+    from hermes_cli.tools_config import _enabled_plugin_toolsets
+
+    config = lcm._read_config(home)
+    assert _enabled_plugin_toolsets(config, "acp", ["hermes-acp", "homeassistant"], {"homeassistant"})
