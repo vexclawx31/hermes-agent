@@ -474,6 +474,12 @@ google = [
   "httplib2==0.32.0",
   "pyasn1==0.6.4",
 ]
+# PyYAML for plugins. Core parses YAML with ruamel.yaml (hermes_yaml.py), but
+# plugins have always run inside this venv and some import `yaml` directly.
+# Earlier releases carried PyYAML transitively; v0.22.2 dropped that path, so
+# those plugins failed with ModuleNotFoundError on upgrade. Declared here and
+# kept in [all] so installs that load plugins keep the module they import.
+yaml = ["pyyaml>=6.0.3,<7"]
 youtube = [
   # Required by skills/media/youtube-content and
   # optional-skills/productivity/memento-flashcards (youtube_quiz.py).
@@ -524,6 +530,7 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  "hermes-agent[yaml]",
 ]
 
 [dependency-groups]

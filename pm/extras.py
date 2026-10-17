@@ -55,6 +55,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "google-chat": "google.cloud.pubsub_v1",
     "google-meet": ("playwright.sync_api", "websockets"),
     "youtube": "youtube_transcript_api",
+    "yaml": "yaml",
     "acp": "acp",
     "web": "fastapi",
     "doc-extract": "anydoc",
