@@ -28,7 +28,7 @@ from tools.approval_context import (
     _tirith_fail_open, get_current_session_key,
 )
 from tools.approval_detection import (
-    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
+    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_dangerous_keys, detect_hardline_command,
 )
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
@@ -545,7 +545,7 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, human_required: bool = False) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
@@ -555,6 +555,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     pending["description"] = description
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
+    if human_required:
+        pending.update(human_required=True, allow_permanent=False, allow_session=False)
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
@@ -576,6 +578,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     }
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
+    if human_required:
+        result.update(human_required=True, allow_permanent=False, allow_session=False)
     return result
 
 
@@ -794,7 +798,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, pending_body=None,
+                    human_required: bool = False) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
@@ -806,13 +811,15 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     from agent.redact import redact_sensitive_text
 
     smart_denied = False
-    if smart:
+    # A human-required (red-tier) prompt never goes to the guardian and is always one operation.
+    if smart and not human_required:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
                                            session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = permanent_capable and not smart_denied
+    once_only = smart_denied or human_required
+    allow_permanent = permanent_capable and not once_only
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -826,7 +833,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        if not once_only:
             _persist_choice(session_key, choice, warnings)
         if spec.user_approved:
             return _user_approved(session_key, description)
@@ -836,7 +843,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=not once_only, allow_permanent=allow_permanent,
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -862,11 +869,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": not once_only,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            if human_required:
+                data["human_required"] = True
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
@@ -902,6 +911,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
                 pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                human_required=human_required,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -913,7 +923,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
     choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+                                       allow_session=not once_only, smart_denied=smart_denied,
+                                       approval_callback=approval_callback)
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -1036,6 +1047,52 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
         return bool(provider_flag(env_type, "skip_container_guards", False))
     except Exception:
         return False
+
+
+# Red-tier detector categories that no guardian verdict, allowlist entry or earlier session
+# approval may satisfy: a person decides each one, once. ``approvals.human_required`` replaces
+# this list (``[]`` turns the floor off). An entry matches a detector key exactly or as the
+# prefix of a variant: "in-place edit of Hermes config/env" also covers "... (long flag)".
+# Operator-chosen yolo / mode=off still apply; the floor only removes agent-side shortcuts.
+DEFAULT_HUMAN_REQUIRED = (
+    "stop/restart hermes gateway",
+    "stop/restart hermes gateway via shell-spliced verb",
+    "stop/restart hermes launchd service",
+    "hermes update",
+    "kill hermes/gateway process",
+    "kill process via pgrep/pidof expansion",
+    "kill process via backtick pgrep/pidof expansion",
+    "in-place edit of sensitive credential/SSH/shell-rc path",
+    "copy/move file into sensitive credential/SSH/shell-rc path",
+    "in-place edit of Hermes config/env",
+    "access to Hermes secrets",
+    "access to SSH keys",
+    "cloud metadata endpoint access",
+    "sudo with privilege flag",
+    "sudo with combined-flag privilege escalation",
+    "delete backups",
+    "delete volume shadow copies",
+    # Nothing behind a parser-limit key was inspected, so it may hide any of the above.
+    "command parser limit exceeded",
+)
+
+
+def _human_required_entries() -> tuple[str, ...]:
+    configured = approval_context._get_approval_config().get("human_required")
+    if configured is None:
+        return DEFAULT_HUMAN_REQUIRED
+    if not isinstance(configured, (list, tuple)):
+        logger.warning("approvals.human_required must be a list; using the default floor (got %r)", configured)
+        return DEFAULT_HUMAN_REQUIRED
+    return tuple(str(entry).strip() for entry in configured if str(entry).strip())
+
+
+def is_human_required(pattern_key: str | None) -> bool:
+    """True when ``pattern_key`` falls in a human-required (red-tier) category."""
+    if not pattern_key:
+        return False
+    return any(pattern_key == entry or pattern_key.startswith(entry + " (")
+               for entry in _human_required_entries())
 
 
 def _user_deny_block(command: str) -> dict | None:
@@ -1178,13 +1235,22 @@ def check_all_command_guards(command: str, env_type: str,
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    red_keys = [key for key in detect_dangerous_keys(command) if is_human_required(key)] if is_dangerous else []
+    human_required = bool(red_keys)
+    if not human_required and _command_matches_permanent_allowlist(command):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
+        if human_required:
+            red_desc = "; ".join(red_keys)
+            logger.warning("Human-required command blocked with nobody present: %s", red_desc)
+            return {"approved": False, "human_required": True, "message": (
+                f"BLOCKED: {red_desc} needs a person's approval and nobody is present to give it. "
+                "Do NOT retry or attempt the same outcome another way; report it as a decision for the user.")}
         for ctx in _unattended_contexts():
             result = _unattended_deny(command, ctx)
             if result is not None:
@@ -1194,7 +1260,6 @@ def check_all_command_guards(command: str, env_type: str,
     # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
     # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
     tirith_result = _tirith_scan(command)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
     warnings = []
     session_key = get_current_session_key()
     if tirith_result["action"] in {"block", "warn"}:
@@ -1203,8 +1268,11 @@ def check_all_command_guards(command: str, env_type: str,
         tirith_key = f"tirith:{rule_id}"
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
-    if is_dangerous and not is_approved(session_key, pattern_key):
+    if is_dangerous and (human_required or not is_approved(session_key, pattern_key)):
         warnings.append((pattern_key, description, False))
+    for key in red_keys:
+        if key != pattern_key:
+            warnings.append((key, key, False))
     if not warnings:
         return _approved()
 
@@ -1220,7 +1288,7 @@ def check_all_command_guards(command: str, env_type: str,
         pattern_key=primary_key, pattern_keys=all_keys, warnings=warnings,
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
-        permanent_capable=any(not is_t for _, _, is_t in warnings),
+        permanent_capable=any(not is_t for _, _, is_t in warnings), human_required=human_required,
     )
 
 

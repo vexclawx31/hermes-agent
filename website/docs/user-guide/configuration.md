@@ -2923,6 +2923,20 @@ approvals:
 
 The guardian must answer with a single verdict word. Reasoning models may write a short rationale first; only the last non-empty line is read, and it must be exactly `APPROVE`, `DENY`, or `ESCALATE` (markdown or punctuation around it is ignored). Anything else escalates to you.
 
+### Human-required commands
+
+Some command categories always need a person's decision, whatever the approval mode allows the agent to decide on its own. If any part of a command (for example the second half of `a && b`) falls in one of these categories, Hermes skips the smart guardian, ignores `command_allowlist` and earlier session approvals, and offers only a one-time approval. With nobody present to answer, the command is blocked, even when `cron_mode` is `approve`. An operator-chosen `--yolo` or `mode: off` still applies.
+
+The default list covers the categories the command detector flags for: gateway restarts, updates and kills (including quote-spliced spellings), edits to credential, SSH, shell-rc and Hermes config/env files, cloud instance-credential access, the Windows-path secret and SSH-key reads, privileged `sudo`, and deleting backups or shadow copies. Commands too large for the detector to inspect are included as well. The floor only acts on what the detector flags; it is not a sandbox. `approvals.human_required` replaces the list. Each entry is a detector category name; an entry also covers that category's variants, so `in-place edit of Hermes config/env` covers its `(long flag)` form. `[]` turns the floor off.
+
+```yaml
+approvals:
+  human_required:
+    - stop/restart hermes gateway
+    - in-place edit of sensitive credential/SSH/shell-rc path
+    - sudo with privilege flag
+```
+
 
 ## Checkpoints
 
