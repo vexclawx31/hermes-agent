@@ -219,15 +219,24 @@ platforms:
   native mention metadata. Typed numbers, `mention_patterns`, `/commands`, replies to the bot and
   `free_response_chats` do not wake the bot in groups. WhatsApp clients set this metadata, so it is the best
   available signal, not cryptographic proof.
-- `guest_toolsets` replaces the platform toolsets for every caller that is not in `owners` (a `"*"` owner never
-  counts). The list is exact: only the named concrete toolsets are enabled — no composites, default-on plugin
-  toolsets or MCP servers. Group sessions stay per participant (`group_sessions_per_user`, default on), so an
-  owner's transcript is not loaded into a guest turn. Profile memory injected into the system prompt is still
-  shared; keep audience-sensitive facts out of global memory.
+- `owners` (a `"*"` owner never counts) separates owner callers from guests:
+  - `guest_toolsets` replaces the platform toolsets for guests. The list is exact: only the named concrete
+    toolsets — no composites, default-on plugin toolsets or MCP servers. With `owners` set and no
+    `guest_toolsets`, guests get no tools; if the WhatsApp adapter cannot be resolved, nobody gets tools.
+  - Guest turns run without profile memory (MEMORY.md / USER.md) and without the external memory provider
+    (no recall, no retain), unless `memory` is in `guest_toolsets`.
+  - Owners administer slash commands in DMs and groups unless `allow_admin_from` / `group_allow_admin_from`
+    is set; guests keep `help`, `whoami` and `group_user_allowed_commands`. Matching covers phone/LID forms.
+  - Group sessions and text batches stay per participant. With `group_sessions_per_user: false`, guests are
+    denied rather than sharing the owner's transcript.
+- Poll answers to the bot's own polls (clarify-as-poll) pass the native-mention rule; sender rules still apply.
+- Messages the bridge receives as history/offline replay (`upsertType: append`) are never answered.
 
 Plugins that archive group traffic can register the observer-only `whatsapp_transport_event` hook: it fires
 for every group message the bridge forwards, **before** sender and mention gating, with a deep copy of the
-bridge payload. The bridge also exposes `GET /groups` (joined groups with participant IDs) and
+bridge payload. Callbacks run off the intake loop (bounded by `plugins.hook_callback_timeout`, at most 256
+pending), may see a message twice after a reconnect and in any order, so dedupe by `messageId`. The bot's own
+group messages are not forwarded. The bridge also exposes `GET /groups` (joined groups with participant IDs) and
 `GET /message-status/<id>` (delivery status of a message it sent; in groups usually `server_ack`).
 
 Then start the gateway:

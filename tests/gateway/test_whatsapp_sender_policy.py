@@ -207,13 +207,15 @@ def test_runner_sender_rules_override_owner_env_allowlist(monkeypatch):
 
 # --- transport observer --------------------------------------------------------------------
 
-def _hook_capture(monkeypatch, fail=False):
-    from hermes_cli import lifecycle
-    from hermes_cli import plugins
+def _hook_capture(monkeypatch, fail=False, delay=0.0):
+    import time
+
+    from hermes_cli import lifecycle, plugins
 
     seen = []
 
-    async def fake_ainvoke(name, **kwargs):
+    def fake_invoke(name, **kwargs):
+        time.sleep(delay)  # health: allow HX013 -- a slow observer is the behaviour under test
         seen.append((name, kwargs))
         kwargs["raw_message"]["body"] = "mutated"
         if fail:
@@ -221,8 +223,17 @@ def _hook_capture(monkeypatch, fail=False):
         return []
 
     monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "whatsapp_transport_event")
-    monkeypatch.setattr(plugins, "ainvoke_hook", fake_ainvoke)
+    monkeypatch.setattr(plugins, "invoke_hook", fake_invoke)
     return seen
+
+
+def _build_and_drain(adapter, data):
+    async def run():
+        result = await adapter._build_message_event(data)
+        await asyncio.gather(*list(adapter.__dict__.get("_observer_tasks", ())))
+        return result
+
+    return asyncio.run(run())
 
 
 def test_hook_is_registered():
@@ -236,18 +247,115 @@ def test_observer_sees_ungated_group_chatter_and_cannot_mutate(monkeypatch, fail
     seen = _hook_capture(monkeypatch, fail=fail)
     adapter = _make_adapter()
     data = _group(sender=GUEST, body="plain chatter")
-    assert asyncio.run(adapter._build_message_event(data)) is None  # not a conversation turn
+    assert _build_and_drain(adapter, data) is None  # not a conversation turn
     assert [name for name, _ in seen] == ["whatsapp_transport_event"]
     assert seen[0][1]["platform"] == "whatsapp"
     assert data["body"] == "plain chatter"
 
 
+def test_slow_observer_does_not_block_intake(monkeypatch):
+    import time
+
+    _hook_capture(monkeypatch, delay=0.5)
+    adapter = _make_adapter()
+
+    async def run():
+        started = time.monotonic()
+        await adapter._build_message_event(_group(sender=GUEST))
+        elapsed = time.monotonic() - started
+        await asyncio.gather(*list(adapter.__dict__.get("_observer_tasks", ())))
+        return elapsed
+
+    assert asyncio.run(run()) < 0.2
+
+
 def test_observer_skips_dms_and_broadcasts(monkeypatch):
     seen = _hook_capture(monkeypatch)
     adapter = _make_adapter()
-    asyncio.run(adapter._build_message_event(_dm(GUEST)))
-    asyncio.run(adapter._build_message_event(_group(chat_id="status@broadcast")))
+    _build_and_drain(adapter, _dm(GUEST))
+    _build_and_drain(adapter, _group(chat_id="status@broadcast"))
     assert seen == []
+
+
+def test_append_replay_is_observed_but_never_answered(monkeypatch):
+    seen = _hook_capture(monkeypatch)
+    adapter = _make_adapter()
+    assert adapter._should_process_message(_native(upsertType="append")) is False
+    assert adapter._should_process_message(_native(upsertType="notify")) is True
+    _build_and_drain(adapter, _native(upsertType="append"))
+    assert len(seen) == 1
+
+
+# --- review round fixes --------------------------------------------------------------------
+
+def test_owners_without_guest_toolsets_means_no_guest_tools():
+    extra = {k: v for k, v in ALEX_EXTRA.items() if k != "guest_toolsets"}
+    adapter = _make_adapter(extra)
+    assert adapter.toolsets_for_source(_source(GUEST)) == []
+    assert adapter.toolsets_for_source(_source(OWNER)) is None
+
+
+def test_owner_poll_vote_admitted_guest_vote_denied_in_ordinary_group():
+    adapter = _make_adapter()
+    vote = {"nativeType": "pollUpdateMessage", "body": "Option A"}
+    assert adapter._should_process_message(_group(sender=OWNER, **vote)) is True
+    assert adapter._should_process_message(_group(sender=GUEST, **vote)) is False
+
+
+def test_shared_group_sessions_deny_guests():
+    adapter = _make_adapter({**ALEX_EXTRA, "group_sessions_per_user": False})
+    assert adapter._should_process_message(_native(chat_id=SQUAD_GROUP, sender=GUEST)) is False
+    assert adapter._should_process_message(_native(chat_id=SQUAD_GROUP, sender=OWNER)) is True
+
+
+def test_text_batches_never_merge_across_participants():
+    from gateway.platforms.base import MessageEvent
+
+    adapter = _make_adapter()
+    adapter._session_key_profile = lambda source: None
+    adapter._canonicalize = lambda source: None
+    keys = {adapter._text_batch_key(MessageEvent(text="x", source=_source(user))) for user in (OWNER, GUEST)}
+    assert len(keys) == 2
+
+
+def test_allow_all_env_does_not_bypass_sender_rules(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_ALLOW_ALL_USERS", "true")
+    adapter = _make_adapter()
+    runner = _runner_with(adapter)
+    runner._authorization_adapter = lambda platform, profile=None: adapter
+    assert runner._is_user_authorized(_source(GUEST, ORDINARY_GROUP)) is False
+
+
+def test_missing_whatsapp_adapter_gives_no_tools():
+    runner = _runner_with(None)
+    config = {"platform_toolsets": {"whatsapp": ["web", "terminal"]}}
+    assert runner._resolve_enabled_toolsets_for_source(config, _source(GUEST), "whatsapp") == []
+
+
+def test_guests_skip_memory_owners_keep_it():
+    from gateway.run_turn_toolsets import source_skips_memory
+
+    adapter = _make_adapter()
+    assert source_skips_memory(lambda s: adapter, _source(GUEST)) is True
+    assert source_skips_memory(lambda s: adapter, _source(OWNER)) is False
+    with_memory = _make_adapter({**ALEX_EXTRA, "guest_toolsets": ["web", "memory"]})
+    assert source_skips_memory(lambda s: with_memory, _source(GUEST)) is False
+
+
+def test_owners_administer_slash_commands_guests_get_floor(lid_mapping):
+    from types import SimpleNamespace
+
+    from gateway.slash_access import policy_for_source
+
+    gw = SimpleNamespace(platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, extra=dict(ALEX_EXTRA))})
+    policy = policy_for_source(gw, _source(GUEST))
+    assert policy.enabled is True
+    assert policy.can_run(GUEST, "help") is True
+    for cmd in ("model", "yolo", "restart", "update", "reload_mcp"):
+        assert policy.can_run(GUEST, cmd) is False
+    assert policy.can_run(OWNER, "model") is True
+    assert policy_for_source(gw, _source(lid_mapping)).can_run(lid_mapping, "model") is True
+    assert policy_for_source(gw, _source(OWNER, OWNER, "dm")).can_run(OWNER_DEVICE, "yolo") is True
 
 
 # --- identity forms ------------------------------------------------------------------------

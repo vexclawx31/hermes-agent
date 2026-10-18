@@ -2391,6 +2391,11 @@ class GatewayTurnMixin:
         from gateway.run_turn_toolsets import resolve_enabled_toolsets_for_source
         return resolve_enabled_toolsets_for_source(self._delivery_adapter_for, user_config, source, platform_key)
 
+    def _source_skips_memory(self, source: SessionSource) -> bool:
+        """No profile memory or external memory provider for exact-override guest callers."""
+        from gateway.run_turn_toolsets import source_skips_memory
+        return source_skips_memory(self._delivery_adapter_for, source)
+
     def _resolve_turn_toolsets(self, user_config: dict, source: SessionSource, platform_key: str):
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""
         from agent.skill_utils import parse_config_string_list
@@ -2454,7 +2459,7 @@ class GatewayTurnMixin:
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
-                    disabled_toolsets=disabled_toolsets,
+                    disabled_toolsets=disabled_toolsets, skip_memory=self._source_skips_memory(source),
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),

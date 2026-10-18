@@ -230,9 +230,13 @@ export function createDeliveryStatusStore(limit = 512) {
       while (statuses.size > limit) statuses.delete(statuses.keys().next().value);
     },
     update(id, status) {
+      if (!id || !Number.isInteger(status)) return false;
+      if (!statuses.has(id)) this.track(id); // an ack can arrive before /send returns
       const current = statuses.get(id);
-      if (!current || !Number.isInteger(status)) return false;
-      if (status === 0 || status > current.status) statuses.set(id, { status, updatedAt: Date.now() });
+      // An error after delivery (3+) is a late artefact; never downgrade a delivered/read message.
+      if ((status === 0 && current.status < 3) || status > current.status) {
+        statuses.set(id, { status, updatedAt: Date.now() });
+      }
       return true;
     },
     get(id) {

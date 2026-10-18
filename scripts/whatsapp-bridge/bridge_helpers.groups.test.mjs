@@ -17,7 +17,14 @@ test('summarizeGroups keeps ids, subject and participant ids only, sorted', () =
 
 test('delivery status store tracks only sent ids and never regresses', () => {
   const store = createDeliveryStatusStore(2);
-  assert.equal(store.update('unknown', 3), false);
+  assert.equal(store.update('', 3), false);
+  store.update('early', 2); // ack before /send returned
+  assert.equal(store.get('early').status, 'server_ack');
+  store.track('early');
+  assert.equal(store.get('early').status, 'server_ack');
+  store.update('early', 4);
+  store.update('early', 0);
+  assert.equal(store.get('early').status, 'read');
   store.track('m1');
   assert.equal(store.get('m1').status, 'pending');
   store.update('m1', 3);
@@ -26,5 +33,6 @@ test('delivery status store tracks only sent ids and never regresses', () => {
   store.track('m2');
   store.track('m3');
   assert.equal(store.get('m1'), null);
+  assert.equal(store.get('early'), null);
   assert.equal(store.get('m3').status, 'pending');
 });

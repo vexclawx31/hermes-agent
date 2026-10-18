@@ -28,6 +28,9 @@ def resolve_enabled_toolsets_for_source(
         override = None
         if getattr(adapter, "toolsets_for_source_exact", False) is True:
             return []
+    if adapter is None and platform_key == "whatsapp":
+        # Sender-aware tool selection needs the live adapter; without it fail closed.
+        return []
     if getattr(adapter, "toolsets_for_source_exact", False) is True and isinstance(override, list):
         names = [str(x) for x in override]
         pts = dict(user_config.get("platform_toolsets") or {})
@@ -39,3 +42,17 @@ def resolve_enabled_toolsets_for_source(
         pts[platform_key] = [str(x) for x in override]
         user_config = {**user_config, "platform_toolsets": pts}
     return sorted(_get_platform_tools(user_config, platform_key))
+
+
+def source_skips_memory(delivery_adapter_for: Callable[[Any], Any], source: Any) -> bool:
+    """True for an exact-override guest caller: no MEMORY.md/USER.md and no external memory provider
+    (recall or retain) unless ``memory`` is one of the guest toolsets."""
+    try:
+        adapter = delivery_adapter_for(source)
+        if getattr(adapter, "toolsets_for_source_exact", False) is not True:
+            return False
+        override = adapter.toolsets_for_source(source)
+    except Exception:  # health: allow BLE001 -- adapter override is plugin code; undecidable means skip memory
+        logger.debug("toolsets_for_source failed while resolving memory", exc_info=True)
+        return True
+    return isinstance(override, list) and "memory" not in override

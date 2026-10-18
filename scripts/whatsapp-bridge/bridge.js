@@ -786,6 +786,8 @@ async function startSocket() {
         mediaType: event.mediaType,
         mediaUrls: event.mediaUrls,
       });
+      // 'append' = history/offline replay; the adapter archives it but never answers it.
+      event.upsertType = type;
       messageQueue.push(event);
       emitDebugEvent({
         stage: 'queued',

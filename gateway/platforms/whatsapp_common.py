@@ -299,11 +299,25 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
     def toolsets_for_source(self, source) -> Optional[list[str]]:
         """``extra.guest_toolsets`` for any caller that is not an owner; owners keep the platform toolsets."""
         guest = self.config.extra.get("guest_toolsets")
-        if guest is None:
+        if guest is None and not getattr(self, "_owners", None):
             return None
         if self._is_whatsapp_owner(getattr(source, "user_id", None)):
             return None
+        # With owners configured, a missing/blank guest list means no tools, never the platform set.
         return [str(t) for t in self._coerce_allow_list(guest)]
+
+    def _text_batch_key(self, event) -> str:
+        """Never merge one participant's burst into another's when owners/guests get different tools."""
+        key = super()._text_batch_key(event)
+        source = getattr(event, "source", None)
+        if getattr(self, "_owners", None) and getattr(source, "chat_type", "") == "group":
+            return f"{key}:{getattr(source, 'user_id', '') or ''}"
+        return key
+
+    def _guest_isolation_broken(self) -> bool:
+        """Owner/guest separation needs per-participant group sessions; a shared one would load the
+        owner's transcript (and its tool results) into a guest turn."""
+        return bool(getattr(self, "_owners", None)) and self.config.extra.get("group_sessions_per_user", True) is False
 
     def _should_process_message(self, data: dict[str, Any]) -> bool:
         chat_id = str(data.get("chatId") or "")
@@ -313,10 +327,16 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         if not data.get("isGroup", False):
             # DMs that pass the policy gate are always processed
             return self._is_dm_intake_allowed(str(data.get("senderId") or data.get("from") or ""))
-        if not self._is_group_allowed(chat_id, str(data.get("senderId") or "")):
+        sender = str(data.get("senderId") or "")
+        if not self._is_group_allowed(chat_id, sender):
             return False
+        if self._guest_isolation_broken() and not self._is_whatsapp_owner(sender):
+            return False
+        if data.get("upsertType") == "append":
+            return False  # history/offline replay: archive-only, never a late conversation turn
         if self._whatsapp_require_native_mention():
-            return self._message_natively_mentions_bot(data)
+            # The bridge emits poll votes only for polls it sent itself (clarify-as-poll answers).
+            return data.get("nativeType") == "pollUpdateMessage" or self._message_natively_mentions_bot(data)
         # Group messages: check mention / free-response settings
         if chat_id in self._whatsapp_free_response_chats() or not self._whatsapp_require_mention():
             return True

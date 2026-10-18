@@ -30,6 +30,7 @@ def _wenv(name: str, default: str = "") -> str:
 
 logger = logging.getLogger(__name__)
 
+_MAX_PENDING_OBSERVER_EVENTS = 256
 # Owner-typed inbound text is prefixed at MessageEvent construction so transcripts stay disambiguated before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
@@ -1040,9 +1041,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         if not self._transport_observers_subscribed():
             return
+        pending = self.__dict__.setdefault("_observer_tasks", set())
+        if len(pending) >= _MAX_PENDING_OBSERVER_EVENTS:
+            logger.warning("[%s] whatsapp_transport_event backlog full; event not observed", self.name)
+            return
+        # Off the poll loop: a slow archive must never delay intake. invoke_hook bounds each callback
+        # with plugins.hook_callback_timeout; plugins dedupe by messageId (ordering is not guaranteed).
+        task = asyncio.create_task(self._run_transport_observers(copy.deepcopy(data)))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    async def _run_transport_observers(self, raw: dict[str, Any]) -> None:
         try:
-            from hermes_cli.plugins import ainvoke_hook
-            await ainvoke_hook("whatsapp_transport_event", raw_message=copy.deepcopy(data), platform="whatsapp")
+            from hermes_cli.plugins import invoke_hook
+            await asyncio.to_thread(invoke_hook, "whatsapp_transport_event", raw_message=raw, platform="whatsapp")
         except Exception:  # health: allow BLE001 -- observer-only hook: errors never escape into intake
             logger.debug("[%s] whatsapp_transport_event dispatch error", self.name, exc_info=True)
 

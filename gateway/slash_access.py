@@ -11,7 +11,7 @@ site in ``gateway/run.py`` via the live registry; never affects plain chat.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, FrozenSet, Iterable, Optional
 
 # Read-only floor every allowed user keeps under gating, so a non-admin can still discover what
@@ -35,10 +35,15 @@ class SlashAccessPolicy:
     admin_user_ids: frozenset[str]
     user_allowed_commands: frozenset[str]
 
+    # Platform identity matcher (WhatsApp phone/LID/device aliases); exact string match when None.
+    id_matcher: Optional[Callable[[str, frozenset], bool]] = field(default=None, compare=False)
+
     def is_admin(self, user_id: Optional[str]) -> bool:
         # Gating disabled -> everyone is admin so callers can use is_admin/can_run uniformly.
         if not self.enabled:
             return True
+        if self.id_matcher is not None and user_id:
+            return bool(self.id_matcher(str(user_id), self.admin_user_ids - {"*"}))
         return bool(user_id) and str(user_id) in self.admin_user_ids
 
     def can_run(self, user_id: Optional[str], canonical_cmd: str) -> bool:
@@ -91,6 +96,9 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     """
     admin_key, cmd_key = _SCOPE_KEYS.get(scope, _SCOPE_KEYS["dm"])
     admin_ids = _coerce_id_list(extra.get(admin_key))
+    if not admin_ids:
+        # Agent owners (WhatsApp ``owners``) administer slash commands in every scope by default.
+        admin_ids = _coerce_id_list(extra.get("owners")) - {"*"}
     cmds = _coerce_command_list(extra.get(cmd_key))
     if scope == "dm" and not cmds:
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
@@ -120,14 +128,14 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
     normalized = str(chat_type).strip().lower() if chat_type is not None else ""
     if normalized:
         scope = "dm" if normalized in _DM_CHAT_TYPES else "group"
-        return policy_from_extra(extra, scope)
+        return _with_platform_matcher(policy_from_extra(extra, scope), source)
     # Blank/None chat_type is ambiguous (relay frames may send "" / null; restored rows keep a
     # stored empty value verbatim). _DM_CHAT_TYPES lists "" but a truthiness guard made it
     # unreachable: resolve to whichever scope is gated so an ambiguous source never lands in an
     # ungated allow-everything scope; keep the historical group scope on a tie.
     dm_policy = policy_from_extra(extra, "dm")
     group_policy = policy_from_extra(extra, "group")
-    return dm_policy if dm_policy.enabled and not group_policy.enabled else group_policy
+    return _with_platform_matcher(dm_policy if dm_policy.enabled and not group_policy.enabled else group_policy, source)
 
 
 __all__ = ["SlashAccessPolicy", "policy_for_source", "policy_from_extra"]
@@ -156,3 +164,13 @@ def policy_for_runner_source(runner: Any, source: Any) -> SlashAccessPolicy:
         if config is None:
             return _FAIL_CLOSED_POLICY
     return policy_for_source(config, source)
+
+
+def _with_platform_matcher(policy: SlashAccessPolicy, source: Any) -> SlashAccessPolicy:
+    """WhatsApp admin entries match the sender across phone/LID/device forms."""
+    if not policy.enabled or str(getattr(getattr(source, "platform", None), "value", "")) != "whatsapp":
+        return policy
+    from dataclasses import replace
+
+    from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+    return replace(policy, id_matcher=WhatsAppBehaviorMixin._matches_whatsapp_allowlist)

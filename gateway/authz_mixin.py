@@ -647,6 +647,12 @@ class GatewayAuthorizationMixin:
         adapter_profile = self._adapter_profile_for_source(source)
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
+        # Per-group sender rules (WhatsApp ``groups.<id>.allow_from``) are authoritative for group turns:
+        # re-check this sender on the live adapter before allow-all, chat-scoped and env allowlist grants.
+        if is_group and allow_adapter_delegation:
+            sender_rules = self._adapter_group_sender_verdict(source, source.user_id, adapter_profile)
+            if sender_rules is not None:
+                return sender_rules
         if self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation):
             return True
         user_id = source.user_id
@@ -662,12 +668,6 @@ class GatewayAuthorizationMixin:
                 platform_allow_all_var = getattr(entry, "allow_all_env", "") or platform_allow_all_var
         if platform_allow_all_var and _env_truthy(platform_allow_all_var):
             return True
-        # Per-group sender rules (WhatsApp ``groups.<id>.allow_from``) are authoritative for group turns:
-        # re-check this sender on the live adapter instead of the platform-wide env allowlist.
-        if is_group and allow_adapter_delegation:
-            sender_rules = self._adapter_group_sender_verdict(source, user_id, adapter_profile)
-            if sender_rules is not None:
-                return sender_rules
         # Adapter-verified role auth (Discord DISCORD_ALLOWED_ROLES). ``is True``: no MagicMock pass.
         if allow_adapter_delegation and getattr(source, "role_authorized", False) is True:
             return True
