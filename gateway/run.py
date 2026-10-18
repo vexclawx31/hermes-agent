@@ -2224,6 +2224,19 @@ _OWN_POLICY_OPEN_ENV = {
     Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS")}
 
 
+def _group_sender_rules_gate_all(extra: dict) -> bool:
+    """True when ``groups`` restricts senders and the ``"*"`` default (if any) is not itself open."""
+    groups = extra.get("groups")
+    if not isinstance(groups, dict) or not any(isinstance(v, dict) for v in groups.values()):
+        return False
+    default = groups.get("*")
+    if not isinstance(default, dict):
+        return True  # groups without an entry are denied
+    allow = default.get("allow_from", default.get("allowFrom"))
+    entries = [str(x).strip() for x in (allow if isinstance(allow, (list, tuple, set)) else str(allow or "").split(","))]
+    return bool(entries) and all(entries) and "*" not in entries
+
+
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
     for platform, platform_config in getattr(config, "platforms", {}).items():
@@ -2239,7 +2252,10 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         group_policy = str(
             extra.get("group_policy") or (_getenv(group_env, "pairing") if group_env else "pairing")
         ).strip().lower()
-        if dm_policy != "open" and group_policy != "open":
+        # An open group policy gated by per-group sender rules (``groups.<id|*>.allow_from``) is not an
+        # open door: every unmatched sender is denied at intake and again by the runner.
+        group_open = group_policy == "open" and not _group_sender_rules_gate_all(extra)
+        if dm_policy != "open" and not group_open:
             continue
         gateway_allow_all = _getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
         if gateway_allow_all or (
