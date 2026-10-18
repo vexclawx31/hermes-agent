@@ -396,6 +396,9 @@ def test_owner_lid_sender_matches_phone_rules(lid_mapping):
     ({"*": {"allow_from": []}}, "allowlist", True),
     ({}, "allowlist", True),
     ({"*": {"allow_from": [OWNER]}}, "open", True),                          # open DMs still need the opt-in
+    ({"*": {"allow_from": '["*"]'}}, "allowlist", True),                     # JSON-list string parsed like intake
+    ({"*": {"allow_from": f'{OWNER},*'}}, "allowlist", True),                # CSV with a wildcard
+    ({"*": {"allow_from": f'["{OWNER}"]'}}, "allowlist", False),
 ])
 def test_open_group_policy_guard_accepts_sender_rules(monkeypatch, groups, dm_policy, violation):
     from types import SimpleNamespace
@@ -406,3 +409,14 @@ def test_open_group_policy_guard_accepts_sender_rules(monkeypatch, groups, dm_po
     extra = {"dm_policy": dm_policy, "group_policy": "open", "groups": groups}
     cfg = SimpleNamespace(platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, extra=extra)})
     assert (_own_policy_open_startup_violation(cfg) is not None) is violation
+
+
+def test_open_group_guard_never_exempts_other_platforms(monkeypatch):
+    from types import SimpleNamespace
+
+    from gateway.run import _own_policy_open_startup_violation
+    for key in ("GATEWAY_ALLOW_ALL_USERS", "WECOM_ALLOW_ALL_USERS"):
+        monkeypatch.delenv(key, raising=False)
+    extra = {"dm_policy": "allowlist", "group_policy": "open", "groups": {"g1": {"allow_from": ["u1"]}}}
+    cfg = SimpleNamespace(platforms={Platform.WECOM: PlatformConfig(enabled=True, extra=extra)})
+    assert _own_policy_open_startup_violation(cfg) is not None

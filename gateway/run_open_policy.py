@@ -16,17 +16,22 @@ _OWN_POLICY_OPEN_ENV = {
     Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS")}
 
 
-def _group_sender_rules_gate_all(extra: dict) -> bool:
-    """True when ``groups`` restricts senders and the ``"*"`` default (if any) is not itself open."""
+def _group_sender_rules_gate_all(platform, extra: dict) -> bool:
+    """True when WhatsApp ``groups`` sender rules gate every group sender: an entry-less group is denied there and
+    the ``"*"`` default (if any) is not itself a wildcard. Only WhatsApp intake denies unmatched senders, so other
+    platforms (e.g. WeCom, which admits a group with no or an empty entry) never qualify. A ``"*"`` list on one
+    exact group is a deliberate per-group exception and does not open the others."""
+    if platform != Platform.WHATSAPP:
+        return False
     groups = extra.get("groups")
     if not isinstance(groups, dict) or not any(isinstance(v, dict) for v in groups.values()):
         return False
     default = groups.get("*")
     if not isinstance(default, dict):
-        return True  # groups without an entry are denied
-    allow = default.get("allow_from", default.get("allowFrom"))
-    entries = [str(x).strip() for x in (allow if isinstance(allow, (list, tuple, set)) else str(allow or "").split(","))]
-    return bool(entries) and all(entries) and "*" not in entries
+        return True
+    from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin  # same parsing as intake
+    entries = WhatsAppBehaviorMixin._coerce_allow_list(default.get("allow_from", default.get("allowFrom")))
+    return bool(entries) and "*" not in entries
 
 
 def _own_policy_open_startup_violation(config) -> Optional[str]:
@@ -46,7 +51,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         ).strip().lower()
         # An open group policy gated by per-group sender rules (``groups.<id|*>.allow_from``) is not an
         # open door: every unmatched sender is denied at intake and again by the runner.
-        group_open = group_policy == "open" and not _group_sender_rules_gate_all(extra)
+        group_open = group_policy == "open" and not _group_sender_rules_gate_all(platform, extra)
         if dm_policy != "open" and not group_open:
             continue
         gateway_allow_all = _getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
