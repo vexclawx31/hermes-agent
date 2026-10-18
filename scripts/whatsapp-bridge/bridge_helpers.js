@@ -229,6 +229,9 @@ export function createDeliveryStatusStore(limit = 512) {
       statuses.set(id, { status: 1, updatedAt: Date.now() });
       while (statuses.size > limit) statuses.delete(statuses.keys().next().value);
     },
+    has(id) {
+      return Boolean(id) && statuses.has(id);
+    },
     update(id, status) {
       if (!id || !Number.isInteger(status)) return false;
       if (!statuses.has(id)) this.track(id); // an ack can arrive before /send returns
@@ -248,21 +251,30 @@ export function createDeliveryStatusStore(limit = 512) {
 }
 
 // Delivery status from a per-participant group receipt (message-receipt.update): read beats delivered.
-export function receiptStatus(receipt) {
+// Receipts from our own account (the sending phone's ``sender`` receipt) say nothing about recipients.
+export function receiptStatus(receipt, ownIds = []) {
   if (!receipt) return null;
+  if (ownIds.length && ownIds.includes(normalizeWhatsAppId(receipt.userJid || ''))) return null;
   if (receipt.readTimestamp || receipt.playedTimestamp) return 4;
   if (receipt.receiptTimestamp) return 3;
   return null;
 }
 
 // Bounded FIFO for history-sync events: drained a slice at a time so a large sync never crowds out
-// live messages (which keep their own small queue).
+// live messages (which keep their own small queue). Overflow drops the oldest and is counted.
 export function createHistoryQueue(limit = 5000) {
   const items = [];
+  let dropped = 0;
   return {
     push(event) {
       items.push(event);
-      while (items.length > limit) items.shift();
+      while (items.length > limit) {
+        items.shift();
+        dropped += 1;
+      }
+    },
+    get dropped() {
+      return dropped;
     },
     take(n) {
       return items.splice(0, Math.max(0, n));
@@ -271,6 +283,16 @@ export function createHistoryQueue(limit = 5000) {
       return items.length;
     },
   };
+}
+
+// Group JIDs only (creator-timestamp form or numeric), as accepted by POST /history-request.
+export const GROUP_JID_RE = /^[0-9]{6,}(-[0-9]+)?@g\.us$/;
+
+// History messages worth archiving: skip poll-vote and protocol traffic (encrypted payloads, no text).
+export function isArchivableHistoryMessage(msg) {
+  const keys = Object.keys(msg?.message || {});
+  return keys.length > 0 && !keys.some((k) => k === 'pollUpdateMessage' || k === 'protocolMessage'
+    || k === 'senderKeyDistributionMessage');
 }
 
 // Joined-group directory for GET /groups: ids, subject and participant ids only (no profile data).

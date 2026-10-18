@@ -55,6 +55,8 @@ import {
   createDeliveryStatusStore,
   createHistoryQueue,
   receiptStatus,
+  GROUP_JID_RE,
+  isArchivableHistoryMessage,
   writeJsonLine,
 } from './bridge_helpers.js';
 
@@ -534,8 +536,11 @@ async function startSocket() {
   });
 
   sock.ev.on('message-receipt.update', (updates) => {
+    const ownIds = [normalizeWhatsAppId(sock.user?.id), normalizeWhatsAppId(sock.user?.lid)].filter(Boolean);
     for (const { key, receipt } of updates || []) {
-      const status = key?.fromMe && key?.id ? receiptStatus(receipt) : null;
+      // Only messages this bridge sent; never start tracking from a receipt.
+      if (!key?.fromMe || !key?.id || !deliveryStatuses.has(key.id)) continue;
+      const status = receiptStatus(receipt, ownIds);
       if (status) deliveryStatuses.update(key.id, status);
     }
   });
@@ -548,7 +553,7 @@ async function startSocket() {
     let queued = 0;
     for (const msg of messages || []) {
       const chatId = msg?.key?.remoteJid || '';
-      if (!msg?.message || !chatId.endsWith('@g.us')) continue;
+      if (!msg?.message || !chatId.endsWith('@g.us') || !isArchivableHistoryMessage(msg)) continue;
       const senderId = msg.key.fromMe ? (botIds[0] || '') : (msg.key.participant || '');
       const senderAltId = normalizeWhatsAppId(msg.key.participantAlt || '');
       const resolvedSenderId = senderAltId.endsWith('@s.whatsapp.net') ? senderAltId : senderId;
@@ -886,8 +891,12 @@ app.use((req, res, next) => {
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
-  res.json(msgs.concat(historyQueue.take(HISTORY_BATCH)));
+  // History only for adapters that opt in (they archive it and never answer it); older adapters only
+  // filter live 'append' replays and could answer a history message that mentions the bot.
+  res.json(req.query.history === '1' ? msgs.concat(historyQueue.take(HISTORY_BATCH)) : msgs);
 });
+
+const historyRequestsInFlight = new Set();
 
 // Ask the phone for older messages of one group before a known message (WhatsApp on-demand history
 // sync). Results arrive asynchronously through messaging-history.set and are archived, never answered.
@@ -897,10 +906,15 @@ app.post('/history-request', async (req, res) => {
   }
   const { chatId, messageId, fromMe, timestampMs, count } = req.body || {};
   const n = Number.isInteger(count) ? Math.min(Math.max(count, 1), 50) : 50;
-  if (typeof chatId !== 'string' || !chatId.endsWith('@g.us') || typeof messageId !== 'string' || !messageId
-      || !Number.isFinite(timestampMs)) {
-    return res.status(400).json({ error: 'chatId (group), messageId and timestampMs are required' });
+  if (typeof chatId !== 'string' || !GROUP_JID_RE.test(chatId) || typeof messageId !== 'string' || !messageId
+      || messageId.length > 128 || !Number.isFinite(timestampMs) || timestampMs < 1e12) {
+    return res.status(400).json({ error: 'group chatId, messageId (<=128) and timestampMs (milliseconds) are required' });
   }
+  if (historyRequestsInFlight.has(chatId)) {
+    return res.status(429).json({ error: 'A history request for this group is already in flight' });
+  }
+  historyRequestsInFlight.add(chatId);
+  setTimeout(() => historyRequestsInFlight.delete(chatId), 15000);
   try {
     const requestId = await sock.fetchMessageHistory(n, { remoteJid: chatId, id: messageId, fromMe: !!fromMe }, timestampMs);
     return res.json({ success: true, requestId, count: n });
@@ -1228,6 +1242,7 @@ app.get('/health', (req, res) => {
     session: path.resolve(SESSION_DIR),
     capabilities: { outboundMentions: true, groupDirectory: true, deliveryStatus: true, historyRequest: true },
     historyQueueLength: historyQueue.size,
+    historyDropped: historyQueue.dropped,
   });
 });
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createDeliveryStatusStore, createHistoryQueue, receiptStatus, summarizeGroups } from './bridge_helpers.js';
+import { GROUP_JID_RE, createDeliveryStatusStore, createHistoryQueue, isArchivableHistoryMessage, receiptStatus, summarizeGroups } from './bridge_helpers.js';
 
 test('summarizeGroups keeps ids, subject and participant ids only, sorted', () => {
   const groups = summarizeGroups({
@@ -43,6 +43,25 @@ test('group receipts map to delivered/read and ignore empty receipts', () => {
   assert.equal(receiptStatus({ playedTimestamp: 7 }), 4);
   assert.equal(receiptStatus({}), null);
   assert.equal(receiptStatus(null), null);
+  // Our own phone's sender receipt is not a recipient read.
+  assert.equal(receiptStatus({ userJid: '111:3@s.whatsapp.net', readTimestamp: 1 }, ['111@s.whatsapp.net']), null);
+  assert.equal(receiptStatus({ userJid: '222@s.whatsapp.net', readTimestamp: 1 }, ['111@s.whatsapp.net']), 4);
+});
+
+test('delivery store exposes has() so receipts never create entries', () => {
+  const store = createDeliveryStatusStore(4);
+  assert.equal(store.has('x'), false);
+  store.track('x');
+  assert.equal(store.has('x'), true);
+});
+
+test('history filters and group JID validation', () => {
+  assert.equal(isArchivableHistoryMessage({ message: { conversation: 'hi' } }), true);
+  assert.equal(isArchivableHistoryMessage({ message: { pollUpdateMessage: {} } }), false);
+  assert.equal(isArchivableHistoryMessage({ message: { protocolMessage: {} } }), false);
+  assert.equal(isArchivableHistoryMessage({}), false);
+  assert.equal(GROUP_JID_RE.test('120363000000000001@g.us'), true);
+  assert.equal(GROUP_JID_RE.test('x@g.us'), false);
 });
 
 test('history queue is bounded and drained in slices', () => {
@@ -52,4 +71,5 @@ test('history queue is bounded and drained in slices', () => {
   assert.deepEqual(q.take(2), [3, 4]);
   assert.deepEqual(q.take(10), [5]);
   assert.deepEqual(q.take(1), []);
+  assert.equal(q.dropped, 2);
 });

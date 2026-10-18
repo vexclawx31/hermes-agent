@@ -239,7 +239,7 @@ pending), may see a message twice after a reconnect and in any order, so dedupe 
 group messages are not forwarded. The bridge also exposes `GET /groups` (joined groups with participant IDs) and
 `GET /message-status/<id>` (delivery status of a message it sent, updated from server acks and per-participant group receipts: `delivery_ack`, `read`).
 
-Group history that WhatsApp syncs to the linked device (initial bootstrap, recent, or on demand) is forwarded with `upsertType: history`: observers archive it and the adapter never answers it. `POST /history-request` with `{chatId, messageId, timestampMs, fromMe, count}` asks the phone for up to 50 messages of one group older than a known message; results arrive asynchronously through the same path. The phone must be online.
+Group history that WhatsApp syncs to the linked device (initial bootstrap, recent, or on demand) is queued by the bridge (bounded at 5000, overflow counted in `/health` `historyDropped`) and forwarded only to adapters that request `/messages?history=1`, tagged `upsertType: history`: one background archiver feeds it to observers in order, and the adapter never answers it. Poll votes and protocol messages are not archived. `POST /history-request` with `{chatId, messageId, timestampMs, fromMe, count}` asks the phone for up to 50 messages of one group older than a known message; results arrive asynchronously through the same path. The phone must be online.
 
 Then start the gateway:
 
