@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createDeliveryStatusStore, summarizeGroups } from './bridge_helpers.js';
+import { createDeliveryStatusStore, createHistoryQueue, receiptStatus, summarizeGroups } from './bridge_helpers.js';
 
 test('summarizeGroups keeps ids, subject and participant ids only, sorted', () => {
   const groups = summarizeGroups({
@@ -35,4 +35,21 @@ test('delivery status store tracks only sent ids and never regresses', () => {
   assert.equal(store.get('m1'), null);
   assert.equal(store.get('early'), null);
   assert.equal(store.get('m3').status, 'pending');
+});
+
+test('group receipts map to delivered/read and ignore empty receipts', () => {
+  assert.equal(receiptStatus({ receiptTimestamp: 5 }), 3);
+  assert.equal(receiptStatus({ receiptTimestamp: 5, readTimestamp: 6 }), 4);
+  assert.equal(receiptStatus({ playedTimestamp: 7 }), 4);
+  assert.equal(receiptStatus({}), null);
+  assert.equal(receiptStatus(null), null);
+});
+
+test('history queue is bounded and drained in slices', () => {
+  const q = createHistoryQueue(3);
+  for (const i of [1, 2, 3, 4, 5]) q.push(i);
+  assert.equal(q.size, 3);
+  assert.deepEqual(q.take(2), [3, 4]);
+  assert.deepEqual(q.take(10), [5]);
+  assert.deepEqual(q.take(1), []);
 });

@@ -1041,6 +1041,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         if not self._transport_observers_subscribed():
             return
+        if data.get("upsertType") == "history":
+            # History arrives in large slices: archive inline (bounded by the hook timeout) rather than through
+            # the capped live-event backlog, so no history event is dropped.
+            await self._run_transport_observers(copy.deepcopy(data))
+            return
         pending = self.__dict__.setdefault("_observer_tasks", set())
         if len(pending) >= _MAX_PENDING_OBSERVER_EVENTS:
             logger.warning("[%s] whatsapp_transport_event backlog full; event not observed", self.name)

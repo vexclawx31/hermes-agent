@@ -324,6 +324,8 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         # Broadcast pseudo-chats are filtered even in self-chat mode (fromMe events).
         if self._is_broadcast_chat(chat_id):
             return False
+        if data.get("upsertType") == "history":
+            return False  # history sync: archive-only, never a conversation turn
         if not data.get("isGroup", False):
             # DMs that pass the policy gate are always processed
             return self._is_dm_intake_allowed(str(data.get("senderId") or data.get("from") or ""))

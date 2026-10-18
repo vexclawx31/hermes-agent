@@ -420,3 +420,18 @@ def test_open_group_guard_never_exempts_other_platforms(monkeypatch):
     extra = {"dm_policy": "allowlist", "group_policy": "open", "groups": {"g1": {"allow_from": ["u1"]}}}
     cfg = SimpleNamespace(platforms={Platform.WECOM: PlatformConfig(enabled=True, extra=extra)})
     assert _own_policy_open_startup_violation(cfg) is not None
+
+
+def test_history_events_are_archived_inline_and_never_answered(monkeypatch):
+    seen = _hook_capture(monkeypatch)
+    adapter = _make_adapter()
+    events = [_native(upsertType="history", messageId=f"H{i}", fromMe=(i % 2 == 0)) for i in range(300)]
+
+    async def run():
+        for e in events:
+            assert await adapter._build_message_event(e) is None
+        return adapter.__dict__.get("_observer_tasks", set())
+
+    pending = asyncio.run(run())
+    assert len(seen) == 300 and not pending  # none dropped by the live backlog cap
+    assert all(adapter._should_process_message(e) is False for e in events)

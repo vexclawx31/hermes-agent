@@ -247,6 +247,32 @@ export function createDeliveryStatusStore(limit = 512) {
   };
 }
 
+// Delivery status from a per-participant group receipt (message-receipt.update): read beats delivered.
+export function receiptStatus(receipt) {
+  if (!receipt) return null;
+  if (receipt.readTimestamp || receipt.playedTimestamp) return 4;
+  if (receipt.receiptTimestamp) return 3;
+  return null;
+}
+
+// Bounded FIFO for history-sync events: drained a slice at a time so a large sync never crowds out
+// live messages (which keep their own small queue).
+export function createHistoryQueue(limit = 5000) {
+  const items = [];
+  return {
+    push(event) {
+      items.push(event);
+      while (items.length > limit) items.shift();
+    },
+    take(n) {
+      return items.splice(0, Math.max(0, n));
+    },
+    get size() {
+      return items.length;
+    },
+  };
+}
+
 // Joined-group directory for GET /groups: ids, subject and participant ids only (no profile data).
 export function summarizeGroups(groupsById) {
   return Object.values(groupsById || {})
