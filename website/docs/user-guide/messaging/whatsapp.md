@@ -193,6 +193,52 @@ needs the participant paired or `WHATSAPP_ALLOW_ALL_USERS=true`. By default the 
 message; set `require_mention: true` / `WHATSAPP_REQUIRE_MENTION=true` to answer only @mentions, replies to the
 bot, or `/commands` (groups in `free_response_chats` are exempt).
 
+#### Per-group senders, native mentions and guest tools
+
+These keys live under `platforms.whatsapp.extra` (they are not bridged to env vars):
+
+```yaml
+platforms:
+  whatsapp:
+    enabled: true
+    extra:
+      group_policy: open             # the bridge forwards every joined group; senders are gated below
+      require_native_mention: true   # groups: only a real @mention (mentionedJid metadata) wakes the bot
+      owners: ["15550000001"]        # owner callers keep the platform toolsets
+      groups:
+        "*": {allow_from: ["15550000001"]}          # any group: owner only
+        "120363001234567890@g.us": {allow_from: ["*"]}  # this group: any participant
+      guest_toolsets: [web, vision]  # exact toolsets for every non-owner caller
+```
+
+- `groups.<group JID | "*">.allow_from` restricts **senders** per group on top of `group_policy` (exact
+  key, then case-insensitive key, then `"*"`). With any `groups` entry configured, a group with no matching
+  entry, an empty list or a missing sender is denied, and the gateway re-checks the sender against these rules
+  instead of `WHATSAPP_ALLOWED_USERS`. DMs still use `dm_policy` / `allow_from`.
+- `require_native_mention: true` admits a group message only when the bot's own ID is in the message's
+  native mention metadata. Typed numbers, `mention_patterns`, `/commands`, replies to the bot and
+  `free_response_chats` do not wake the bot in groups. WhatsApp clients set this metadata, so it is the best
+  available signal, not cryptographic proof.
+- `owners` (a `"*"` owner never counts) separates owner callers from guests:
+  - `guest_toolsets` replaces the platform toolsets for guests. The list is exact: only the named concrete
+    toolsets — no composites, default-on plugin toolsets or MCP servers. With `owners` set and no
+    `guest_toolsets`, guests get no tools; if the WhatsApp adapter cannot be resolved, nobody gets tools.
+  - Guest turns run without profile memory (MEMORY.md / USER.md) and without the external memory provider
+    (no recall, no retain), unless `memory` is in `guest_toolsets`.
+  - Owners administer slash commands in DMs and groups unless `allow_admin_from` / `group_allow_admin_from`
+    is set; guests keep `help`, `whoami` and `group_user_allowed_commands`. Matching covers phone/LID forms.
+  - Group sessions and text batches stay per participant. With `group_sessions_per_user: false`, guests are
+    denied rather than sharing the owner's transcript.
+- Poll answers to the bot's own polls (clarify-as-poll) pass the native-mention rule; sender rules still apply.
+- Messages the bridge receives as history/offline replay (`upsertType: append`) are never answered.
+
+Plugins that archive group traffic can register the observer-only `whatsapp_transport_event` hook: it fires
+for every group message the bridge forwards, **before** sender and mention gating, with a deep copy of the
+bridge payload. Callbacks run off the intake loop (bounded by `plugins.hook_callback_timeout`, at most 256
+pending), may see a message twice after a reconnect and in any order, so dedupe by `messageId`. The bot's own
+group messages are not forwarded. The bridge also exposes `GET /groups` (joined groups with participant IDs) and
+`GET /message-status/<id>` (delivery status of a message it sent; in groups usually `server_ack`).
+
 Then start the gateway:
 
 ```bash

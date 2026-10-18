@@ -448,6 +448,17 @@ class GatewayAuthorizationMixin:
             return bool(sender_allow.strip())
         return isinstance(sender_allow, (list, tuple, set)) and any(str(item).strip() for item in sender_allow)
 
+    def _adapter_group_sender_verdict(self, source, user_id, adapter_profile) -> Optional[bool]:
+        """Live adapter verdict for a group sender when it declares ``group_sender_rules_active``; None otherwise."""
+        adapter = self._authorization_adapter(source.platform, profile=adapter_profile)
+        if adapter is None or getattr(adapter, "group_sender_rules_active", False) is not True:
+            return None
+        try:
+            return bool(adapter._is_group_allowed(str(source.chat_id or ""), str(user_id or "")))
+        except Exception:  # health: allow BLE001 -- sender-rule check failing must deny, never fall through to broader grants
+            logger.warning("group sender rule check failed; denying", exc_info=True)
+            return False
+
     def _pairing_store_for(self, source: SessionSource):
         """Per-profile PairingStore for a source, else the global ``self.pairing_store``."""
         per_profile = getattr(self, "pairing_stores", None) or {}
@@ -636,6 +647,12 @@ class GatewayAuthorizationMixin:
         adapter_profile = self._adapter_profile_for_source(source)
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
+        # Per-group sender rules (WhatsApp ``groups.<id>.allow_from``) are authoritative for group turns:
+        # re-check this sender on the live adapter before allow-all, chat-scoped and env allowlist grants.
+        if is_group and allow_adapter_delegation:
+            sender_rules = self._adapter_group_sender_verdict(source, source.user_id, adapter_profile)
+            if sender_rules is not None:
+                return sender_rules
         if self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation):
             return True
         user_id = source.user_id

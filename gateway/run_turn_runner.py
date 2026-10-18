@@ -1131,7 +1131,7 @@ class TurnRunner:
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
             fallback_model=self._runner._refresh_fallback_model(),
-            skip_context_files=skip_context_files,
+            skip_context_files=skip_context_files, skip_memory=runner._source_skips_memory(src),
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=True,
         )

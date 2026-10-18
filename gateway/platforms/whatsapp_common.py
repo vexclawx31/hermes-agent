@@ -6,7 +6,8 @@ to-bot detection, broadcast filtering, WhatsApp markdown conversion, chunk budge
 Mixin contract — the host adapter sets these on ``self`` before calling any mixin
 method: ``config`` (PlatformConfig), ``name``, ``_dm_policy`` / ``_group_policy``
 ("open" | "allowlist" | "disabled" | "pairing"), ``_allow_from`` / ``_group_allow_from`` (set[str]),
-``_mention_patterns`` (list[re.Pattern]), ``_reply_prefix`` (Optional[str]).
+``_mention_patterns`` (list[re.Pattern]), ``_reply_prefix`` (Optional[str]). Optional:
+``_groups`` (``groups.<chat_id|*>.allow_from`` per-group sender lists) and ``_owners`` (set[str]).
 """
 
 from __future__ import annotations
@@ -244,6 +245,80 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
                 cleaned = re.sub(rf"@{re.escape(bare_id)}\b[,:\-]*\s*", "", cleaned)
         return cleaned.strip() or text
 
+    def _whatsapp_require_native_mention(self) -> bool:
+        """``extra.require_native_mention``: a group turn needs the bot in the message's native
+        ``mentionedJid`` metadata. Replies, ``/`` commands, regex patterns, typed numbers and
+        free-response chats no longer wake the bot in groups."""
+        configured = self.config.extra.get("require_native_mention", False)
+        if isinstance(configured, str):
+            return configured.strip().lower() in _TRUTHY
+        return configured is True
+
+    def _message_natively_mentions_bot(self, data: dict[str, Any]) -> bool:
+        bot_ids = self._bot_ids_from_message(data)
+        mentioned = {nid for c in (data.get("mentionedIds") or []) if (nid := self._normalize_whatsapp_id(c))}
+        return bool(bot_ids and mentioned & bot_ids)
+
+    def _resolve_group_cfg(self, chat_id: str) -> dict[str, Any]:
+        """``groups`` entry for a chat: exact key, then case-insensitive key, then ``"*"``."""
+        groups = getattr(self, "_groups", None)
+        if not isinstance(groups, dict):
+            return {}
+        lowered = chat_id.lower()
+        candidates = (groups.get(chat_id), next((v for k, v in groups.items() if isinstance(k, str) and k.lower() == lowered and isinstance(v, dict)), None), groups.get("*"))
+        return next((c for c in candidates if isinstance(c, dict)), {})
+
+    @property
+    def group_sender_rules_active(self) -> bool:
+        """True when ``groups`` restricts group senders, so the runner re-checks each sender here."""
+        groups = getattr(self, "_groups", None)
+        return isinstance(groups, dict) and any(isinstance(v, dict) for v in groups.values())
+
+    def _is_group_allowed(self, chat_id: str, sender_id: str = "") -> bool:
+        """Chat-level ``group_policy`` plus per-group ``groups.<id>.allow_from`` sender lists. With sender
+        rules configured, a chat with no matching entry (and no ``"*"``) or an empty list is denied."""
+        if not super()._is_group_allowed(chat_id):
+            return False
+        if not self.group_sender_rules_active:
+            return True
+        group_cfg = self._resolve_group_cfg(chat_id)
+        sender_allow = self._coerce_allow_list(group_cfg.get("allow_from", group_cfg.get("allowFrom")))
+        principal = str(sender_id or "").strip()
+        return bool(principal and sender_allow and self._matches_whatsapp_allowlist(principal, sender_allow))
+
+    def _is_whatsapp_owner(self, user_id: Optional[str]) -> bool:
+        """Whether ``user_id`` is one of ``extra.owners`` (phone/LID aliases match)."""
+        owners = getattr(self, "_owners", None) or set()
+        principal = str(user_id or "").strip()
+        return bool(principal and owners and "*" not in owners and self._matches_whatsapp_allowlist(principal, owners))
+
+    # Guest overrides are exact: the runner keeps only the listed concrete toolsets (no composites,
+    # default-on plugin toolsets or MCP servers).
+    toolsets_for_source_exact = True
+
+    def toolsets_for_source(self, source) -> Optional[list[str]]:
+        """``extra.guest_toolsets`` for any caller that is not an owner; owners keep the platform toolsets."""
+        guest = self.config.extra.get("guest_toolsets")
+        if guest is None and not getattr(self, "_owners", None):
+            return None
+        if self._is_whatsapp_owner(getattr(source, "user_id", None)):
+            return None
+        # With owners configured, a missing/blank guest list means no tools, never the platform set.
+        return [str(t) for t in self._coerce_allow_list(guest)]
+
+    def _text_batch_key(self, event) -> str:
+        """Never merge one participant's burst into another's when owners/guests get different tools."""
+        key = super()._text_batch_key(event)
+        source = getattr(event, "source", None)
+        if getattr(self, "_owners", None) and getattr(source, "chat_type", "") == "group":
+            return f"{key}:{getattr(source, 'user_id', '') or ''}"
+        return key
+
+    def _guest_isolation_broken(self) -> bool:
+        """Owner/guest separation needs per-participant group sessions; a shared one would load the
+        owner's transcript (and its tool results) into a guest turn."""
+        return bool(getattr(self, "_owners", None)) and self.config.extra.get("group_sessions_per_user", True) is False
+
     def _should_process_message(self, data: dict[str, Any]) -> bool:
         chat_id = str(data.get("chatId") or "")
         # Broadcast pseudo-chats are filtered even in self-chat mode (fromMe events).
@@ -252,8 +327,16 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         if not data.get("isGroup", False):
             # DMs that pass the policy gate are always processed
             return self._is_dm_intake_allowed(str(data.get("senderId") or data.get("from") or ""))
-        if not self._is_group_allowed(chat_id):
+        sender = str(data.get("senderId") or "")
+        if not self._is_group_allowed(chat_id, sender):
             return False
+        if self._guest_isolation_broken() and not self._is_whatsapp_owner(sender):
+            return False
+        if data.get("upsertType") == "append":
+            return False  # history/offline replay: archive-only, never a late conversation turn
+        if self._whatsapp_require_native_mention():
+            # The bridge emits poll votes only for polls it sent itself (clarify-as-poll answers).
+            return data.get("nativeType") == "pollUpdateMessage" or self._message_natively_mentions_bot(data)
         # Group messages: check mention / free-response settings
         if chat_id in self._whatsapp_free_response_chats() or not self._whatsapp_require_mention():
             return True

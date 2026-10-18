@@ -1,0 +1,58 @@
+"""Per-source toolset resolution for gateway agent runs (split from ``gateway/run_turn.py``)."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_enabled_toolsets_for_source(
+    delivery_adapter_for: Callable[[Any], Any], user_config: dict, source: Any, platform_key: str,
+) -> list:
+    """Enabled toolsets for an agent run, honoring an adapter ``toolsets_for_source()`` override
+    validated through the SAME ``_get_platform_tools`` path (unknown / platform-restricted
+    toolsets dropped, not trusted).
+
+    An adapter with ``toolsets_for_source_exact = True`` (WhatsApp guest callers) gets exactly the listed
+    concrete toolsets — never default-on plugin toolsets or MCP servers — and no tools at all if the
+    override itself fails."""
+    from hermes_cli.tools_config import _get_platform_tools
+    adapter = None
+    try:
+        adapter = delivery_adapter_for(source)
+        override = adapter.toolsets_for_source(source) if adapter is not None else None
+    except Exception:  # health: allow BLE001 -- adapter override is plugin code; any failure falls back (or fails closed below)
+        logger.debug("toolsets_for_source override failed", exc_info=True)
+        override = None
+        if getattr(adapter, "toolsets_for_source_exact", False) is True:
+            return []
+    if adapter is None and platform_key == "whatsapp":
+        # Sender-aware tool selection needs the live adapter; without it fail closed.
+        return []
+    if getattr(adapter, "toolsets_for_source_exact", False) is True and isinstance(override, list):
+        names = [str(x) for x in override]
+        pts = dict(user_config.get("platform_toolsets") or {})
+        pts[platform_key] = [*names, "no_mcp"]
+        resolved = _get_platform_tools({**user_config, "platform_toolsets": pts}, platform_key)
+        return sorted(resolved & set(names))
+    if override and isinstance(override, list):
+        pts = dict(user_config.get("platform_toolsets") or {})
+        pts[platform_key] = [str(x) for x in override]
+        user_config = {**user_config, "platform_toolsets": pts}
+    return sorted(_get_platform_tools(user_config, platform_key))
+
+
+def source_skips_memory(delivery_adapter_for: Callable[[Any], Any], source: Any) -> bool:
+    """True for an exact-override guest caller: no MEMORY.md/USER.md and no external memory provider
+    (recall or retain) unless ``memory`` is one of the guest toolsets."""
+    try:
+        adapter = delivery_adapter_for(source)
+        if getattr(adapter, "toolsets_for_source_exact", False) is not True:
+            return False
+        override = adapter.toolsets_for_source(source)
+    except Exception:  # health: allow BLE001 -- adapter override is plugin code; undecidable means skip memory
+        logger.debug("toolsets_for_source failed while resolving memory", exc_info=True)
+        return True
+    return isinstance(override, list) and "memory" not in override
