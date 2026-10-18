@@ -2216,37 +2216,7 @@ def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
 _EXECUTOR_QUIESCE_TIMEOUT = 2.0
 
 
-_OWN_POLICY_OPEN_ENV = {
-    Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
-    Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
-    Platform.YUANBAO: ("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY", "YUANBAO_ALLOW_ALL_USERS"),
-    Platform.QQBOT: (None, None, "QQ_ALLOW_ALL_USERS"),
-    Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS")}
-
-
-def _own_policy_open_startup_violation(config) -> Optional[str]:
-    """Return a startup-abort reason when open policy lacks allow-all opt-in."""
-    for platform, platform_config in getattr(config, "platforms", {}).items():
-        if not getattr(platform_config, "enabled", False):
-            continue
-        open_env = _OWN_POLICY_OPEN_ENV.get(platform)
-        if not open_env:
-            continue
-        dm_env, group_env, allow_all_env = open_env
-        extra = getattr(platform_config, "extra", None) or {}
-        dm_policy = str(extra.get("dm_policy")
-                        or (_getenv(dm_env, "pairing") if dm_env else "pairing")).strip().lower()
-        group_policy = str(
-            extra.get("group_policy") or (_getenv(group_env, "pairing") if group_env else "pairing")
-        ).strip().lower()
-        if dm_policy != "open" and group_policy != "open":
-            continue
-        gateway_allow_all = _getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
-        if gateway_allow_all or (
-                allow_all_env and _getenv(allow_all_env, "").lower() in {"true", "1", "yes"}):
-            continue
-        return f"{platform.value}: open policy without allow-all opt-in"
-    return None
+from gateway.run_open_policy import _OWN_POLICY_OPEN_ENV, _own_policy_open_startup_violation
 
 
 # Placed into _running_agents *before* any await so a second message can't slip past the "already
