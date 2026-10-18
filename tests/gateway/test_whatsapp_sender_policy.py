@@ -420,3 +420,45 @@ def test_open_group_guard_never_exempts_other_platforms(monkeypatch):
     extra = {"dm_policy": "allowlist", "group_policy": "open", "groups": {"g1": {"allow_from": ["u1"]}}}
     cfg = SimpleNamespace(platforms={Platform.WECOM: PlatformConfig(enabled=True, extra=extra)})
     assert _own_policy_open_startup_violation(cfg) is not None
+
+
+def test_history_events_are_archived_in_order_by_a_background_worker_and_never_answered(monkeypatch):
+    seen = _hook_capture(monkeypatch)
+    adapter = _make_adapter()
+    events = [_native(upsertType="history", messageId=f"H{i}", fromMe=(i % 2 == 0)) for i in range(300)]
+
+    async def run():
+        for e in events:
+            assert await adapter._build_message_event(e) is None
+        assert adapter._messages_path() == "messages?history=1"
+        await adapter._history_queue().join()
+        return adapter.__dict__.get("_observer_tasks", set())
+
+    pending = asyncio.run(run())
+    assert len(seen) == 300 and not pending
+    assert [kw["raw_message"]["messageId"] for _, kw in seen] == [f"H{i}" for i in range(300)]  # order kept
+    assert all(adapter._should_process_message(e) is False for e in events)
+
+
+def test_history_opt_in_backs_off_when_archiver_is_full(monkeypatch):
+    import plugins.platforms.whatsapp.adapter as wa
+
+    _hook_capture(monkeypatch)
+    adapter = _make_adapter()
+    monkeypatch.setattr(wa, "_MAX_PENDING_HISTORY_EVENTS", 2)
+
+    async def run():
+        queue = asyncio.Queue()
+        adapter.__dict__["_history_events"] = queue
+        for i in range(3):
+            queue.put_nowait({"messageId": i})
+        return adapter._messages_path()
+
+    assert asyncio.run(run()) == "messages"
+
+
+def test_no_history_opt_in_without_an_observer(monkeypatch):
+    from hermes_cli import lifecycle
+
+    monkeypatch.setattr(lifecycle, "has_hook", lambda name: False)
+    assert _make_adapter()._messages_path() == "messages"

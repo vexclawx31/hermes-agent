@@ -31,6 +31,7 @@ def _wenv(name: str, default: str = "") -> str:
 logger = logging.getLogger(__name__)
 
 _MAX_PENDING_OBSERVER_EVENTS = 256
+_MAX_PENDING_HISTORY_EVENTS = 1000  # bridge sends at most 200 per poll, so the archiver backlog stays < 1200
 # Owner-typed inbound text is prefixed at MessageEvent construction so transcripts stay disambiguated before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
@@ -915,7 +916,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if not self._http_session or await self._report_bridge_exit():
                 break
             try:
-                async with self._bridge_req("get", "messages", 30) as resp:
+                async with self._bridge_req("get", self._messages_path(), 30) as resp:
                     if resp.status == 200:
                         for msg_data in await resp.json():
                             event = await self._build_message_event(msg_data)
@@ -1041,6 +1042,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         if not self._transport_observers_subscribed():
             return
+        if data.get("upsertType") == "history":
+            self._history_queue().put_nowait(copy.deepcopy(data))  # bounded by _messages_path's opt-in
+            return
         pending = self.__dict__.setdefault("_observer_tasks", set())
         if len(pending) >= _MAX_PENDING_OBSERVER_EVENTS:
             logger.warning("[%s] whatsapp_transport_event backlog full; event not observed", self.name)
@@ -1050,6 +1054,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         task = asyncio.create_task(self._run_transport_observers(copy.deepcopy(data)))
         pending.add(task)
         task.add_done_callback(pending.discard)
+
+    def _history_queue(self) -> asyncio.Queue:
+        """History events for one ordered background archiver, so a large sync never stalls live polling."""
+        queue = self.__dict__.get("_history_events")
+        if queue is None:
+            queue = self.__dict__["_history_events"] = asyncio.Queue()
+            self.__dict__["_history_worker"] = asyncio.create_task(self._archive_history())
+        return queue
+
+    async def _archive_history(self) -> None:
+        queue = self._history_queue()
+        while True:
+            raw = await queue.get()
+            try:
+                await self._run_transport_observers(raw)
+            finally:
+                queue.task_done()
+
+    def _messages_path(self) -> str:
+        """Opt in to bridge history only while the archiver has room; otherwise the bridge keeps it queued."""
+        if not self._transport_observers_subscribed():
+            return "messages"
+        queue = self.__dict__.get("_history_events")
+        return "messages?history=1" if queue is None or queue.qsize() < _MAX_PENDING_HISTORY_EVENTS else "messages"
 
     async def _run_transport_observers(self, raw: dict[str, Any]) -> None:
         try:
