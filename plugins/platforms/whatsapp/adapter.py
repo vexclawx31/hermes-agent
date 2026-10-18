@@ -2,6 +2,7 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
+import copy
 import logging
 import mimetypes
 import os
@@ -380,6 +381,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         _, raw_groups = self._select_allowlist(
             extra, ("group_allow_from", "groupAllowFrom"), ("WHATSAPP_GROUP_ALLOW_FROM", "WHATSAPP_GROUP_ALLOWED_USERS"), _wenv)
         self._group_allow_from = self._coerce_allow_list(raw_groups)
+        self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
+        self._owners = self._coerce_allow_list(extra.get("owners"))
         rr = extra.get("send_read_receipts", False)
         self._send_read_receipts = rr if isinstance(rr, bool) else str(rr or "").strip().lower() in {"1", "true", "yes", "on"}
         self._mention_patterns = self._compile_mention_patterns()
@@ -1022,9 +1025,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] Attached quoted-reply media: {path}", flush=True)
         return accepted
 
+    @staticmethod
+    def _transport_observers_subscribed() -> bool:
+        try:
+            from hermes_cli.lifecycle import has_hook
+            return has_hook("whatsapp_transport_event")
+        except Exception:  # health: allow BLE001 -- observer discovery must never block intake
+            logger.debug("whatsapp_transport_event discovery failed", exc_info=True)
+            return False
+
+    async def _fire_transport_observers(self, data: dict[str, Any]) -> None:
+        """``whatsapp_transport_event`` for a group message before any gating; observer errors never escape."""
+        if data.get("isGroup") is not True or self._is_broadcast_chat(str(data.get("chatId") or "")):
+            return
+        if not self._transport_observers_subscribed():
+            return
+        try:
+            from hermes_cli.plugins import ainvoke_hook
+            await ainvoke_hook("whatsapp_transport_event", raw_message=copy.deepcopy(data), platform="whatsapp")
+        except Exception:  # health: allow BLE001 -- observer-only hook: errors never escape into intake
+            logger.debug("[%s] whatsapp_transport_event dispatch error", self.name, exc_info=True)
+
     async def _build_message_event(self, data: dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
+            await self._fire_transport_observers(data)
             if not self._should_process_message(data):
                 return None
             msg_type = self._classify_bridge_message(data)

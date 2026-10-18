@@ -217,6 +217,52 @@ export function pollUpdateForAggregation({
   return null;
 }
 
+// Highest delivery status seen per sent message id (Baileys proto WebMessageInfo.Status:
+// 1 pending, 2 server ack, 3 delivered, 4 read, 5 played). Bounded FIFO like outbound_ids.js.
+export const DELIVERY_STATUS_NAMES = { 0: 'error', 1: 'pending', 2: 'server_ack', 3: 'delivery_ack', 4: 'read', 5: 'played' };
+
+export function createDeliveryStatusStore(limit = 512) {
+  const statuses = new Map();
+  return {
+    track(id) {
+      if (!id || statuses.has(id)) return;
+      statuses.set(id, { status: 1, updatedAt: Date.now() });
+      while (statuses.size > limit) statuses.delete(statuses.keys().next().value);
+    },
+    update(id, status) {
+      const current = statuses.get(id);
+      if (!current || !Number.isInteger(status)) return false;
+      if (status === 0 || status > current.status) statuses.set(id, { status, updatedAt: Date.now() });
+      return true;
+    },
+    get(id) {
+      const current = statuses.get(id);
+      if (!current) return null;
+      return { messageId: id, status: DELIVERY_STATUS_NAMES[current.status] || String(current.status), updatedAt: current.updatedAt };
+    },
+  };
+}
+
+// Joined-group directory for GET /groups: ids, subject and participant ids only (no profile data).
+export function summarizeGroups(groupsById) {
+  return Object.values(groupsById || {})
+    .filter((g) => g && typeof g.id === 'string' && g.id.endsWith('@g.us'))
+    .map((g) => ({
+      id: g.id,
+      subject: typeof g.subject === 'string' ? g.subject : '',
+      announce: g.announce === true,
+      participants: (Array.isArray(g.participants) ? g.participants : [])
+        .filter((p) => p && typeof p.id === 'string')
+        .map((p) => ({
+          id: p.id,
+          phoneNumber: typeof p.phoneNumber === 'string' ? p.phoneNumber : null,
+          lid: typeof p.lid === 'string' ? p.lid : null,
+          admin: p.admin === 'admin' || p.admin === 'superadmin' ? p.admin : null,
+        })),
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
 export function addMentions(payload, mentions) {
   if (payload && Array.isArray(mentions) && mentions.length > 0) {
     payload.mentions = mentions;

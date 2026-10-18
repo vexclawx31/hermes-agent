@@ -192,7 +192,7 @@ VALID_HOOKS: set[str] = {
     # "thread_renamed". Each event type carries its own event-local additive payload contract (see
     # hooks.md). Other event types and hook names land here only together with real fire-sites and payload
     # contracts; no inert VALID_HOOKS surface is registered ahead of implementation.
-    "gateway_platform_event",
+    "gateway_platform_event", "whatsapp_transport_event",  # the latter: pre-gating WhatsApp group observer (hooks.md)
     # pre_command: BEFORE a recognized slash command's handler on CLI and gateway canonical dispatch;
     # returns IGNORED in v1. Deliberately NOT fired for the gateway's running-agent intercept path
     # (/stop, /approve, busy_policy) — a slow/hostile plugin must not touch the operator's escape

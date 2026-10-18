@@ -51,6 +51,8 @@ import {
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  summarizeGroups,
+  createDeliveryStatusStore,
   writeJsonLine,
 } from './bridge_helpers.js';
 
@@ -371,8 +373,11 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
   }
 }
 
+const deliveryStatuses = createDeliveryStatusStore(512);
+
 function rememberSentId(id) {
   recentlySentIds.remember(id);
+  deliveryStatuses.track(id);
 }
 
 let sock = null;
@@ -471,6 +476,9 @@ async function startSocket() {
 
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates || []) {
+      if (key?.fromMe && key?.id && Number.isInteger(update?.status)) {
+        deliveryStatuses.update(key.id, update.status);
+      }
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
       const pollCreation = messageStore.get(pollCreationId);
@@ -1124,6 +1132,25 @@ app.get('/chat/:id', async (req, res) => {
   });
 });
 
+// Joined groups with participant ids (for archive discovery and resolving native mention targets)
+app.get('/groups', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    return res.json({ groups: summarizeGroups(await sock.groupFetchAllParticipating()) });
+  } catch (err) {
+    console.warn('[bridge] failed to list groups:', err.message);
+    return res.status(500).json({ error: 'Failed to list groups' });
+  }
+});
+
+// Delivery status of a message this bridge sent (unknown ids → 404)
+app.get('/message-status/:id', (req, res) => {
+  const status = deliveryStatuses.get(req.params.id);
+  return status ? res.json(status) : res.status(404).json({ error: 'Unknown message id' });
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
@@ -1134,7 +1161,7 @@ app.get('/health', (req, res) => {
     sendReadReceipts: SEND_READ_RECEIPTS,
     // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
     session: path.resolve(SESSION_DIR),
-    capabilities: { outboundMentions: true },
+    capabilities: { outboundMentions: true, groupDirectory: true, deliveryStatus: true },
   });
 });
 
