@@ -503,59 +503,6 @@ class TestStartRun:
         assert body.rstrip().endswith(": stream closed")
 
     @pytest.mark.asyncio
-    async def test_interim_commentary_suppressed_only_for_credential_runs(self, monkeypatch):
-        """Credential-scoped runs get no interim callback (commentary may echo run secrets);
-        an ordinary /v1/runs turn on the same adapter still streams ``message.interim``."""
-        import json
-        import hermes_cli.config
-        from gateway.runtime_context import PROTOCOL, ROUTE
-
-        key, secret = "PAPERCLIP_API_KEY", "synthetic-interim-secret-12345"
-        config = {"gateway": {"api_server": {"run_environment_allowlist": [key]}}}
-        monkeypatch.setattr(hermes_cli.config, "load_config", lambda: config)
-        monkeypatch.setattr(hermes_cli.config, "load_config_readonly", lambda: config)
-        auth = {"Authorization": "Bearer synthetic-receiver-key"}
-        adapter = _make_adapter("synthetic-receiver-key")
-        app = _create_runs_app(adapter)
-        app.router.add_post(ROUTE, adapter._handle_runs)
-        callbacks = {}
-
-        def create_agent(**kwargs):
-            agent = MagicMock()
-
-            def run_conversation(user_message=None, **_kw):
-                interim = callbacks[user_message] = kwargs["interim_assistant_callback"]
-                if interim is not None:
-                    interim(f"Commentary for {user_message}.", already_streamed=False)
-                return {"final_response": "Done."}
-
-            agent.run_conversation.side_effect = run_conversation
-            agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
-            return agent
-
-        async def run_and_collect(cli, path, body):
-            resp = await cli.post(path, headers=auth, json=body)
-            assert resp.status == 202, await resp.text()
-            run_id = (await resp.json())["run_id"]
-            text = await (await cli.get(f"/v1/runs/{run_id}/events", headers=auth)).text()
-            events = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
-            assert any(e["event"] == "run.completed" for e in events), text
-            return text, [e["text"] for e in events if e["event"] == "message.interim"]
-
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent", side_effect=create_agent):
-                scoped_text, scoped_interim = await run_and_collect(cli, ROUTE, {
-                    "input": "scoped", "environment": {key: secret},
-                    "required_environment_capability": PROTOCOL})
-                plain_text, plain_interim = await run_and_collect(cli, "/v1/runs", {"input": "plain"})
-
-        assert callbacks["scoped"] is None
-        assert scoped_interim == []
-        assert secret not in scoped_text
-        assert callable(callbacks["plain"])
-        assert plain_interim == ["Commentary for plain."]
-
-    @pytest.mark.asyncio
     async def test_start_passes_request_model_provider_options_to_create_agent(self, adapter):
         app = _create_runs_app(adapter)
         model_options = {"reasoning_effort": "medium", "service_tier": "priority"}

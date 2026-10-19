@@ -20,11 +20,9 @@ Rules:
 - **Timeout:** the sink uses the protected `timeout_seconds` (60–3600) as its subprocess bound. The model's `timeout` argument does not shorten it.
 - **Outer executor deadline:** every tool call also runs under the agent executor's own deadline: `timeouts.tools.sequential_call` for a lone call, and `timeouts.tools.concurrent_batch` for a parallel batch. The default is 420 s, and approval waits are excluded. When that deadline expires, the executor abandons the tool and reports a generic `timed out` error, while a root operation may still be running. To avoid that, the executor publishes its budget to the tool (`agent.deadline.current_tool_budget()`). A rollout is admitted only if the remaining budget covers `timeout_seconds + 120` s (`SIBLING_ROLLOUT_OUTER_MARGIN_S`). Otherwise it refuses as `blocked` before approval, with no prompt and no subprocess. An unknown budget also refuses; this covers any caller that publishes none. With the default 420 s deadlines, every rollout therefore refuses until both settings are raised (or set to `0`, meaning unbounded).
 - **On timeout:** within that guarantee, a sink timeout is reported as `outcome: unknown` (`exit_code: null`), and nothing is retried automatically. The sink stops waiting for `sudo`, but the root-side operation may continue, and its receipts are authoritative. Limits outside the tool executor, such as a whole-turn or whole-run limit owned by a caller, are not inspected. They should not be set below the rollout bound.
-- **Credential runs:** refused before admission. A run that carries scoped run credentials (for example a dispatched run with an allowlisted API key) cannot submit a rollout, and only an uncredentialed hosting session can. This stays so until an explicit authority contract supports sibling rollout under run credentials. Isolation is not relaxed implicitly.
 - **Unchanged from schema 2:**
   - the hosting-identity and exact-profile checks;
   - the protected helper file check;
-  - credential-run refusal before admission;
   - foreground only (no PTY, workdir or background);
   - approval guards and the native foreground finalizer.
 
@@ -37,7 +35,7 @@ Rules:
 
 - **Names:** must be distinct, and must not collide with any restart or rollout name or with the hosting profile. A request's set must be drawn wholly from the list; mixed, unknown and duplicate sets refuse.
 - **Distinct verbs:** a consumer request can never be read as a rollout, and the reverse is also true.
-- **Same rules as rollout:** budget gate, approval, credential-run refusal, foreground-only and finalizer.
+- **Same rules as rollout:** budget gate, approval, foreground-only and finalizer.
 - **Older policies:** schema 2, and schema 3 without the key, never admit these requests.
 
 The command text only selects the operation and target set. The helper and its root-side operator must independently verify that the hash-bound plan targets exactly this set and excludes the hosting service.

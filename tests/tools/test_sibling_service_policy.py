@@ -184,21 +184,6 @@ def test_real_finalizer_preserves_helper_exit(pipeline, monkeypatch, rc):
     pipeline.sink.return_value = SimpleNamespace(stdout='synthetic output', stderr='', returncode=rc)
     assert json.loads(t.terminal_tool(COMMAND))['exit_code'] == rc
 
-@pytest.mark.parametrize('force', [False, True])
-def test_credential_run_refused_before_admission(pipeline, admission, force):
-    from gateway.runtime_context import bind_environment, validate_environment
-    scope = validate_environment({'PAPERCLIP_API_KEY': 'synthetic-sibling-unit-12345'},
-        {'gateway': {'api_server': {'run_environment_allowlist': ['PAPERCLIP_API_KEY']}}}, 'local')
-    with bind_environment(scope):
-        result = json.loads(t.terminal_tool(COMMAND, force=force))
-        # Non-candidates keep the ordinary guarded path under the same scope.
-        assert json.loads(t.terminal_tool('printf ok'))['status'] == 'blocked'
-    assert result['status'] == 'blocked' and 'credential runs' in result['error']
-    admission.assert_not_called()
-    pipeline.approval.assert_not_called()
-    pipeline.sink.assert_not_called()
-    pipeline.generic.assert_called_once()
-
 def test_workdir_refused(pipeline):
     assert json.loads(t.terminal_tool(COMMAND, workdir='/'))['status'] == 'blocked'
     pipeline.sink.assert_not_called()
@@ -305,18 +290,6 @@ def test_rollout_denial_and_pending_never_execute(rollout, status):
 @pytest.mark.parametrize('kwargs', [{'background': True}, {'pty': True}, {'workdir': '/'}, {'_host_local': True}])
 def test_rollout_requires_plain_foreground(rollout, kwargs):
     assert json.loads(t.terminal_tool(APPLY, **kwargs))['status'] == 'blocked'
-    rollout.sink.assert_not_called()
-
-
-def test_rollout_refused_in_credential_run_before_admission(rollout, admission):
-    from gateway.runtime_context import bind_environment, validate_environment
-    scope = validate_environment({'PAPERCLIP_API_KEY': 'synthetic-rollout-unit-12345'},
-        {'gateway': {'api_server': {'run_environment_allowlist': ['PAPERCLIP_API_KEY']}}}, 'local')
-    with bind_environment(scope):
-        result = json.loads(t.terminal_tool(APPLY))
-    assert result['status'] == 'blocked' and 'credential runs' in result['error']
-    admission.assert_not_called()
-    rollout.approval.assert_not_called()
     rollout.sink.assert_not_called()
 
 
@@ -631,15 +604,10 @@ def test_consumer_denial_and_pending_never_execute(rollout, admission, status):
     rollout.sink.assert_not_called()
 
 
-def test_consumer_request_needs_an_outer_budget_and_refuses_credential_runs(pipeline, admission):
+def test_consumer_request_needs_an_outer_budget(pipeline, admission):
     admission.return_value = copy.deepcopy(CONSUMED)
     command = HELPER + 'consumers-apply ' + PLAN + ' viewer'
     assert 'outer tool deadline' in json.loads(t.terminal_tool(command))['error']          # unknown budget
-    from gateway.runtime_context import bind_environment, validate_environment
-    scope = validate_environment({'PAPERCLIP_API_KEY': 'synthetic-consumer-unit-12345'},
-        {'gateway': {'api_server': {'run_environment_allowlist': ['PAPERCLIP_API_KEY']}}}, 'local')
-    with bind_environment(scope), tool_budget(ToolBudget(None)):
-        assert 'credential runs' in json.loads(t.terminal_tool(command))['error']
     pipeline.approval.assert_not_called()
     pipeline.sink.assert_not_called()
 

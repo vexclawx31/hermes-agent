@@ -10,8 +10,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass, field
-from gateway.runtime_context import bind_environment, validate_environment
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -120,10 +119,7 @@ class _RunStream:
     BACKLOG_LIMIT = 1000
     SUBSCRIBER_QUEUE_LIMIT = 256
 
-    def __init__(self, redact: Optional[Callable[[Any], Any]] = None) -> None:
-        # A scoped run's redactor: applied here so every writer (put_event, control-plane marks,
-        # progress callbacks) and the replay backlog only ever hold redacted events.
-        self.redact = redact
+    def __init__(self) -> None:
         self.subscribers: set[asyncio.Queue] = set()
         self.backlog: deque[tuple[int, Optional[dict[str, Any]]]] = deque(
             maxlen=self.BACKLOG_LIMIT
@@ -134,8 +130,6 @@ class _RunStream:
     def put_nowait(self, event: Optional[dict[str, Any]]) -> None:
         if self.terminal:
             return
-        if event is not None and self.redact is not None:
-            event = self.redact(event)
         seq = self.next_seq
         self.next_seq += 1
         self.backlog.append((seq, event))
@@ -481,13 +475,7 @@ def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _op
             code="idempotency_key_conflict", status=409)
     original_id = str(record["run_id"])
     status = self._durable_run_status(request, original_id) or record["status"]
-    response = _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
-    from gateway.runtime_context import ROUTE, PROTOCOL
-    if request.path.endswith(ROUTE):
-        payload = json.loads(response.body)
-        payload['environment_capability'] = PROTOCOL
-        response = web.json_response(payload, status=202, headers={'Idempotency-Replayed': 'true'})
-    return response
+    return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
 
 
 @dataclass(slots=True)
@@ -513,7 +501,6 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
-    environment: Any = field(default=None, repr=False)
 
     @property
     def approval_session_key(self) -> str:
@@ -523,7 +510,7 @@ class _RunLaunch:
     def put_event(self, event: Optional[dict]) -> None:
         """Enqueue only while this run still owns live transport state."""
         if self.owner._run_streams.get(self.run_id) is self.queue:
-            self.queue.put_nowait(self.environment.redact(event) if self.environment else event)
+            self.queue.put_nowait(event)
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -641,28 +628,6 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
-    environment = None
-    if isinstance(body, dict) and "environment" in body:
-        # Environment authority requires the operator API key, never a room grant.
-        if not self._api_key or self._check_auth(request) is not None:
-            return _json_error(_openai_error, "Run environment requires API key authentication", status=403)
-        try:
-            from hermes_cli.config import load_config
-            from tools.terminal_tool import _get_env_config
-            # The production profile-prefix middleware binds this request's home.
-            environment = validate_environment(body["environment"], load_config(), _get_env_config()["env_type"])
-        except (ValueError, TypeError, KeyError):
-            return _json_error(_openai_error, "Run environment denied by policy", status=400)
-        from gateway.runtime_context import PROTOCOL, ROUTE
-        if not request.path.endswith(ROUTE) or body.get('required_environment_capability') != PROTOCOL:
-            return _json_error(_openai_error, 'Required scoped capability missing', code='run_environment_unsupported', status=422)
-        # Receiver-generated, unadvertised UUID sessions only: never race a live
-        # owner's existing session or bypass its mailbox/turn lease.
-        if gateway_session_key or any(k in body for k in (
-                'session_id', 'previous_response_id', 'conversation_history', 'hosted_room_dispatch')):
-            return _json_error(_openai_error, 'Scoped runs require a fresh receiver session', status=400)
-    elif request.path.endswith('/v1/trusted-local-runs') or (isinstance(body, dict) and 'required_environment_capability' in body):
-        return _json_error(_openai_error, 'Scoped environment required', status=400)
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -747,7 +712,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     session_history_delivery = not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
-    q = self._run_streams[run_id] = _RunStream(environment.redact if environment else None)
+    q = self._run_streams[run_id] = _RunStream()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
@@ -773,12 +738,12 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author, environment=environment)
+        turn_author=turn_author)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id and not environment else None
+    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
     if admitted is not None:
         task = self._active_run_tasks[run_id] = asyncio.create_task(
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
@@ -788,13 +753,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    response = _accepted_response(run_id, "started", gateway_session_key, replayed=False)
-    if environment:
-        from gateway.runtime_context import PROTOCOL
-        payload = json.loads(response.body)
-        payload['environment_capability'] = PROTOCOL
-        response = web.json_response(payload, status=response.status)
-    return response
+    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
 def _run_usage(agent) -> dict[str, int]:
@@ -836,7 +795,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
-    with self._profile_scope(run.request_profile), bind_environment(run.environment):
+    with self._profile_scope(run.request_profile):
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
@@ -872,18 +831,9 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
         finally:
-            try:
-                if run.environment:
-                    try:
-                        run.environment.close()
-                    except Exception:
-                        # Revocation is not proof that every owned process was killed.
-                        # Do not log exception text: callbacks may include credentials.
-                        logger.warning("[api_server] run %s subprocess cleanup failed; teardown unconfirmed", run.run_id)
-            finally:
-                # Clear ownership now so a later stop can't reap work this run left running.
-                _api_server._clear_turn_process_ownership(agent)
-                self._memory_sessions.checkin(agent)
+            # Clear ownership now so a later stop can't reap work this run left running.
+            _api_server._clear_turn_process_ownership(agent)
+            self._memory_sessions.checkin(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.
             if run.declared_selected:
                 self._bind_declared_conversation(
@@ -899,15 +849,14 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
 
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[dict[str, Any]], None]:
     """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
-    run_id, loop = run.run_id, asyncio.get_running_loop()
+    run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: dict[str, Any]) -> None:
-        # Clients must never receive the raw flagged command (#48456) or a run credential literal:
-        # the shared builder redacts both.
-        event = _api_server._approval_request_event(run_id, approval_data, environment=run.environment)
+        # Clients must never receive the raw flagged command (#48456): the shared builder redacts.
+        event = _api_server._approval_request_event(run_id, approval_data)
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
-            loop.call_soon_threadsafe(run.put_event, event)
+            loop.call_soon_threadsafe(q.put_nowait, event)
 
     return _approval_notify
 
@@ -964,21 +913,6 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
 
 
 async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
-    with bind_environment(run.environment):
-        try:
-            await _execute_run_scoped(self, run, _api_server=_api_server)
-        finally:
-            if run.environment:
-                try:
-                    run.environment.close()
-                except Exception:
-                    # Terminal status is already published; a cleanup failure must not replace
-                    # the run's result or CancelledError, nor reach asyncio's handler with its
-                    # chained (unredacted) cause. Revocation is not proof of kill.
-                    logger.warning("[api_server] run %s subprocess cleanup failed; teardown unconfirmed", run.run_id)
-
-
-async def _execute_run_scoped(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
@@ -1003,9 +937,6 @@ async def _execute_run_scoped(self, run: _RunLaunch, *, _api_server) -> None:
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
         extra = extra or {}
-        if run.environment:
-            extra = run.environment.redact(extra)
-            fields = run.environment.redact(fields)
         if run_id in self._shutdown_interrupted_run_ids:
             status = "interrupted"
             fields = {"error": "Gateway shutdown interrupted the run."}
@@ -1028,12 +959,9 @@ async def _execute_run_scoped(self, run: _RunLaunch, *, _api_server) -> None:
             return
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
-                stream_delta_callback=None if run.environment else _text_cb,
-                tool_progress_callback=None if run.environment else self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=None if run.environment else _interim_cb, **run.agent_kwargs)
+                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
-        if run.environment:
-            agent._api_run_environment = run.environment
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
             loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
@@ -1338,15 +1266,6 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
     if agent is not None:
-        scope = getattr(agent, '_api_run_environment', None)
-        from gateway.runtime_context import RunEnvironment
-        if isinstance(scope, RunEnvironment):
-            # Revoke new spawns immediately; drain owned foreground processes off
-            # the event loop. This is not Paperclip JWT invalidation.
-            try:
-                await asyncio.to_thread(scope.close)
-            except Exception:
-                logger.warning("[api_server] run %s subprocess cleanup failed; teardown unconfirmed", run_id)
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
