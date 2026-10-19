@@ -30,7 +30,7 @@ def profile_policy_path(filename, legacy_path):
     profile = get_active_profile_name()
     if not isinstance(profile, str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', profile):
         raise ValueError('invalid runtime profile')
-    if filename not in {'sibling-services.json', 'run-admin.json'}:
+    if filename not in {'sibling-services.json'}:
         raise ValueError('invalid policy filename')
     path = Path(PROFILE_POLICY_ROOT) / profile / filename
     if os.path.lexists(path) or profile != 'default':

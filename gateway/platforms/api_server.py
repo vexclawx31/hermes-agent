@@ -7,7 +7,6 @@ OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_
 """
 
 import asyncio
-from gateway.runtime_context import environment_capability
 import concurrent.futures
 import errno
 import hashlib
@@ -111,8 +110,7 @@ def _approval_event_choices(*, smart_denied: bool, allow_session: bool, allow_pe
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
 
 
-def _approval_request_event(run_id: str, approval_data: Optional[dict[str, Any]], *,
-                            environment: Any = None, **fields: Any) -> dict[str, Any]:
+def _approval_request_event(run_id: str, approval_data: Optional[dict[str, Any]], **fields: Any) -> dict[str, Any]:
     """The ``approval.request`` payload every approval surface emits (runs bridge, session stream,
     chat completions): the flagged command redacted before egress (#48456), the ``_run_event``
     envelope, and the ``choices`` the client may send back to ``POST /v1/runs/{id}/approval``."""
@@ -125,10 +123,7 @@ def _approval_request_event(run_id: str, approval_data: Optional[dict[str, Any]]
         smart_denied=bool(event.get("smart_denied")),
         allow_session=event.get("allow_session") is not False,
         allow_permanent=event.get("allow_permanent") is not False)))
-    # A scoped run's credential literals never leave in an approval event, whichever surface emits it.
-    from gateway.runtime_context import current_environment
-    scope = environment or current_environment()
-    return scope.redact(event) if scope else event
+    return event
 
 
 try:
@@ -1730,7 +1725,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
-            ("POST", "/v1/trusted-local-runs", self._handle_runs),
             # Browser-control (gated on browser.extension_control.enabled + API key): POST
             # mints a short-lived ticket, WS consumes it; artifacts are bounded + scope-bound.
             ("POST", "/v1/browser-control/register", self._handle_browser_control_register),
@@ -2530,7 +2524,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "features": {
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
-                "run_environment": environment_capability(),
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
                 **_STATIC_FEATURE_FLAGS,
                 "cors": bool(self._cors_origins),

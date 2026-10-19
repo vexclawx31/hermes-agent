@@ -1403,11 +1403,6 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
-        from gateway.runtime_context import current_environment
-        run_scope = current_environment()
-        if run_scope and (plan.env_type != "local" or background or pty
-                          or plan.promoted_from_foreground_timeout is not None):
-            raise _Rejected(_error_json("Credential runs support bounded local foreground commands only"))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1422,14 +1417,6 @@ def terminal_tool(
         from tools.sibling_service_policy import admit_terminal_command, is_candidate
         from agent.deadline import run_bounded_sync
         sibling_candidate = env_type == 'local' and not _host_local and is_candidate(command)
-        # Fail closed: sibling service control never runs under run credential authority, and the
-        # refusal precedes admission so the helper's fixed-env early return is never reached.
-        if sibling_candidate and run_scope:
-            from tools.run_admin_policy import admit_run
-            trusted = run_bounded_sync(lambda: admit_run(run_scope), 8, label='terminal.run-admin')
-            if trusted.timed_out or not trusted.value:
-                raise _Rejected(_error_json('Sibling control is unavailable in credential runs without authenticated admin admission; command not run.',
-                                            status='blocked'))
         admission = (run_bounded_sync(lambda: admit_terminal_command(command), 10,
                                       label='terminal.sibling-admission')
                      if sibling_candidate else None)
@@ -1464,18 +1451,7 @@ def terminal_tool(
                 kwargs = dict(shell=False, capture_output=True, text=True, encoding='utf-8', errors='replace',
                               timeout=sink_timeout, cwd='/',
                               env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C'})
-                if run_scope:
-                    # Approval may outlive server authority; revalidate at the sink.
-                    from tools.run_admin_policy import admit_run
-                    trusted = run_bounded_sync(lambda: admit_run(run_scope), 8,
-                                               label='terminal.run-admin-final')
-                    if trusted.timed_out or not trusted.value:
-                        raise _Rejected(_error_json(
-                            'Admin authority no longer valid; command not run.', status='blocked'))
-                    from tools.run_admin_sink import run_helper
-                    completed = run_helper(run_scope, list(sibling_argv), **kwargs)
-                else:
-                    completed = _sp.run(list(sibling_argv), **kwargs)
+                completed = _sp.run(list(sibling_argv), **kwargs)
             except _sp.TimeoutExpired:
                 logger.warning('Sibling control timed out argv=%r; outcome unknown', sibling_argv)
                 return json.dumps({'output': '', 'exit_code': None, 'timed_out': True,
@@ -1548,14 +1524,12 @@ def terminal_tool(
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return _metered(None if _host_local else plan, result)
-        from gateway.runtime_context import terminal_environment
-        with terminal_environment():
-            return _metered(None if _host_local else plan, _run_foreground(
-                command, env, plan,
-                task_id=task_id, session_id=session_id, session_key=session_key,
-                workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-                metered=not _host_local,
-            ))
+        return _metered(None if _host_local else plan, _run_foreground(
+            command, env, plan,
+            task_id=task_id, session_id=session_id, session_key=session_key,
+            workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            metered=not _host_local,
+        ))
     except _Rejected as r:
         return r.result_json
     except EnvironmentConnectionError as e:

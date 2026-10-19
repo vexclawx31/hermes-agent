@@ -244,11 +244,7 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
     copy_identity_fields(msg, row)
     if isinstance(msg.get(DB_ROW_SNAPSHOT), str):
         row[DB_ROW_SNAPSHOT] = msg[DB_ROW_SNAPSHOT]
-    # Defensive durable projection only: preserve live execution arguments.
-    # This row also feeds the emergency JSONL divert on database failure.
-    from gateway.runtime_context import current_environment
-    scope = current_environment()
-    return scope.redact(row) if scope else row
+    return row
 
 
 def _db_flush_collect(agent, messages: list[dict], conversation_history: Optional[list[dict]],
