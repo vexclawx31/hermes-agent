@@ -86,18 +86,43 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     return {"success": True, "result": result.get("data", {}).get("result")}
 
 
+def _owned_tab_target(task_id: str) -> Optional[str]:
+    """The tab a shared-Chrome session is bound to: its targetId, ``""`` when the session owns tabs but
+    none is currently bound (refuse), or None for sessions without owned tabs (unchanged behavior).
+    Invariant from ``browser_tool_session``: while ``owned_tab_state`` is "bound" the daemon is pinned
+    to the newest ``owned_target_ids`` entry."""
+    import tools.browser_tool as bt
+
+    key = bt._last_session_key(task_id)  # takes _cleanup_lock itself: call it outside
+    with bt._cleanup_lock:
+        record = dict(bt._active_sessions.get(key) or {})
+    if not (record.get("features") or {}).get("cdp_override") or record.get("owned_tab_state") == "unsupported":
+        return None
+    owned = record.get("owned_target_ids") or []
+    if record.get("owned_tab_state") != "bound" or not owned:
+        return "" if record else None
+    return owned[-1]
+
+
 def _ensure_supervisor(task_id: str):
     """The supervisor for ``task_id``, attaching one on demand for a LOCAL built-in browser session.
 
     Cloud/CDP-override sessions and browser_exec attach their supervisor when the session is created;
     a local agent-browser ``--session`` has no ``cdp_url`` of its own, so nothing did. Ask the daemon
     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
-    Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
+    Returns None when no endpoint is reachable; the fill then refuses rather than touching argv.
+
+    A session that owns its tab in a shared external Chrome (``browser.cdp_url``) only ever gets a
+    supervisor scoped to that tab; if the tab is unknown, stale or cannot be attached, this returns
+    None (the fill refuses) instead of an unscoped supervisor that could pick another tab."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
-    if supervisor is not None:
+    target = _owned_tab_target(task_id)
+    if supervisor is not None and (target is None or getattr(supervisor, "page_target_id", None) == target):
         return supervisor
+    if target == "":
+        return None
     from tools.browser_tool import _last_session_key
     from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
     from tools.browser_tool_session import _run_browser_command
@@ -106,10 +131,14 @@ def _ensure_supervisor(task_id: str):
     cdp_url = str(((res or {}).get("data") or {}).get("cdpUrl") or "") if (res or {}).get("success") else ""
     if not cdp_url:
         return None
+    target = _owned_tab_target(task_id)  # the command above may have re-bound the session
+    if target == "":
+        return None
     policy, timeout_s = _get_dialog_policy_config()
+    target_kw = {"page_target_id": target} if target else {}
     try:
         return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=_resolve_cdp_override(cdp_url),
-                                                dialog_policy=policy, dialog_timeout_s=timeout_s)
+                                                dialog_policy=policy, dialog_timeout_s=timeout_s, **target_kw)
     except Exception as exc:
         logger.debug("vault fill: supervisor attach to local session failed (%s)", exc)
         return None

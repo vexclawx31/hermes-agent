@@ -373,3 +373,72 @@ def test_focus_page_only_considers_the_owned_tab():
         thread.join(timeout=5)
 
     assert result["ok"] and sup.attached == "T1"
+
+
+class _VaultFakeSup:
+    attach_ok = True
+
+    def __init__(self, task_id, cdp_url, dialog_policy=None, dialog_timeout_s=None, page_target_id=None):
+        self.cdp_url, self.page_target_id = cdp_url, page_target_id
+        self._thread = type("T", (), {"is_alive": lambda s: True})()
+        self._loop = type("L", (), {"is_running": lambda s: True})()
+
+    def start(self, timeout):
+        if not _VaultFakeSup.attach_ok:
+            raise TimeoutError("did not attach")
+
+    def stop(self):
+        pass
+
+
+@pytest.fixture
+def vault_chrome(chrome, monkeypatch):
+    from tools import browser_supervisor as bs
+
+    monkeypatch.setattr(bs, "CDPSupervisor", _VaultFakeSup)
+    monkeypatch.setattr(bs, "SUPERVISOR_REGISTRY", bs._SupervisorRegistry())
+    orig = chrome.dispatch
+
+    def dispatch(task_id, info, cmd, command, args, timeout, engine):
+        if command == "get" and args == ["cdp-url"]:
+            return "auto", {"success": True, "data": {"cdpUrl": WS_URL}}
+        return orig(task_id, info, cmd, command, args, timeout, engine)
+
+    monkeypatch.setattr(bt_session, "_dispatch_browser_command", dispatch)
+    bt_session._run_browser_command("a", "open", ["https://example.com"])
+    _VaultFakeSup.attach_ok = True
+    yield chrome
+    _VaultFakeSup.attach_ok = True
+
+
+def test_vault_supervisor_is_scoped_to_the_owned_tab(vault_chrome):
+    from tools import browser_vault_tool as vt
+
+    sup = vt._ensure_supervisor("a")
+
+    assert sup is not None and sup.page_target_id == "T1"
+
+
+def test_vault_refuses_when_the_owned_tab_supervisor_cannot_attach(vault_chrome):
+    from tools import browser_vault_tool as vt
+
+    _VaultFakeSup.attach_ok = False
+
+    assert vt._ensure_supervisor("a") is None  # never an unscoped (first-tab / all-tabs) supervisor
+
+
+def test_vault_refuses_while_the_session_has_no_bound_tab(vault_chrome):
+    from tools import browser_vault_tool as vt
+
+    bt._active_sessions["a"]["owned_tab_state"] = None  # e.g. owned tab closed, new one not opened yet
+
+    assert vt._ensure_supervisor("a") is None
+
+
+def test_vault_replaces_an_unscoped_supervisor_for_an_owning_session(vault_chrome):
+    from tools import browser_supervisor as bs
+    from tools import browser_vault_tool as vt
+
+    bs.SUPERVISOR_REGISTRY.get_or_start("a", WS_URL)  # e.g. left by browser_exec
+
+    assert vt._ensure_supervisor("a").page_target_id == "T1"
