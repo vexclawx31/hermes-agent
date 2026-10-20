@@ -679,6 +679,22 @@ def _release_session_resources(task_id: str, session_info: dict[str, Any]) -> No
             shutil.rmtree(socket_dir, ignore_errors=True)
 
 
+def _close_owned_tabs(task_id: str, session_info: dict[str, Any], *, timeout: int) -> None:
+    """Close the tabs this session recorded as its own (external Chrome); never any other tab.
+
+    Dispatched on the captured record, not via ``_run_browser_command``: teardown must not
+    re-create a session (or its supervisor) just to close a tab."""
+    owned = session_info.get("owned_target_ids") or ()
+    if not owned:
+        return
+    preflight = _session._browser_command_preflight()
+    if "browser_cmd" not in preflight:
+        return
+    for target_id in owned:
+        _best_effort(f"closing owned tab for task {task_id}", lambda tid=target_id: _session._dispatch_browser_command(
+            task_id, session_info, preflight["browser_cmd"], "tab", ["close", tid], timeout, None))
+
+
 def _force_reap_browser_session(task_id: str) -> None:
     """Janitor last resort: skip the failing ``close`` round-trips, release resources directly.
 
@@ -690,6 +706,7 @@ def _force_reap_browser_session(task_id: str) -> None:
         _bt._session_last_activity.pop(task_id, None)
         _bt._recording_sessions.discard(task_id)
     if session_info:
+        _close_owned_tabs(task_id, session_info, timeout=5)
         _release_session_resources(task_id, session_info)
     _drop_last_active_binding(task_id)
 
@@ -732,6 +749,9 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     elif _session_has_expired(session_info):
         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
     else:
+        # External Chrome (browser.cdp_url): ``close`` only disconnects, so close the tabs this
+        # session opened itself. Pre-existing, foreign and unrecorded tabs are never touched.
+        _close_owned_tabs(task_id, session_info, timeout=10)
         try:
             _session._run_browser_command(task_id, "close", [], timeout=10)
             _bt.logger.debug("agent-browser close command completed for task %s", task_id)

@@ -414,7 +414,9 @@ def _get_session_info(task_id: Optional[str] = None) -> dict[str, Any]:
 
     # Lazy-start the CDP supervisor (idempotent). Skip local sidecars (no CDP URL) and
     # Lightpanda sessions (Browser Use mode hides the tools that consume supervisor state).
-    if not force_local and not (session_info.get("features") or {}).get("lightpanda"):
+    # External-Chrome sessions start it once their own tab exists, so it never attaches to another tab.
+    if not force_local and not (session_info.get("features") or {}).get("lightpanda") \
+            and not _is_cdp_override(session_info):
         _cdp._ensure_cdp_supervisor(task_id)
 
     return session_info
@@ -430,6 +432,12 @@ def _discard_timed_out_browser_session(task_id: str, session_info: dict[str, Any
             replacement = dict(session_info)
             replacement["session_name"] = f"h_{uuid.uuid4().hex[:10]}"
             replacement.pop("_first_nav", None)
+            if replacement.get("owned_target_ids"):
+                replacement["owned_target_ids"] = list(replacement["owned_target_ids"])
+                if replacement.get("owned_tab_state") == "bound":
+                    replacement["_rebind_owned_tab"] = True  # the new daemon must not fall back to the first tab
+            if replacement.get("owned_tab_state") == "binding":
+                replacement["owned_tab_state"] = None  # the in-flight bind finishes on this record or retries
             _bt._active_sessions[task_id] = replacement
         else:
             _bt._active_sessions.pop(task_id, None)
@@ -848,8 +856,9 @@ def _dispatch_browser_command(
     timeout: int, _engine_override: Optional[str],
 ) -> tuple[str, dict[str, Any]]:
     """Build the agent-browser argv for ``session_info`` and run it once → ``(engine, result)``."""
-    # Cleanup stops the supervisor before closing the backend; keep it stopped.
-    if command != "close" and session_info.get("cdp_url"):
+    # Cleanup stops the supervisor before closing the backend (and owned tabs); keep it stopped.
+    # ``tab`` is only issued internally (owned-tab bind/close), which manages the supervisor itself.
+    if command not in ("close", "tab") and session_info.get("cdp_url"):
         _cdp._ensure_cdp_supervisor(task_id)
 
     # Every backend runs in this task's own daemon (``--session <name>``); Cloud/CDP adds
@@ -861,6 +870,9 @@ def _dispatch_browser_command(
     backend_args = ["--session", session_info["session_name"]]
     if session_info.get("cdp_url"):
         backend_args += ["--cdp", session_info["cdp_url"]]
+        if session_info.get("owned_target_ids") and command != "tab":  # rebind switches first, then pins
+            # Stay on the owned tab: unpinned, the daemon follows whichever tab another client opens last.
+            backend_args.append("--pin-tab")
     else:
         if (bd_port := _bot_desktop_attach_port(session_info)) is not None:
             # A Chromium already runs on the Bot Desktop's shared profile (the human clicked the dock's
@@ -884,6 +896,107 @@ def _dispatch_browser_command(
         _bt.logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
     return engine, result
+
+
+def _is_cdp_override(session_info: dict[str, Any]) -> bool:
+    return bool((session_info.get("features") or {}).get("cdp_override"))
+
+
+def _find_marked_tab(task_id: str, browser_cmd: str, marker: str) -> Optional[str]:
+    """targetId of the tab still showing our unique ``marker`` URL, via the task's live daemon."""
+    with _bt._cleanup_lock:
+        current = _bt._active_sessions.get(task_id)
+    if current is None:
+        return None
+    _, result = _dispatch_browser_command(task_id, current, browser_cmd, "tab", ["list"], 10, None)
+    tabs = (result.get("data") or {}).get("tabs") or [] if result.get("success") else []
+    return next((t.get("targetId") for t in tabs if t.get("url") == marker and t.get("targetId")), None)
+
+
+def _open_owned_cdp_tab(task_id: str, session_info: dict[str, Any], browser_cmd: str, timeout: int) -> str:
+    """Open a tab for this session and record it as owned → ``"bound"``, ``"unsupported"`` or ``"failed"``.
+
+    Ownership is positive only: the targetId our own ``tab new`` returned, or, when that command timed out,
+    the tab still showing the unique marker URL we opened. The record is written to whatever session is now
+    live for ``task_id`` (a timeout replaces it); if none is, the new tab is closed again.
+    """
+    marker = f"about:blank#hermes-tab-{uuid.uuid4().hex[:12]}"
+    _, result = _dispatch_browser_command(task_id, session_info, browser_cmd, "tab", ["new", marker], timeout, None)
+    data = (result.get("data") or {}) if result.get("success") else {}
+    target_id = data.get("targetId")
+    if result.get("success") and not target_id:
+        # Older agent-browser (no targetId, no --pin-tab): undo the tab we just opened, keep old behavior.
+        if data.get("tabId"):
+            _dispatch_browser_command(task_id, session_info, browser_cmd, "tab", ["close", str(data["tabId"])], 10, None)
+        return "unsupported"
+    if not target_id:
+        target_id = _find_marked_tab(task_id, browser_cmd, marker)
+        if not target_id:
+            _bt.logger.warning("Could not open an owned tab for CDP session %s: %s",
+                               session_info.get("session_name"), result.get("error"))
+            return "failed"
+    with _bt._cleanup_lock:
+        current = _bt._active_sessions.get(task_id)
+        if current is not None:
+            current["owned_target_ids"] = [*(current.get("owned_target_ids") or ()), target_id]
+            current["owned_tab_state"] = "bound"
+            if current is not session_info:
+                current["_rebind_owned_tab"] = True  # replacement daemon: switch to the tab before pinning
+    if current is None:  # cleaned up meanwhile: nobody will close it, so close it now
+        _dispatch_browser_command(task_id, session_info, browser_cmd, "tab", ["close", target_id], 10, None)
+        return "failed"
+    _bt.logger.debug("CDP session %s owns tab %s", current.get("session_name"), target_id)
+    _cdp._ensure_cdp_supervisor(task_id)  # re-point dialogs/eval at the owned tab, never another one
+    return "bound"
+
+
+def _bind_owned_cdp_tab(task_id: str, session_info: dict[str, Any], browser_cmd: str, command: str,
+                        timeout: int) -> Optional[dict[str, Any]]:
+    """Make a ``browser.cdp_url`` session work in its own tab; an error dict means "don't run the command".
+
+    Without this, agent-browser attaches to the first existing tab of the external Chrome (a person's,
+    or another agent's) and any tab it creates outlives the session. Only tabs recorded by
+    :func:`_open_owned_cdp_tab` are owned; cleanup closes exactly those, and ``--pin-tab`` keeps the
+    daemon on the newest. A replacement daemon switches back to it (or opens a new one if it is gone);
+    it never falls back to another tab. agent-browser without targetId support keeps the old behavior.
+    """
+    if command in ("close", "tab") or not _is_cdp_override(session_info):
+        return None
+    with _bt._cleanup_lock:
+        state = session_info.get("owned_tab_state")
+        if state is None:
+            session_info["owned_tab_state"] = "binding"
+        rebind = state == "bound" and session_info.pop("_rebind_owned_tab", False)
+    if state == "binding":
+        return {"success": False, "error": "Browser session is still opening its tab; retry the command."}
+    if state == "unsupported" or (state == "bound" and not rebind):
+        return None
+    if rebind:
+        _, result = _dispatch_browser_command(task_id, session_info, browser_cmd, "tab",
+                                              [session_info["owned_target_ids"][-1]], timeout, None)
+        if result.get("success"):
+            return None
+        with _bt._cleanup_lock:
+            replaced = _bt._active_sessions.get(task_id) is not session_info
+        if replaced:  # the switch timed out and replaced this record: the caller binds the live one
+            return None
+    try:
+        outcome = _open_owned_cdp_tab(task_id, session_info, browser_cmd, timeout)
+    except Exception as e:  # never leave the record stuck in "binding"
+        _bt.logger.warning("Opening an owned tab failed for task %s: %s", task_id, e)
+        outcome = "failed"
+    if outcome == "unsupported":
+        session_info["owned_tab_state"] = "unsupported"
+        return None
+    if outcome == "failed":
+        with _bt._cleanup_lock:
+            if session_info.get("owned_tab_state") == "binding":
+                session_info["owned_tab_state"] = None  # retry on the next command
+            elif rebind:
+                session_info["_rebind_owned_tab"] = True
+        return {"success": False, "error": "Could not open this session's own browser tab; "
+                                           "not using another tab instead. Retry the command."}
+    return None
 
 
 def _run_browser_command(
@@ -911,10 +1024,30 @@ def _run_browser_command(
         except Exception as e:
             _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
             return {"success": False, "error": f"Failed to create browser session: {e!s}"}
+        for _ in range(2):  # binding can time out and replace the session record; bind the live one
+            refused = _bind_owned_cdp_tab(task_id, session_info, browser_cmd, command, timeout)
+            with _bt._cleanup_lock:
+                live = _bt._active_sessions.get(task_id)
+            if refused or live is session_info or not _is_cdp_override(session_info):
+                break
+            if live is None:
+                refused = {"success": False, "error": "Browser session was closed while opening its tab."}
+                break
+            session_info = live
+        else:  # never run a command on a record that is no longer live (its daemon was discarded)
+            refused = {"success": False, "error": "Browser session restarted while opening its tab; retry the command."}
+        if refused:
+            return refused
         engine, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
             task_id, session_info, browser_cmd, command, args, timeout, _engine_override))
         if result.get("code") == "human_has_control":
             return result
+        if attempt == 0 and result.get("code") == "tab_gone" and _is_cdp_override(session_info):
+            # Someone closed the session's own tab: open a fresh owned one and retry once.
+            _bt.logger.info("browser '%s': owned tab gone (task=%s); opening a new one", command, task_id)
+            with _bt._cleanup_lock:
+                session_info["owned_tab_state"] = None
+            continue
         # #115184: a protocol-level failure (exit 101 on a stale session daemon, empty/non-JSON
         # output) poisons the cached local session record exactly like a timeout — recycle it
         # the same way and retry once on the replacement before handing the caller the error.
