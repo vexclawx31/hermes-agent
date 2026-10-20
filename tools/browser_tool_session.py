@@ -430,6 +430,9 @@ def _discard_timed_out_browser_session(task_id: str, session_info: dict[str, Any
             replacement = dict(session_info)
             replacement["session_name"] = f"h_{uuid.uuid4().hex[:10]}"
             replacement.pop("_first_nav", None)
+            if replacement.get("owned_target_ids"):
+                replacement["owned_target_ids"] = list(replacement["owned_target_ids"])
+                replacement["_rebind_owned_tab"] = True  # the new daemon must not fall back to the first tab
             _bt._active_sessions[task_id] = replacement
         else:
             _bt._active_sessions.pop(task_id, None)
@@ -848,8 +851,9 @@ def _dispatch_browser_command(
     timeout: int, _engine_override: Optional[str],
 ) -> tuple[str, dict[str, Any]]:
     """Build the agent-browser argv for ``session_info`` and run it once → ``(engine, result)``."""
-    # Cleanup stops the supervisor before closing the backend; keep it stopped.
-    if command != "close" and session_info.get("cdp_url"):
+    # Cleanup stops the supervisor before closing the backend (and owned tabs); keep it stopped.
+    # ``tab`` is only issued internally (owned-tab bind/close), which manages the supervisor itself.
+    if command not in ("close", "tab") and session_info.get("cdp_url"):
         _cdp._ensure_cdp_supervisor(task_id)
 
     # Every backend runs in this task's own daemon (``--session <name>``); Cloud/CDP adds
@@ -861,6 +865,9 @@ def _dispatch_browser_command(
     backend_args = ["--session", session_info["session_name"]]
     if session_info.get("cdp_url"):
         backend_args += ["--cdp", session_info["cdp_url"]]
+        if session_info.get("owned_target_ids") and command != "tab":  # rebind switches first, then pins
+            # Stay on the owned tab: unpinned, the daemon follows whichever tab another client opens last.
+            backend_args.append("--pin-tab")
     else:
         if (bd_port := _bot_desktop_attach_port(session_info)) is not None:
             # A Chromium already runs on the Bot Desktop's shared profile (the human clicked the dock's
@@ -884,6 +891,44 @@ def _dispatch_browser_command(
         _bt.logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
     return engine, result
+
+
+def _bind_owned_cdp_tab(task_id: str, session_info: dict[str, Any], browser_cmd: str, command: str) -> None:
+    """Give a ``browser.cdp_url`` session its own tab before its first command.
+
+    Without this, agent-browser attaches to the first existing tab of the external Chrome (a person's,
+    or another agent's) and any tab it creates outlives the session. Only the targetId returned by our
+    own ``tab new`` is recorded in ``owned_target_ids``; cleanup closes exactly those, and ``--pin-tab``
+    keeps the daemon on it. Fails closed: if ``tab new`` fails or returns no targetId (agent-browser before
+    pin/targetId support), the tab it opened is closed again, nothing is recorded and the old behavior stays.
+    A replacement daemon (``_rebind_owned_tab``) switches back to the owned tab instead of opening another.
+    """
+    if command in ("close", "tab") or not (session_info.get("features") or {}).get("cdp_override"):
+        return
+    owned = session_info.get("owned_target_ids")
+    if owned is None:
+        session_info["owned_target_ids"] = []  # claim the attempt first: a failure must not retry per command
+        _, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
+            task_id, session_info, browser_cmd, "tab", ["new"], 10, None))
+        data = (result.get("data") or {}) if result.get("success") else {}
+        target_id = data.get("targetId")
+        if not (isinstance(target_id, str) and target_id) and data.get("tabId"):
+            # Older agent-browser (no targetId, no --pin-tab): undo the tab we just opened, keep old behavior.
+            run_fenced_pair(session_info, lambda: _dispatch_browser_command(
+                task_id, session_info, browser_cmd, "tab", ["close", str(data["tabId"])], 10, None))
+        if isinstance(target_id, str) and target_id:
+            session_info["owned_target_ids"].append(target_id)
+            _bt.logger.debug("CDP session %s owns tab %s", session_info.get("session_name"), target_id)
+            _cdp._ensure_cdp_supervisor(task_id)  # re-point dialogs/eval at the owned tab, not the first one
+        else:
+            _bt.logger.warning("Could not open an owned tab for CDP session %s; its tabs will not be closed: %s",
+                               session_info.get("session_name"), result.get("error"))
+    elif owned and session_info.pop("_rebind_owned_tab", False):
+        _, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
+            task_id, session_info, browser_cmd, "tab", [owned[0]], 10, None))
+        if not result.get("success"):
+            _bt.logger.warning("Could not rebind CDP session %s to its tab: %s",
+                               session_info.get("session_name"), result.get("error"))
 
 
 def _run_browser_command(
@@ -911,6 +956,7 @@ def _run_browser_command(
         except Exception as e:
             _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
             return {"success": False, "error": f"Failed to create browser session: {e!s}"}
+        _bind_owned_cdp_tab(task_id, session_info, browser_cmd, command)
         engine, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
             task_id, session_info, browser_cmd, command, args, timeout, _engine_override))
         if result.get("code") == "human_has_control":

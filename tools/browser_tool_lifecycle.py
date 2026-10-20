@@ -732,6 +732,11 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     elif _session_has_expired(session_info):
         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
     else:
+        # External Chrome (browser.cdp_url): ``close`` only disconnects, so close the tabs this
+        # session opened itself. Pre-existing, foreign and unrecorded tabs are never touched.
+        for target_id in session_info.get("owned_target_ids") or ():
+            _best_effort(f"closing owned tab for task {task_id}",
+                         lambda tid=target_id: _session._run_browser_command(task_id, "tab", ["close", tid], timeout=10))
         try:
             _session._run_browser_command(task_id, "close", [], timeout=10)
             _bt.logger.debug("agent-browser close command completed for task %s", task_id)
