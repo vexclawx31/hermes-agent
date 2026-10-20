@@ -436,6 +436,8 @@ def _discard_timed_out_browser_session(task_id: str, session_info: dict[str, Any
                 replacement["owned_target_ids"] = list(replacement["owned_target_ids"])
                 if replacement.get("owned_tab_state") == "bound":
                     replacement["_rebind_owned_tab"] = True  # the new daemon must not fall back to the first tab
+            if replacement.get("owned_tab_state") == "binding":
+                replacement["owned_tab_state"] = None  # the in-flight bind finishes on this record or retries
             _bt._active_sessions[task_id] = replacement
         else:
             _bt._active_sessions.pop(task_id, None)
@@ -974,6 +976,10 @@ def _bind_owned_cdp_tab(task_id: str, session_info: dict[str, Any], browser_cmd:
                                               [session_info["owned_target_ids"][-1]], timeout, None)
         if result.get("success"):
             return None
+        with _bt._cleanup_lock:
+            replaced = _bt._active_sessions.get(task_id) is not session_info
+        if replaced:  # the switch timed out and replaced this record: the caller binds the live one
+            return None
     try:
         outcome = _open_owned_cdp_tab(task_id, session_info, browser_cmd, timeout)
     except Exception as e:  # never leave the record stuck in "binding"
@@ -1022,9 +1028,14 @@ def _run_browser_command(
             refused = _bind_owned_cdp_tab(task_id, session_info, browser_cmd, command, timeout)
             with _bt._cleanup_lock:
                 live = _bt._active_sessions.get(task_id)
-            if refused or live is None or live is session_info:
+            if refused or live is session_info or not _is_cdp_override(session_info):
+                break
+            if live is None:
+                refused = {"success": False, "error": "Browser session was closed while opening its tab."}
                 break
             session_info = live
+        else:  # never run a command on a record that is no longer live (its daemon was discarded)
+            refused = {"success": False, "error": "Browser session restarted while opening its tab; retry the command."}
         if refused:
             return refused
         engine, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(

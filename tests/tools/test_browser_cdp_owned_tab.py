@@ -6,6 +6,7 @@ overlapping agent sessions. No real agent-browser, Chromium or network is used.
 
 import asyncio
 import itertools
+import threading
 
 import pytest
 
@@ -295,3 +296,80 @@ def test_supervisor_refuses_foreign_or_new_tab_when_owned_tab_is_gone(targets):
         asyncio.run(sup._attach_initial_page())
 
     assert sup.attached is None
+
+
+def test_timed_out_tab_new_without_marker_hit_recovers_on_the_next_command(chrome, monkeypatch):
+    orig = chrome.dispatch
+
+    def dispatch(task_id, info, cmd, command, args, timeout, engine):
+        if command == "tab" and args[:1] == ["list"] and chrome.tab_new == "timeout":
+            return "auto", {"success": False, "error": "timed out"}
+        return orig(task_id, info, cmd, command, args, timeout, engine)
+
+    monkeypatch.setattr(bt_session, "_dispatch_browser_command", dispatch)
+    chrome.tab_new = "timeout"
+    assert bt_session._run_browser_command("a", "open", ["https://example.com"])["success"] is False
+    assert chrome.page_calls() == []
+
+    chrome.tab_new = "ok"
+    assert bt_session._run_browser_command("a", "open", ["https://example.com"])["success"]
+
+
+def test_rebind_timeout_never_opens_tabs_or_runs_commands_on_the_discarded_daemon(chrome, monkeypatch):
+    bt_session._run_browser_command("a", "open", ["https://example.com"])
+    bt_session._discard_timed_out_browser_session("a", bt._active_sessions["a"], "")
+    replacement = bt._active_sessions["a"]["session_name"]
+    orig = chrome.dispatch
+
+    def dispatch(task_id, info, cmd, command, args, timeout, engine):
+        if command == "tab" and args == ["T1"]:  # every rebind times out → record replaced again
+            bt_session._discard_timed_out_browser_session(task_id, info, "")
+            return "auto", {"success": False, "error": "timed out"}
+        return orig(task_id, info, cmd, command, args, timeout, engine)
+
+    monkeypatch.setattr(bt_session, "_dispatch_browser_command", dispatch)
+    result = bt_session._run_browser_command("a", "snapshot", [])
+
+    assert result["success"] is False and "retry" in result["error"]
+    assert [c for c in chrome.calls if c[0] == replacement and c[2][:1] == ["new"]] == []
+    assert [c for c in chrome.page_calls() if c[1] == "snapshot"] == []
+
+
+def test_supervisor_lookup_without_target_keeps_the_owned_tab_supervisor(monkeypatch):
+    from tools.browser_supervisor import _SupervisorRegistry
+
+    class FakeSup:
+        def __init__(self, task_id, cdp_url, dialog_policy=None, dialog_timeout_s=None, page_target_id=None):
+            self.cdp_url, self.page_target_id = cdp_url, page_target_id
+            self._thread = type("T", (), {"is_alive": lambda s: True})()
+            self._loop = type("L", (), {"is_running": lambda s: True})()
+
+        def start(self, timeout):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr("tools.browser_supervisor.CDPSupervisor", FakeSup)
+    reg = _SupervisorRegistry()
+    reg.get_or_start("a", "ws://x", page_target_id="T1")
+
+    assert reg.get_or_start("a", "ws://x").page_target_id == "T1"  # vault fill / browser_exec shape
+    assert reg.get_or_start("a", "ws://x", page_target_id="T2").page_target_id == "T2"
+
+
+def test_focus_page_only_considers_the_owned_tab():
+    targets = [{"type": "page", "targetId": "HUMAN-1", "url": "https://www.instagram.com/accounts/login/"},
+               {"type": "page", "targetId": "T1", "url": "https://www.instagram.com/accounts/login/"}]
+    sup = _FakeSupervisorCDP(targets, page_target_id="T1")
+    loop = asyncio.new_event_loop()
+    sup._loop = loop
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        result = sup.focus_page("https://www.instagram.com")
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+
+    assert result["ok"] and sup.attached == "T1"

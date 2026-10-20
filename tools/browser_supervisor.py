@@ -273,7 +273,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         that open their own tabs (browser_exec) put the login form somewhere else. With
         ``accept`` (a JS expression) the first same-origin tab where it evaluates truthy wins,
         so a login and a checkout tab on one site resolve to the right one. Returns
-        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays."""
+        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays.
+        A session that owns its tab (``page_target_id``, shared external Chrome) only considers that tab."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -294,7 +295,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 try:
                     # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
                     if t.get("type") == "page" and url.startswith(("http://", "https://")) \
-                            and (not origin or normalize_origin(url) == origin):
+                            and (not origin or normalize_origin(url) == origin) \
+                            and (not self.page_target_id or t.get("targetId") == self.page_target_id):
                         candidates.append((t["targetId"], url))
                 except Exception:
                     continue
@@ -538,7 +540,10 @@ class _SupervisorRegistry:
             if existing is not None:
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
-                if existing.cdp_url == cdp_url and getattr(existing, "page_target_id", None) == page_target_id and healthy:
+                # No page_target_id = "whatever this task has": never swap a session's owned-tab supervisor
+                # for one on the first tab (vault fill / browser_exec callers don't know the owned tab).
+                same_target = page_target_id is None or getattr(existing, "page_target_id", None) == page_target_id
+                if existing.cdp_url == cdp_url and same_target and healthy:
                     return existing
                 self._by_task.pop(task_id, None)
         if existing is not None:
@@ -551,7 +556,8 @@ class _SupervisorRegistry:
         with self._lock:
             # Guard against a concurrent get_or_start from another thread.
             already = self._by_task.get(task_id)
-            if already is not None and already.cdp_url == cdp_url and getattr(already, "page_target_id", None) == page_target_id:
+            if already is not None and already.cdp_url == cdp_url and \
+                    (page_target_id is None or getattr(already, "page_target_id", None) == page_target_id):
                 supervisor.stop()
                 return already
             self._by_task[task_id] = supervisor
