@@ -443,8 +443,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         """Find (or create) a page target, attach flattened, enable domains, install dialog bridge."""
         targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
         pages = [t for t in targets if t.get("type") == "page"]
-        page_target = next((t for t in pages if self.page_target_id and t.get("targetId") == self.page_target_id),
-                           pages[0] if pages else None)
+        if self.page_target_id:  # the session's own tab or nothing: never attach to someone else's
+            page_target = next((t for t in pages if t.get("targetId") == self.page_target_id), None)
+            if page_target is None:
+                raise RuntimeError(f"session tab {self.page_target_id} is gone")
+        else:
+            page_target = pages[0] if pages else None
         if page_target is None:
             page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
         attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
