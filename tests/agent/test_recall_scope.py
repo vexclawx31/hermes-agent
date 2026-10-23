@@ -78,3 +78,20 @@ def test_enforcement_flag():
     assert enforcement_enabled({"privacy": {"recall_scope": "enforce"}})
     assert not enforcement_enabled({"privacy": {"recall_scope": "off"}})
     assert not enforcement_enabled({})
+
+
+def test_unreadable_config_keeps_the_last_known_answer(monkeypatch):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"privacy": {"recall_scope": "enforce"}})
+    assert enforcement_enabled()
+
+    def _boom():
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(config_mod, "load_config_readonly", _boom)
+    assert enforcement_enabled()  # an enforcing profile stays enforced
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {})
+    assert not enforcement_enabled()
+    monkeypatch.setattr(config_mod, "load_config_readonly", _boom)
+    assert not enforcement_enabled()  # a profile that never opted in is unaffected

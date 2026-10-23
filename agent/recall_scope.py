@@ -141,17 +141,25 @@ def scope_for_source(platform: Any, user_id: Any, chat_id: Any, chat_type: Any, 
 
 def enforcement_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
     """``privacy.recall_scope == "enforce"`` in the given or the active profile config."""
+    global _LAST_KNOWN_ENFORCEMENT
     if config is None:
         try:
             from hermes_cli.config import load_config_readonly
             config = load_config_readonly()
         except Exception:
-            # An unreadable config cannot prove enforcement is off; callers that only widen must not
-            # read this as "off". Report on so recall fails closed rather than open.
-            return True
+            # A transient read failure keeps this process's last known answer: an enforcing profile
+            # (read fine at startup) stays enforced, and a profile that never opted in is unaffected.
+            return _LAST_KNOWN_ENFORCEMENT
+        privacy = config.get("privacy") if isinstance(config, Mapping) else None
+        value = privacy.get("recall_scope") if isinstance(privacy, Mapping) else None
+        _LAST_KNOWN_ENFORCEMENT = isinstance(value, str) and value.strip().lower() == ENFORCE
+        return _LAST_KNOWN_ENFORCEMENT
     privacy = config.get("privacy") if isinstance(config, Mapping) else None
     value = privacy.get("recall_scope") if isinstance(privacy, Mapping) else None
     return isinstance(value, str) and value.strip().lower() == ENFORCE
+
+
+_LAST_KNOWN_ENFORCEMENT = False
 
 
 # ---------------------------------------------------------------------------
