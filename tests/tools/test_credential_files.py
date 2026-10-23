@@ -217,6 +217,19 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
             mounts = get_credential_file_mounts()
         assert [m["container_path"] for m in mounts] == ["/root/.hermes/service_token.json"]
 
+    def test_malformed_config_entry_does_not_drop_other_mounts(self, tmp_path):
+        home = self._home(tmp_path)
+        _authorize(home, ["bad\x00name.json", "service_token.json"])
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
+            assert [m["container_path"] for m in get_credential_file_mounts()] == ["/root/.hermes/service_token.json"]
+
+    def test_hardlinked_file_is_refused(self, tmp_path):
+        home = self._home(tmp_path)
+        os.link(home / "state.db", home / "linked.json")
+        _authorize(home, ["linked.json", "service_token.json"])
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
+            assert [m["container_path"] for m in get_credential_file_mounts()] == ["/root/.hermes/service_token.json"]
+
     def test_local_backend_reports_absolute_and_traversal_paths(self, tmp_path):
         home = self._home(tmp_path)
         with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "local"}):

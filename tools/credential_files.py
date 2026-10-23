@@ -142,7 +142,9 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
 
 
 def _is_relative_inside(rel: str) -> bool:
-    return bool(rel) and not posixpath.isabs(rel) and rel != ".." and not rel.startswith("../")
+    from pathlib import PureWindowsPath
+    return (bool(rel) and "\x00" not in rel and not posixpath.isabs(rel) and rel != ".." and not rel.startswith("../")
+            and not PureWindowsPath(rel).anchor)  # no drive letter or UNC share either
 
 
 def _config_authorized_paths() -> list[str]:
@@ -176,13 +178,18 @@ def _checked_config_file(rel: str, hermes_home: Path) -> Optional[Path]:
     """The host file for an authorized entry, or None. Checked on every call, so a file created after
     startup is picked up and a later swap is caught: the path must resolve to exactly HERMES_HOME/<rel>
     (no symlink in any component), be a regular file, and pass the master-store deny-list (fails closed).
-    The operator must still authorize only files the agent can't write: this check narrows, but doesn't
-    remove, the window between it and the mount."""
+    Docker binds the file when the container is created, so there a file created later needs a container
+    recreate; file-sync backends re-check on every sync. A hardlinked file (more than one link) is refused,
+    since it could be another store under an authorized name. The operator must still authorize only files the
+    agent can't write: this check narrows, but doesn't remove, the window between it and the mount."""
     expected = hermes_home.resolve() / rel
     try:
         if (hermes_home / rel).resolve(strict=True) != expected or not expected.is_file():
             return None
-    except (OSError, RuntimeError):
+        if expected.stat().st_nlink != 1:
+            logger.warning("credential_files: refused config entry %r — hardlinked file", rel)
+            return None
+    except (OSError, RuntimeError, ValueError):
         return None
     try:
         denied = get_read_block_error is None or bool(get_read_block_error(str(expected)))
