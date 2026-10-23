@@ -122,10 +122,10 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
             entry = entry.get("path") or entry.get("name") or ""
         elif not isinstance(entry, str):
             continue
-        rel_path = entry.strip()
-        if not rel_path:
+        if not entry.strip():
             continue
-        if posixpath.normpath(rel_path) not in authorized:
+        rel_path = posixpath.normpath(entry.strip())  # one spelling, so "./x" can't add a second mount
+        if rel_path not in authorized:
             logger.warning("credential_files: refused skill-declared %r — not listed in terminal.credential_files",
                            rel_path)
             missing.append(rel_path)
