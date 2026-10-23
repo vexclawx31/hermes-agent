@@ -63,6 +63,13 @@ def sender_metadata(event: Any, source: Any = None) -> dict[str, Any]:
         "message_id": str(message_id) if message_id else None,
         "trusted": not reasons,
     }
+    # Display name for readers' labels only (agent/recall_scope.py attribution): user-editable, so it
+    # never decides authorship; user_id does.
+    user_name = getattr(source, "user_name", None)
+    if user_name:
+        from gateway.session import neutralize_untrusted_inline_text
+        if name := neutralize_untrusted_inline_text(user_name, max_chars=80):
+            sender["name"] = name
     if reasons:
         sender["untrusted_reasons"] = reasons
     return {SENDER_METADATA_KEY: sender}

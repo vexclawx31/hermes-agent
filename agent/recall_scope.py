@@ -13,7 +13,10 @@ path by one of two means:
   from, the partition of the scope it was produced under: built-in memory files and provider banks per
   scope, sessions that begin under enforcement (older ones are replaced, never replayed), cron outputs
   that record their run's scope. Without a scope, a turn recalls nothing.
-Unenforced profiles keep their previous behaviour.
+Attribution only (``privacy.recall_scope: attribute``) keeps recall unpartitioned but labels who
+wrote each recalled item (summaries, session_search rows, provider memories) from the same trusted
+senders; what to surface to whom is left to the agent's judgement. Profiles with neither keep their
+previous behaviour.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 UNKNOWN_LABEL = "?"
 ENFORCE = "enforce"
+ATTRIBUTE = "attribute"
 WILDCARD = "*"
 DM_CHAT_TYPES = frozenset({"dm", "im"})
 
@@ -140,10 +144,36 @@ def scope_for_source(platform: Any, user_id: Any, chat_id: Any, chat_type: Any, 
     return RecallScope(frozenset({f"{p}:{WILDCARD}@{c}"}), origin="chat")
 
 
-def _configured(config: Mapping[str, Any]) -> bool:
+def _mode(config: Mapping[str, Any]) -> str:
+    """The configured ``privacy.recall_scope`` mode: ``enforce``, ``attribute`` or ``off``."""
     privacy = config.get("privacy") if isinstance(config, Mapping) else None
     value = privacy.get("recall_scope") if isinstance(privacy, Mapping) else None
-    return isinstance(value, str) and value.strip().lower() == ENFORCE
+    value = value.strip().lower() if isinstance(value, str) else ""
+    return value if value in (ENFORCE, ATTRIBUTE) else "off"
+
+
+def _configured(config: Mapping[str, Any]) -> bool:
+    return _mode(config) == ENFORCE
+
+
+def _active_mode() -> tuple[str, Optional[str]]:
+    """``(profile home, mode)`` of the active profile; mode is None when its config can't be read."""
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+    except Exception:
+        home = ""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_read_errors import FailedConfigRead
+        loaded = load_config_readonly()
+        if isinstance(loaded, FailedConfigRead):
+            return home, None
+    except Exception:
+        return home, None
+    mode = _mode(loaded)
+    _LAST_KNOWN_MODE[home] = mode
+    return home, mode
 
 
 def enforcement_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
@@ -154,31 +184,36 @@ def enforcement_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
     process keeps its last answer for that profile home (off for a profile that never opted in)."""
     if config is not None:
         return _configured(config)
-    try:
-        from hermes_constants import get_hermes_home
-        home = str(get_hermes_home())
-    except Exception:
-        home = ""
-    try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.config_read_errors import FailedConfigRead
-        loaded = load_config_readonly()
-        readable = not isinstance(loaded, FailedConfigRead)
-    except Exception:
-        loaded, readable = None, False
-    if not readable:
+    home, mode = _active_mode()
+    if mode is None:
         try:
             if _epoch_path(home or None).exists():
                 return True
         except Exception:
             return True
-        return _LAST_KNOWN_ENFORCEMENT.get(home, False)
-    _LAST_KNOWN_ENFORCEMENT[home] = _configured(loaded)
-    return _LAST_KNOWN_ENFORCEMENT[home]
+        return _LAST_KNOWN_MODE.get(home) == ENFORCE
+    return mode == ENFORCE
 
 
-# Last successfully read answer per profile home (a multiplexed gateway serves several).
-_LAST_KNOWN_ENFORCEMENT: dict[str, bool] = {}
+def attribution_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
+    """Speaker labels on recalled evidence: ``privacy.recall_scope`` is ``attribute`` or ``enforce``.
+
+    ``attribute`` labels who wrote each recalled item (summaries, session_search rows, provider
+    memories) from trusted persisted senders, without partitioning recall: the agent still recalls
+    across chats and decides by judgement what to surface to whom. An unreadable config keeps the
+    last answer for that profile home, and an enforcing profile always attributes."""
+    if config is not None:
+        return _mode(config) in (ENFORCE, ATTRIBUTE)
+    if enforcement_enabled():
+        return True
+    home, mode = _active_mode()
+    if mode is None:
+        mode = _LAST_KNOWN_MODE.get(home, "off")
+    return mode == ATTRIBUTE
+
+
+# Last successfully read mode per profile home (a multiplexed gateway serves several).
+_LAST_KNOWN_MODE: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +298,8 @@ def apply_turn_recall_scope(agent: Any) -> None:
     manager = getattr(agent, "_memory_manager", None)
     if manager is not None and hasattr(manager, "bind_recall_scope"):
         manager.bind_recall_scope(enforced, scope)
+    if manager is not None and hasattr(manager, "bind_attribution"):
+        manager.bind_attribution(enforced or attribution_enabled())
 
 
 class _UnprovableLineage(Exception):

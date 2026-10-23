@@ -2084,6 +2084,9 @@ display:
 #   # (session_search, memory providers, built-in MEMORY.md/USER.md, cron context_from, history
 #   # replay) to the turn's verified sender or chat, or a cron job's `recall_scope`; unattributed
 #   # history is never recalled and conversations that predate enforcement start fresh once.
+#   # "attribute" keeps recall across chats as with "off" but labels who wrote each recalled item
+#   # (compression summaries, session_search rows, memory providers) from verified senders; what to
+#   # share with whom is left to the agent's judgement.
 #   recall_scope: off
 
 # =============================================================================
