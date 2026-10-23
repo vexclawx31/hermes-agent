@@ -249,6 +249,26 @@ def test_switch_session_never_adopts_another_routes_conversation(home, monkeypat
     assert not store._foreign_route_under_recall_scope(JOINT_KEY, "jamal-dm")
 
 
+def test_a_copy_fork_carries_its_parents_route_and_epoch(home, monkeypatch):
+    # Review 4: an API fork / CLI branch copies the parent's transcript into an unkeyed row; the
+    # parent ends "branched". The fork must not launder the DM into another route, or an old
+    # conversation past the epoch.
+    from agent.recall_scope import session_lineage_predates_epoch, session_route_mismatch
+    _enforce(monkeypatch)
+    since = enforcement_epoch(True)
+    db = _SessionDB({
+        "jamal-dm": {"session_key": DM_KEY, "started_at": since + 1, "parent_session_id": None,
+                     "end_reason": "branched"},
+        "fork": {"session_key": None, "started_at": since + 2, "parent_session_id": "jamal-dm"},
+        "legacy": {"session_key": DM_KEY, "started_at": since - 100, "parent_session_id": None,
+                   "end_reason": "branched"},
+        "fork-of-legacy": {"session_key": None, "started_at": since + 3, "parent_session_id": "legacy"},
+    })
+    assert session_route_mismatch(db, "fork", JOINT_KEY)
+    assert not session_route_mismatch(db, "fork", DM_KEY)
+    assert session_lineage_predates_epoch(db, "fork-of-legacy")
+
+
 def test_resume_and_branch_are_refused_under_enforcement(monkeypatch):
     from gateway.slash_commands_session import _recall_scope_refusal
     _enforce(monkeypatch)

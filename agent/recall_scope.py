@@ -269,11 +269,15 @@ class _UnprovableLineage(Exception):
     pass
 
 
+# A compression child continues its parent's transcript and a branch (API fork, CLI /branch) copies
+# it, so their parents' rows are this conversation's too; a reset successor starts fresh.
+_HISTORY_CARRYING_END_REASONS = frozenset({"compression", "branched"})
+
+
 def _conversation_rows(session_db: Any, session_id: str, max_depth: int = 64) -> list[dict]:
-    """*session_id*'s row, then its compression ancestors: the rows whose transcript this
-    conversation replays. Only compression links are followed (the parent ended with
-    ``end_reason='compression'``); a reset or branch parent is a boundary, its rows are not this
-    conversation's. ``[]`` when the session doesn't exist yet; unprovable lineage raises."""
+    """*session_id*'s row, then the ancestors whose transcript it carries (compression continues
+    it, a branch copies it); a reset parent is a boundary, its rows are not this conversation's.
+    ``[]`` when the session doesn't exist yet; unprovable lineage raises."""
     rows: list[dict] = []
     current = str(session_id)
     for _ in range(max_depth):
@@ -289,7 +293,7 @@ def _conversation_rows(session_db: Any, session_id: str, max_depth: int = 64) ->
         parent_row = session_db.get_session(parent)
         if not parent_row:
             raise _UnprovableLineage(parent)
-        if parent_row.get("end_reason") != "compression":
+        if parent_row.get("end_reason") not in _HISTORY_CARRYING_END_REASONS:
             return rows
         current = parent
     raise _UnprovableLineage(session_id)
