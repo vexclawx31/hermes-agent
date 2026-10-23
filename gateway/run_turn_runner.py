@@ -1708,10 +1708,15 @@ class TurnRunner:
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
                                          "is_bot": bool(getattr(ctx.source, "is_bot", False))}
-                from agent.recall_scope import attribution_enabled
+                from agent.recall_scope import attribution_enabled, author_id_redactor
                 if attribution_enabled():
                     # Labels must not name this user for mixed text (merged senders, backfill, quotes).
                     kwargs["turn_author"]["verified"] = _turn_author_verified(ctx)
+                    # The id providers write into memory text: hashed where privacy.redact_pii applies.
+                    platform = getattr(ctx.source.platform, "value", ctx.source.platform)
+                    label_id = author_id_redactor()(platform, ctx.source.user_id)
+                    if label_id and label_id != ctx.source.user_id:
+                        kwargs["turn_author"]["label_id"] = label_id
             if ctx.title_user_message is not None:
                 kwargs["title_user_message"] = ctx.title_user_message
             if persist_user_message_override is not None:

@@ -77,6 +77,8 @@ def parse_turn_author(raw: Any, *, keep_verified: bool = False) -> Optional[dict
             return None
         if keep_verified and isinstance(raw.get("verified"), bool):
             author["verified"] = raw["verified"]
+            if label_id := _clean_text(raw.get("label_id")):
+                author["label_id"] = label_id  # privacy.redact_pii form of the id for memory labels
         origin = _clean_text(raw.get("origin"))
         if origin and author["id"] and author["id"].startswith("bot:") and "/" not in author["id"]:
             author["id"] = _clean_text(bot_author_id(author["id"][len("bot:"):], origin))

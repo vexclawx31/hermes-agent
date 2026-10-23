@@ -2146,7 +2146,7 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
-def _summary_author_label(msg: dict[str, Any]) -> str:
+def _summary_author_label(msg: dict[str, Any], redact: Any = None) -> str:
     """``platform:<id> verified, shown as <name>`` (name when known; display only) from a user row's persisted
     trusted sender, else ``author unknown``."""
     sender = msg.get("_sender")
@@ -2163,6 +2163,8 @@ def _summary_author_label(msg: dict[str, Any]) -> str:
     platform, user_id = str(sender.get("platform") or "").strip(), str(sender.get("user_id") or "").strip()
     if not platform or not user_id or any(ch in user_id for ch in "]\n"):
         return "author unknown"
+    if redact is not None:  # privacy.redact_pii: phone-number ids are hashed (agent/recall_scope.py)
+        user_id = redact(platform, user_id)
     name = " ".join(re.sub(r"[\[\]()<>:]", " ", str(sender.get("name") or "")).split())[:80]
     return f"{platform}:{user_id} verified, shown as {name}" if name else f"{platform}:{user_id} verified"
 
@@ -3518,8 +3520,9 @@ class ContextCompressor(
         """Serialize turns into a list of labeled, redacted records for the summarizer."""
         # Lazy import: agent_runtime_helpers pulls heavy transitive imports.
         from agent.agent_runtime_helpers import strip_think_blocks
-        from agent.recall_scope import attribution_enabled
+        from agent.recall_scope import attribution_enabled, author_id_redactor
         attribute = attribution_enabled()  # label authors from persisted sender metadata, never from text
+        redact = author_id_redactor() if attribute else None
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
@@ -3540,7 +3543,7 @@ class ContextCompressor(
                 content += "\n[Tool calls:\n" + "\n".join(map(self._render_tool_call_for_summary, msg["tool_calls"])) + "\n]"
             label = role.upper()
             if role == "user" and attribute:
-                label = f"USER {_summary_author_label(msg)}"
+                label = f"USER {_summary_author_label(msg, redact)}"
             parts.append(f"[{label}]: {content}")
         return parts
 

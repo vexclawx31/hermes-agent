@@ -212,6 +212,36 @@ def attribution_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
     return mode == ATTRIBUTE
 
 
+def author_id_redactor(config: Optional[Mapping[str, Any]] = None):
+    """``f(platform, user_id) -> str`` for attribution labels: the id, or ``user_<hash>`` where
+    ``privacy.redact_pii`` applies to that platform (gateway/session.py: phone-number platforms such
+    as WhatsApp and Signal), so labels never put raw phone numbers into prompts or memory text.
+    Reads the config once; call it once per serialization, not per row."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            config = load_config_readonly()
+        except Exception:
+            config = None
+    privacy = config.get("privacy") if isinstance(config, Mapping) else None
+    enabled = bool(privacy.get("redact_pii")) if isinstance(privacy, Mapping) else False
+
+    def redact(platform: Any, user_id: Any) -> str:
+        uid = str(user_id or "")
+        if not enabled or not uid:
+            return uid
+        try:
+            from gateway.config import Platform
+            from gateway.session import _hash_sender_id, _should_redact_pii
+            if _should_redact_pii(Platform(str(platform or "").strip().lower()), True):
+                return _hash_sender_id(uid)
+        except Exception:
+            return uid
+        return uid
+
+    return redact
+
+
 # Last successfully read mode per profile home (a multiplexed gateway serves several).
 _LAST_KNOWN_MODE: dict[str, str] = {}
 

@@ -112,6 +112,52 @@ def test_label_names_cannot_pose_as_ids_or_brackets(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# privacy.redact_pii: phone-number ids are hashed in every label
+# ---------------------------------------------------------------------------
+PHONE = "+33612345678"
+
+
+def _redacting(monkeypatch, on=True):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                        lambda: {"privacy": {"recall_scope": "attribute", "redact_pii": on}})
+
+
+def test_redactor_hashes_phone_platforms_only(monkeypatch):
+    from agent.recall_scope import author_id_redactor
+    from gateway.session import _hash_sender_id
+    _redacting(monkeypatch)
+    redact = author_id_redactor()
+    assert redact("whatsapp", PHONE) == _hash_sender_id(PHONE)
+    assert redact("slack", JAMAL) == JAMAL  # Slack needs raw ids for mentions
+    _redacting(monkeypatch, on=False)
+    assert author_id_redactor()("whatsapp", PHONE) == PHONE
+
+
+def test_summary_and_search_labels_never_show_a_redacted_phone_number(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _redacting(monkeypatch)
+    turn = {"role": "user", "content": "x", "display_metadata": {"sender": {
+        "platform": "whatsapp", "user_id": PHONE, "name": "Pauline", "trusted": True}}}
+    label = _compressor()._serialize_records_for_summary([turn])[0]
+    assert PHONE not in label and "whatsapp:user_" in label
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s_wa", source="whatsapp", user_id=PHONE)
+    db.append_message("s_wa", role="user", content="hello", display_metadata=turn["display_metadata"])
+    db._conn.commit()
+    out = json.loads(session_search(db=db, session_id="s_wa", enforce_scope=False))
+    assert out["messages"][0]["author"]["user_id"].startswith("user_")
+    assert PHONE not in json.dumps(out["messages"][0]["author"])
+
+
+def test_turn_author_label_id_only_from_the_gateway():
+    from agent.turn_author import parse_turn_author
+    raw = {"id": PHONE, "name": "P", "verified": True, "label_id": "user_0123456789ab"}
+    assert parse_turn_author(raw, keep_verified=True)["label_id"] == "user_0123456789ab"
+    assert "label_id" not in parse_turn_author(raw)
+
+
+# ---------------------------------------------------------------------------
 # turn_author.verified: the gateway's trusted-sender flag, never client-supplied
 # ---------------------------------------------------------------------------
 def test_turn_author_verified_only_from_the_gateway():
