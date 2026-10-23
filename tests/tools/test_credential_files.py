@@ -44,11 +44,11 @@ class TestRegisterCredentialFiles:
         (hermes_home / "token.json").write_text("{}")
         _authorize(hermes_home, ["token.json"])
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files([{"path": "token.json"}])
+            mounts = get_credential_file_mounts()  # mounts are per active profile
 
         assert missing == []
-        mounts = get_credential_file_mounts()
         assert len(mounts) == 1
         assert mounts[0]["host_path"] == str(hermes_home / "token.json")
         assert mounts[0]["container_path"] == "/root/.hermes/token.json"
@@ -61,13 +61,13 @@ class TestRegisterCredentialFiles:
         (hermes_home / "real.json").write_text("{}")
         _authorize(hermes_home, ["real.json"])
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files([
                 {"path": "real.json", "name": "wrong.json"},
             ])
+            mounts = get_credential_file_mounts()
 
         assert missing == []
-        mounts = get_credential_file_mounts()
         assert "real.json" in mounts[0]["container_path"]
 
 
@@ -812,7 +812,7 @@ class TestMasterCredentialStoresAreNeverMountable:
     def test_refused_entry_does_not_block_the_rest_of_the_batch(self, tmp_path):
         home = self._home(tmp_path)
         _authorize(home, [".env", "google_token.json"])
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files([".env", "google_token.json"])
             mounts = get_credential_file_mounts()
 

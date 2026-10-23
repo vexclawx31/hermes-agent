@@ -54,11 +54,11 @@ class TestGoogleWorkspaceCredentialFiles:
             fm = _parse_frontmatter(content)
             entries = fm.get("required_credential_files", [])
 
-            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "docker"}):
                 missing = register_credential_files(entries)
+                mounts = get_credential_file_mounts()
 
             assert missing == [], f"Unexpected missing files: {missing}"
-            mounts = get_credential_file_mounts()
             container_paths = {m["container_path"] for m in mounts}
             assert "/root/.hermes/google_token.json" in container_paths
             assert "/root/.hermes/google_client_secret.json" in container_paths
