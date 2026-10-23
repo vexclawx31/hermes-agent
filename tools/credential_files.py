@@ -107,57 +107,115 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
 
 
 def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> list[str]:
-    """Register skill-frontmatter entries (str or dict with ``path``); return missing paths."""
+    """Check skill-frontmatter entries (str or dict with ``path``); return the ones the skill won't get.
+
+    A skill can't authorize its own mounts: skills are written by the agent itself (``skill_manage``) or
+    installed from the hub, and any HERMES_HOME file outside the master-store deny-list (``state.db``,
+    ``config.yaml``, a CLI's token cache) would otherwise be bind-mounted into the sandbox the skill's
+    code runs in. On a sandboxed backend only paths the operator lists in ``terminal.credential_files``
+    are available; they're checked again whenever mounts are built (see ``get_credential_file_mounts``).
+    Anything else is reported back so the skill shows setup-needed. The local backend mounts nothing:
+    only absent (or non-relative) files are reported.
+    """
+    local = _terminal_backend() in ("local", "")
+    home = get_hermes_home()
+    authorized = set(_config_authorized_paths())
     missing = []
     for entry in entries:
         if isinstance(entry, dict):
             entry = entry.get("path") or entry.get("name") or ""
         elif not isinstance(entry, str):
             continue
-        rel_path = entry.strip()
-        if rel_path and not register_credential_file(rel_path, container_base):
+        if not entry.strip():
+            continue
+        rel_path = posixpath.normpath(entry.strip())  # one spelling, matching the config side
+        if local:
+            if not _is_relative_inside(rel_path) or not (home / rel_path).is_file():
+                missing.append(rel_path)
+        elif rel_path not in authorized:
+            logger.warning("credential_files: %r is not available in the sandbox — list it in "
+                           "terminal.credential_files", rel_path)
+            missing.append(rel_path)
+        elif _checked_config_file(rel_path, home) is None:
             missing.append(rel_path)
     return missing
 
 
-def _load_config_files() -> list[dict[str, str]]:
-    """Load ``terminal.credential_files`` from config.yaml (cached per profile home: the
-    multiplexed gateway must never mount the launch profile's credential files into a
-    secondary profile's sandbox)."""
+def _is_relative_inside(rel: str) -> bool:
+    from pathlib import PureWindowsPath
+    return (bool(rel) and "\x00" not in rel and not posixpath.isabs(rel) and rel != ".." and not rel.startswith("../")
+            and not PureWindowsPath(rel).anchor)  # no drive letter or UNC share either
+
+
+def _config_authorized_paths() -> list[str]:
+    """Normalized HERMES_HOME-relative paths from ``terminal.credential_files`` (cached per profile home:
+    the multiplexed gateway must never mount the launch profile's files into a secondary profile's sandbox).
+    Only the names are cached; the files themselves are checked whenever mounts are built."""
     from hermes_constants import hermes_home_key
     home_key = hermes_home_key()
     cached = _config_files.get(home_key)
     if cached is not None:
         return cached
-
-    result: list[dict[str, str]] = []
+    result: list[str] = []
     try:
         from hermes_cli.config import read_raw_config
-        hermes_home = get_hermes_home()
         cred_files = cfg_get(read_raw_config(), "terminal", "credential_files")
         for item in cred_files if isinstance(cred_files, list) else []:
-            rel = item.strip() if isinstance(item, str) else ""
-            if not rel:
+            rel = posixpath.normpath(item.strip()) if isinstance(item, str) and item.strip() else ""
+            if not _is_relative_inside(rel):
+                if rel:
+                    logger.warning("credential_files: rejected config path %r (must be relative to HERMES_HOME)", rel)
                 continue
-            resolved_path = _contained_host_path(
-                rel, hermes_home,
-                "credential_files: rejected absolute config path %r",
-                "credential_files: rejected config path traversal %r (%s)")
-            if resolved_path is not None and resolved_path.is_file():
-                result.append(_mount(resolved_path, f"/root/.hermes/{rel}"))
+            if rel not in result:
+                result.append(rel)
     except Exception as e:
         logger.warning("Could not read terminal.credential_files from config: %s", e)
-
     _config_files[home_key] = result
     return result
 
 
+def _checked_config_file(rel: str, hermes_home: Path) -> Optional[Path]:
+    """The host file for an authorized entry, or None. Checked on every call, so a file created after
+    startup is picked up and a later swap is caught: the path must resolve to exactly HERMES_HOME/<rel>
+    (no symlink in any component), be a regular file, and pass the master-store deny-list (fails closed).
+    Docker binds the file when the container is created, so there a file created later needs a container
+    recreate; file-sync backends re-check on every sync. A hardlinked file (more than one link) is refused,
+    since it could be another store under an authorized name. The operator must still authorize only files the
+    agent can't write: this check narrows, but doesn't remove, the window between it and the mount."""
+    expected = hermes_home.resolve() / rel
+    try:
+        if (hermes_home / rel).resolve(strict=True) != expected or not expected.is_file():
+            return None
+        if expected.stat().st_nlink != 1:
+            logger.warning("credential_files: refused config entry %r — hardlinked file", rel)
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    try:
+        denied = get_read_block_error is None or bool(get_read_block_error(str(expected)))
+    except Exception:
+        logger.exception("credential_files: read guard raised for config entry %r", rel)
+        denied = True
+    if denied:
+        logger.warning("credential_files: refused config entry %r — a credential store the agent "
+                       "is denied from reading, or the guard is unavailable", rel)
+        return None
+    return expected
+
+
+def _load_config_files() -> list[dict[str, str]]:
+    """Config-authorized credential files that currently pass the checks, as mount dicts."""
+    home = get_hermes_home()
+    return [_mount(path, f"/root/.hermes/{rel}") for rel in _config_authorized_paths()
+            if (path := _checked_config_file(rel, home)) is not None]
+
+
 def get_credential_file_mounts() -> list[dict[str, str]]:
-    """Skill-registered + config credential files as ``host_path``/``container_path`` dicts (re-checked for existence)."""
+    """Skill-registered + config credential files as ``host_path``/``container_path`` dicts (re-checked on each call)."""
     mounts = {cp: hp for cp, hp in _get_registered().items() if Path(hp).is_file()}
     for entry in _load_config_files():
         cp, hp = entry["container_path"], entry["host_path"]
-        if cp not in mounts and Path(hp).is_file():
+        if cp not in mounts:
             mounts[cp] = hp
     return [_mount(hp, cp) for cp, hp in mounts.items()]
 
