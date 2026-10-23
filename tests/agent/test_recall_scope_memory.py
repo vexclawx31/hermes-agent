@@ -191,25 +191,70 @@ def test_undrainable_backlog_withholds_recall_for_the_turn():
     assert manager._recall_providers() == [] and scoped.bound[-1] == (None, True)
 
 
-def test_replay_requires_every_keyed_session_in_the_lineage_to_be_this_route(home, monkeypatch):
+DM_KEY, JOINT_KEY = "agent:calix:slack:dm:DJAMAL0001", "agent:calix:slack:group:CJOINT0001"
+
+
+def test_route_check_covers_the_compression_lineage_only(home, monkeypatch):
     from agent.recall_scope import session_route_mismatch
     _enforce(monkeypatch)
-    dm, joint = "agent:calix:slack:dm:DJAMAL0001", "agent:calix:slack:group:CJOINT0001"
     db = _SessionDB({
-        "jamal-dm": {"session_key": dm, "parent_session_id": None},
-        "jamal-child": {"session_key": None, "parent_session_id": "jamal-dm"},  # compression bookkeeping
-        "branch-into-joint": {"session_key": joint, "parent_session_id": "jamal-dm"},
-        "orphan": {"session_key": dm, "parent_session_id": "missing"},
+        "jamal-dm": {"session_key": DM_KEY, "parent_session_id": None, "end_reason": "compression"},
+        "jamal-child": {"session_key": DM_KEY, "parent_session_id": "jamal-dm"},  # compression child
+        "rekeyed-child": {"session_key": JOINT_KEY, "parent_session_id": "jamal-dm"},  # compressed, then moved
+        "orphan": {"session_key": DM_KEY, "parent_session_id": "missing"},
     })
-    assert not session_route_mismatch(db, "jamal-dm", dm)
-    assert not session_route_mismatch(db, "jamal-child", dm)
-    assert session_route_mismatch(db, "jamal-dm", joint)  # Jamal's DM resumed in a joint channel
-    assert session_route_mismatch(db, "jamal-child", joint)
-    assert session_route_mismatch(db, "branch-into-joint", joint)  # its parent is Jamal's DM
-    assert session_route_mismatch(db, "orphan", dm)  # unprovable lineage
-    assert not session_route_mismatch(db, "not-created-yet", dm)
+    assert not session_route_mismatch(db, "jamal-dm", DM_KEY)
+    assert not session_route_mismatch(db, "jamal-child", DM_KEY)
+    assert session_route_mismatch(db, "jamal-dm", JOINT_KEY)  # a DM conversation served on a joint route
+    assert session_route_mismatch(db, "jamal-child", JOINT_KEY)
+    assert session_route_mismatch(db, "rekeyed-child", JOINT_KEY)  # its compressed history is the DM's
+    assert session_route_mismatch(db, "orphan", DM_KEY)  # unprovable lineage
+    assert not session_route_mismatch(db, "not-created-yet", DM_KEY)
     _enforce(monkeypatch, on=False)
-    assert not session_route_mismatch(db, "jamal-dm", joint)
+    assert not session_route_mismatch(db, "jamal-dm", JOINT_KEY)
+
+
+def test_reset_and_branch_successors_start_their_own_conversation(home, monkeypatch):
+    # R1: a reset/branch successor's parent didn't end by compression, so its rows aren't replayed
+    # and must not condemn the successor forever.
+    from agent.recall_scope import session_lineage_predates_epoch, session_route_mismatch
+    _enforce(monkeypatch)
+    since = enforcement_epoch(True)
+    thread_key = DM_KEY + ":thread:1700000000.000100"
+    db = _SessionDB({
+        "legacy": {"session_key": DM_KEY, "started_at": since - 100, "parent_session_id": None,
+                   "end_reason": "recall_scope_enforced"},
+        "successor": {"session_key": DM_KEY, "started_at": since + 1, "parent_session_id": "legacy"},
+        "channel": {"session_key": JOINT_KEY, "started_at": since + 2, "parent_session_id": None},
+        "thread-branch": {"session_key": thread_key, "started_at": since + 3, "parent_session_id": "channel"},
+    })
+    assert not session_lineage_predates_epoch(db, "successor")
+    assert not session_route_mismatch(db, "successor", DM_KEY)
+    assert not session_route_mismatch(db, "thread-branch", thread_key)
+
+
+def test_switch_session_never_adopts_another_routes_conversation(home, monkeypatch):
+    from gateway.session import SessionStore
+    _enforce(monkeypatch)
+    db = _SessionDB({"jamal-dm": {"session_key": DM_KEY, "parent_session_id": None},
+                     "joint-old": {"session_key": JOINT_KEY, "parent_session_id": None},
+                     "unkeyed": {"session_key": None, "parent_session_id": None}})
+    store = SessionStore.__new__(SessionStore)
+    store._db_for_key = lambda key: db
+    assert store._foreign_route_under_recall_scope(JOINT_KEY, "jamal-dm")
+    assert not store._foreign_route_under_recall_scope(JOINT_KEY, "joint-old")
+    assert not store._foreign_route_under_recall_scope(JOINT_KEY, "unkeyed")  # e.g. a model-switch child
+    assert store.switch_session(JOINT_KEY, "jamal-dm") is None
+    _enforce(monkeypatch, on=False)
+    assert not store._foreign_route_under_recall_scope(JOINT_KEY, "jamal-dm")
+
+
+def test_resume_and_branch_are_refused_under_enforcement(monkeypatch):
+    from gateway.slash_commands_session import _recall_scope_refusal
+    _enforce(monkeypatch)
+    assert "turned off" in _recall_scope_refusal("/resume") and "turned off" in _recall_scope_refusal("/branch")
+    _enforce(monkeypatch, on=False)
+    assert _recall_scope_refusal("/resume") is None
 
 
 def test_an_unscoped_turn_does_not_change_what_the_next_turn_may_replay(home, monkeypatch):
@@ -227,14 +272,14 @@ def test_lineage_check_follows_parents_to_the_root(home, monkeypatch):
     _enforce(monkeypatch)
     since = enforcement_epoch(True)
     db = _SessionDB({
-        "legacy": {"started_at": since - 100, "parent_session_id": None},
+        "legacy": {"started_at": since - 100, "parent_session_id": None, "end_reason": "compression"},
         "child-of-legacy": {"started_at": since + 5, "parent_session_id": "legacy"},
-        "fresh": {"started_at": since + 1, "parent_session_id": None},
+        "fresh": {"started_at": since + 1, "parent_session_id": None, "end_reason": "compression"},
         "child-of-fresh": {"started_at": since + 9, "parent_session_id": "fresh"},
         "orphan": {"started_at": since + 9, "parent_session_id": "missing"},
     })
     assert session_lineage_predates_epoch(db, "legacy")
-    assert session_lineage_predates_epoch(db, "child-of-legacy")  # a resumed/compressed old conversation
+    assert session_lineage_predates_epoch(db, "child-of-legacy")  # an old conversation compressed after the epoch
     assert not session_lineage_predates_epoch(db, "fresh")
     assert not session_lineage_predates_epoch(db, "child-of-fresh")
     assert session_lineage_predates_epoch(db, "orphan")  # unprovable lineage fails closed

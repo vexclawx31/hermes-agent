@@ -265,62 +265,64 @@ def apply_turn_recall_scope(agent: Any) -> None:
         manager.bind_recall_scope(enforced, scope)
 
 
-def session_lineage_predates_epoch(session_db: Any, session_id: str, *, max_depth: int = 64) -> bool:
-    """True when enforcement is on and *session_id*'s lineage root started before the epoch.
+class _UnprovableLineage(Exception):
+    pass
 
-    Covers every way an old conversation can come back besides routing (/resume, /branch, a
-    compression child of an old session). Unreadable lineage counts as old: fail closed."""
-    if not enforcement_enabled():
+
+def _conversation_rows(session_db: Any, session_id: str, max_depth: int = 64) -> list[dict]:
+    """*session_id*'s row, then its compression ancestors: the rows whose transcript this
+    conversation replays. Only compression links are followed (the parent ended with
+    ``end_reason='compression'``); a reset or branch parent is a boundary, its rows are not this
+    conversation's. ``[]`` when the session doesn't exist yet; unprovable lineage raises."""
+    rows: list[dict] = []
+    current = str(session_id)
+    for _ in range(max_depth):
+        row = session_db.get_session(current)
+        if not row:
+            if rows:
+                raise _UnprovableLineage(current)
+            return rows
+        rows.append(row)
+        parent = row.get("parent_session_id")
+        if not parent or parent == current:
+            return rows
+        parent_row = session_db.get_session(parent)
+        if not parent_row:
+            raise _UnprovableLineage(parent)
+        if parent_row.get("end_reason") != "compression":
+            return rows
+        current = parent
+    raise _UnprovableLineage(session_id)
+
+
+def session_lineage_predates_epoch(session_db: Any, session_id: str) -> bool:
+    """True when enforcement is on and *session_id*'s conversation (its compression lineage) began
+    before the epoch. A session that replaced an old one (reset) starts its own conversation.
+    Unreadable lineage counts as old: fail closed."""
+    if not enforcement_enabled() or session_db is None or not session_id:
         return False
     try:
         since = enforcement_epoch(True)
+        rows = _conversation_rows(session_db, session_id)
     except Exception:
         return True
-    if since is None or session_db is None or not session_id:
-        return session_db is not None and bool(session_id)
-    current, started = str(session_id), None
-    try:
-        for depth in range(max_depth):
-            row = session_db.get_session(current)
-            if not row:
-                # The session itself not existing yet means nothing to replay; a missing ancestor
-                # means its lineage can't be proven.
-                return depth > 0
-            started = row.get("started_at")
-            parent = row.get("parent_session_id")
-            if not parent or parent == current:
-                break
-            current = parent
-        else:
-            return True
-    except Exception:
-        return True
+    if not rows:
+        return False
+    started = rows[-1].get("started_at")
     return not isinstance(started, (int, float)) or started < since
 
 
-def session_route_mismatch(session_db: Any, session_id: str, route_key: Optional[str], *,
-                           max_depth: int = 64) -> bool:
+def session_route_mismatch(session_db: Any, session_id: str, route_key: Optional[str]) -> bool:
     """True when enforcement is on and *session_id*'s conversation belongs to another route.
 
-    A gateway route key (``sessions.session_key``) is fixed when a session row is created and names
-    its audience (a DM's person, a shared chat), so a conversation resumed or branched into another
-    chat is caught here. Rows without a key (compression bookkeeping) don't vote. Unreadable lineage
-    counts as a mismatch."""
+    Every row of the conversation (its compression lineage) must carry *route_key*. The commands
+    that move a conversation to another route (/resume, /branch) are refused under enforcement
+    (gateway/slash_commands_session.py), so a key only differs for state made before enforcement or
+    by another writer; unreadable lineage counts as a mismatch."""
     if not enforcement_enabled() or session_db is None or not session_id:
         return False
-    current = str(session_id)
     try:
-        for depth in range(max_depth):
-            row = session_db.get_session(current)
-            if not row:
-                return depth > 0
-            key = row.get("session_key")
-            if key and key != route_key:
-                return True
-            parent = row.get("parent_session_id")
-            if not parent or parent == current:
-                return False
-            current = parent
+        rows = _conversation_rows(session_db, session_id)
     except Exception:
         return True
-    return True
+    return any(row.get("session_key") and row.get("session_key") != route_key for row in rows)
