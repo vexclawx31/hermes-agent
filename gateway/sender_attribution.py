@@ -87,5 +87,10 @@ def trusted_turn_scope(source: Any):
     if str(getattr(source, "user_id", "") or "") != str(ingress.user_id or "") or \
             str(getattr(source, "chat_id", "") or "") != str(ingress.chat_id or ""):
         return None
-    return scope_for_source(ingress.platform, ingress.user_id, ingress.chat_id, ingress.chat_type,
+    chat_type = ingress.chat_type
+    # Slack types group DMs (mpim) as "dm" too, but only a one-to-one IM (a "D…" channel) has a
+    # single reader: anything else gets its chat's scope, never one participant's private scope.
+    if str(ingress.platform).lower() == "slack" and not str(ingress.chat_id or "").startswith("D"):
+        chat_type = "group"
+    return scope_for_source(ingress.platform, ingress.user_id, ingress.chat_id, chat_type,
                             is_bot=bool(getattr(source, "is_bot", False)))

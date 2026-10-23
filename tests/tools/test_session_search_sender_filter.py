@@ -26,7 +26,10 @@ def _sender(user_id, chat_id=CHAN, *, thread_reply=False, trusted=True, platform
 
 
 @pytest.fixture
-def db(tmp_path):
+def db(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # the enforcement epoch file lands here
+    from agent.recall_scope import enforcement_epoch
+    enforcement_epoch(True, tmp_path, now=time.time() - 86400)  # enforcement began before these rows
     db = SessionDB(tmp_path / "state.db")
     now = int(time.time())
     # Shared channel session: Alice opened it, Bob posts in it too.
@@ -222,6 +225,27 @@ def test_enforced_read_browse_and_scroll(db):
     bob_row = db._conn.execute("SELECT id FROM messages WHERE session_id='s_bob'").fetchone()[0]
     scroll = _call(db, session_id="s_bob", around_message_id=bob_row, enforce_scope=True, recall_scope=ALICE_DM)
     assert scroll["success"] is False
+
+
+def test_enforced_read_hides_how_much_others_wrote(db):
+    read = _call(db, session_id="s_shared", enforce_scope=True, recall_scope=ALICE_DM)
+    assert "omitted_messages" not in read
+    assert "omitted_messages" in _call(db, session_id="s_shared", **ALICE_FILTER)
+
+
+def test_enforced_refuses_other_profiles(db):
+    out = _call(db, query="lasagna", enforce_scope=True, recall_scope=ALICE_DM, profile="other")
+    assert out["success"] is False and "another profile" in out["error"]
+    out = _call(db, session_id="other/s_shared", enforce_scope=True, recall_scope=ALICE_DM)
+    assert out["success"] is False and "another profile" in out["error"]
+
+
+def test_enforced_never_returns_rows_from_before_the_epoch(db, tmp_path):
+    from agent.recall_scope import enforcement_epoch
+    enforcement_epoch(False, tmp_path)  # enforcement off, then on again later: a new epoch
+    enforcement_epoch(True, tmp_path, now=time.time() + 3600)  # every fixture row predates it
+    out = _call(db, query="lasagna", enforce_scope=True, recall_scope=ALICE_DM, limit=10)
+    assert _all_contents(out) == []
 
 
 def test_enforcement_defaults_from_profile_config(db, monkeypatch):

@@ -1,9 +1,8 @@
-"""Recall scope: provenance ⊆ scope, unknown provenance never matches (agent/recall_scope.py)."""
+"""Recall scope: labels, scopes, containment and the trusted turn scope (agent/recall_scope.py)."""
 import pytest
 
 from agent.recall_scope import (
-    UNKNOWN_LABEL, enforcement_enabled, make_label, message_provenance, messages_provenance,
-    normalize_pattern, provenance_from_metadata, provenance_metadata, scope_for_source, scope_from_patterns,
+    UNKNOWN_LABEL, enforcement_enabled, make_label, normalize_pattern, scope_for_source, scope_from_patterns,
     sender_label,
 )
 
@@ -57,21 +56,46 @@ def test_labels_and_sender_metadata():
     assert sender_label(None) == UNKNOWN_LABEL
 
 
-def test_message_provenance_inherits_and_taints():
-    rows = [
-        {"role": "user", "content": "hi", "display_metadata": _sender(J, JOINT)},
-        {"role": "assistant", "content": "relaying Pauline"},
-        {"role": "user", "content": "x", "display_metadata": _sender(P, JOINT)},
-    ]
-    assert messages_provenance(rows) == {f"slack:{J}@{JOINT}", f"slack:{P}@{JOINT}"}
-    assert message_provenance({"role": "user", "content": "legacy"}) == {UNKNOWN_LABEL}
-    assert message_provenance({"role": "user", "_compressed_summary": True, "content": "s"}) == {UNKNOWN_LABEL}
-    summary = {"role": "user", "_compressed_summary": True, "display_metadata": provenance_metadata(
-        {f"slack:{J}@{DM_J}"})}
-    assert message_provenance(summary) == {f"slack:{J}@{DM_J}"}
-    assert provenance_metadata(()) == {"provenance": [UNKNOWN_LABEL]}
-    assert provenance_from_metadata({"provenance": []}) is None
-    assert provenance_from_metadata({"provenance": [3]}) == {UNKNOWN_LABEL}
+def test_scope_containment_and_partitions():
+    jamal_anywhere = scope_from_patterns([f"slack:{J}@*"])
+    jamal_joint = scope_from_patterns([f"slack:{J}@{JOINT}"])
+    joint = scope_from_patterns([f"slack:{J}@{JOINT}", f"slack:{P}@{JOINT}"])
+    assert jamal_anywhere.covers(jamal_joint) and not jamal_joint.covers(jamal_anywhere)
+    assert joint.covers(jamal_joint) and not jamal_anywhere.covers(joint)
+    assert jamal_anywhere.partition() != joint.partition()
+    assert jamal_anywhere.partition() == scope_from_patterns([f"slack:{J}@*"], origin="cron").partition()
+
+
+class _Ingress:
+    def __init__(self, user_id, chat_id, chat_type="dm"):
+        self.platform, self.user_id, self.chat_id, self.chat_type = "slack", user_id, chat_id, chat_type
+
+
+class _Source:
+    def __init__(self, user_id, chat_id, is_bot=False):
+        self.platform, self.user_id, self.chat_id, self.is_bot = "slack", user_id, chat_id, is_bot
+
+
+def _turn_scope(monkeypatch, ingress, source):
+    import gateway.ingress_identity as ingress_mod
+    from gateway.sender_attribution import trusted_turn_scope
+    monkeypatch.setattr(ingress_mod, "get_trusted_ingress", lambda: ingress)
+    return trusted_turn_scope(source)
+
+
+def test_trusted_turn_scope_one_to_one_dm_vs_group_dm(monkeypatch):
+    dm = _turn_scope(monkeypatch, _Ingress(J, DM_J), _Source(J, DM_J))
+    assert dm.patterns == {f"slack:{J}@*"}
+    # Slack types a group DM (mpim) as "dm" too: it must get the chat's scope, not Jamal's.
+    group_dm = _turn_scope(monkeypatch, _Ingress(J, "GMPIM00001"), _Source(J, "GMPIM00001"))
+    assert group_dm.patterns == {"slack:*@GMPIM00001"}
+
+
+def test_trusted_turn_scope_requires_matching_native_ingress(monkeypatch):
+    assert _turn_scope(monkeypatch, None, _Source(J, DM_J)) is None
+    assert _turn_scope(monkeypatch, _Ingress(J, DM_J), _Source(P, DM_J)) is None  # source claims another sender
+    assert _turn_scope(monkeypatch, _Ingress(J, DM_J), _Source(J, "DOTHER0001")) is None
+    assert _turn_scope(monkeypatch, _Ingress(J, DM_J), _Source(J, DM_J, is_bot=True)) is None
 
 
 def test_enforcement_flag():
@@ -95,3 +119,17 @@ def test_unreadable_config_keeps_the_last_known_answer(monkeypatch):
     assert not enforcement_enabled()
     monkeypatch.setattr(config_mod, "load_config_readonly", _boom)
     assert not enforcement_enabled()  # a profile that never opted in is unaffected
+
+
+def test_defaults_fallback_on_a_broken_config_is_not_an_off_switch(tmp_path, monkeypatch):
+    import hermes_cli.config as config_mod
+    from hermes_cli.config_read_errors import FailedConfigRead
+    from agent.recall_scope import enforcement_epoch
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    broken = FailedConfigRead({"privacy": {"recall_scope": "off"}}, error=ValueError("bad yaml"))
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: broken)
+    assert not enforcement_enabled()  # never enforced here, no epoch: unaffected
+    enforcement_epoch(True, tmp_path, now=10.0)
+    assert enforcement_enabled()  # an enforcing profile (epoch on disk) stays enforced
+    assert (tmp_path / "state" / "recall_scope_epoch.json").exists()

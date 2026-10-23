@@ -982,6 +982,9 @@ def build_cache_parity_fork(
     # indistinguishable from live turns (#118693).
     review_agent._turn_origin = write_origin
     review_agent._memory_store = agent._memory_store
+    # The shared store is bound to the parent's recall-scope partition: the fork binds the same
+    # scope, or its turn start would rebind (and blank) the parent's memory (agent/recall_scope.py).
+    review_agent._recall_scope = getattr(agent, "_recall_scope", None)
     review_agent._memory_enabled = agent._memory_enabled
     review_agent._user_profile_enabled = agent._user_profile_enabled
     review_agent._memory_nudge_interval = review_agent._skill_nudge_interval = 0

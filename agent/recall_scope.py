@@ -1,18 +1,19 @@
-"""Recall scope: which stored evidence a turn may recall, decided by provenance.
+"""Recall scope: which stored evidence a turn may recall.
 
-Every recallable item (a transcript row, a memory entry, a provider document, a compression summary,
-a cron output) carries a *provenance*: the set of ``platform:user_id@chat_id`` labels of everyone whose
-words could have shaped it. A user row's provenance is its trusted persisted sender
-(gateway/sender_attribution.py); anything produced inside a turn inherits the provenance of the whole
-context that produced it, so assistant text that relays one participant still carries that participant.
+A *label* ``platform:user_id@chat_id`` names who wrote something and where. A turn's *scope* is a set
+of label patterns (``slack:U1@*`` = that person anywhere, ``slack:*@C1`` = that chat), built by core from
+trusted transport provenance (gateway/sender_attribution.py) or a cron job's declared ``recall_scope``,
+never from model arguments, message text or display names. Unknown authors never match.
 
-A turn's *scope* is a set of allowed label patterns (``slack:U1@*``, ``slack:*@C1``, ``slack:U1@C1``),
-built by core from trusted transport provenance or a cron job's declared ``recall_scope``, never from
-model arguments, message text or display names. An item is eligible iff its provenance is non-empty,
-contains no unknown label and every label matches a pattern. Unknown provenance never matches.
-
-Enforcement is opt-in per profile (``privacy.recall_scope: enforce``); without it every caller keeps
-its previous behaviour.
+Enforcement (``privacy.recall_scope: enforce``, opt-in per profile) applies the scope on every recall
+path by one of two means:
+- per message: session_search returns only user rows whose trusted persisted sender is in scope;
+- per partition: everything DERIVED inside a turn (assistant text, memory entries, provider documents,
+  summaries, cron outputs) can carry any participant's words, so it is stored in, and read back only
+  from, the partition of the scope it was produced under: built-in memory files and provider banks per
+  scope, sessions that begin under enforcement (older ones are replaced, never replayed), cron outputs
+  that record their run's scope. Without a scope, a turn recalls nothing.
+Unenforced profiles keep their previous behaviour.
 """
 
 from __future__ import annotations
@@ -139,31 +140,49 @@ def scope_for_source(platform: Any, user_id: Any, chat_id: Any, chat_type: Any, 
     return RecallScope(frozenset({f"{p}:{WILDCARD}@{c}"}), origin="chat")
 
 
-def enforcement_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
-    """``privacy.recall_scope == "enforce"`` in the given or the active profile config."""
-    global _LAST_KNOWN_ENFORCEMENT
-    if config is None:
-        try:
-            from hermes_cli.config import load_config_readonly
-            config = load_config_readonly()
-        except Exception:
-            # A transient read failure keeps this process's last known answer: an enforcing profile
-            # (read fine at startup) stays enforced, and a profile that never opted in is unaffected.
-            return _LAST_KNOWN_ENFORCEMENT
-        privacy = config.get("privacy") if isinstance(config, Mapping) else None
-        value = privacy.get("recall_scope") if isinstance(privacy, Mapping) else None
-        _LAST_KNOWN_ENFORCEMENT = isinstance(value, str) and value.strip().lower() == ENFORCE
-        return _LAST_KNOWN_ENFORCEMENT
+def _configured(config: Mapping[str, Any]) -> bool:
     privacy = config.get("privacy") if isinstance(config, Mapping) else None
     value = privacy.get("recall_scope") if isinstance(privacy, Mapping) else None
     return isinstance(value, str) and value.strip().lower() == ENFORCE
 
 
-_LAST_KNOWN_ENFORCEMENT = False
+def enforcement_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
+    """``privacy.recall_scope == "enforce"`` in the given or the active profile config.
+
+    An unreadable config (an exception, or the defaults-only ``FailedConfigRead`` fallback) never
+    turns enforcement off: the profile counts as enforcing while its epoch file exists, else this
+    process keeps its last answer for that profile home (off for a profile that never opted in)."""
+    if config is not None:
+        return _configured(config)
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+    except Exception:
+        home = ""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_read_errors import FailedConfigRead
+        loaded = load_config_readonly()
+        readable = not isinstance(loaded, FailedConfigRead)
+    except Exception:
+        loaded, readable = None, False
+    if not readable:
+        try:
+            if _epoch_path(home or None).exists():
+                return True
+        except Exception:
+            return True
+        return _LAST_KNOWN_ENFORCEMENT.get(home, False)
+    _LAST_KNOWN_ENFORCEMENT[home] = _configured(loaded)
+    return _LAST_KNOWN_ENFORCEMENT[home]
+
+
+# Last successfully read answer per profile home (a multiplexed gateway serves several).
+_LAST_KNOWN_ENFORCEMENT: dict[str, bool] = {}
 
 
 # ---------------------------------------------------------------------------
-# Provenance of stored items
+# Message-level attribution
 # ---------------------------------------------------------------------------
 
 def sender_label(display_metadata: Any) -> str:
@@ -177,53 +196,6 @@ def sender_label(display_metadata: Any) -> str:
     if not isinstance(sender, Mapping) or sender.get("trusted") is not True:
         return UNKNOWN_LABEL
     return make_label(sender.get("platform"), sender.get("user_id"), sender.get("chat_id"))
-
-
-def message_provenance(message: Mapping[str, Any]) -> frozenset[str]:
-    """Provenance a single transcript message contributes.
-
-    A user row contributes its trusted sender or unknown. A row that already carries a recorded
-    ``provenance`` (summaries, injected recall) contributes it. Assistant, tool and system rows add
-    nothing of their own: they were produced from the same context."""
-    if not isinstance(message, Mapping):
-        return frozenset({UNKNOWN_LABEL})
-    recorded = provenance_from_metadata(message.get("display_metadata"))
-    if recorded is not None:
-        return recorded
-    if message.get("role") == "user":
-        if message.get("_compressed_summary"):
-            return frozenset({UNKNOWN_LABEL})
-        return frozenset({sender_label(message.get("display_metadata"))})
-    return frozenset()
-
-
-def messages_provenance(messages: Iterable[Mapping[str, Any]]) -> frozenset[str]:
-    """Union of every message's provenance: the provenance of anything produced from *messages*."""
-    labels: set[str] = set()
-    for message in messages or ():
-        labels |= message_provenance(message)
-    return frozenset(labels)
-
-
-PROVENANCE_METADATA_KEY = "provenance"
-
-
-def provenance_metadata(provenance: Iterable[str]) -> dict[str, Any]:
-    """``{"provenance": [...]}`` for a derived row's ``display_metadata``."""
-    return {PROVENANCE_METADATA_KEY: sorted(frozenset(provenance or ()) or {UNKNOWN_LABEL})}
-
-
-def provenance_from_metadata(display_metadata: Any) -> Optional[frozenset[str]]:
-    """A derived row's recorded provenance; None when it records none."""
-    if isinstance(display_metadata, str):
-        try:
-            display_metadata = json.loads(display_metadata)
-        except (TypeError, ValueError):
-            return None
-    raw = display_metadata.get(PROVENANCE_METADATA_KEY) if isinstance(display_metadata, Mapping) else None
-    if not isinstance(raw, list):
-        return None
-    return frozenset(label if isinstance(label, str) and label else UNKNOWN_LABEL for label in raw) or None
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +280,12 @@ def session_lineage_predates_epoch(session_db: Any, session_id: str, *, max_dept
         return session_db is not None and bool(session_id)
     current, started = str(session_id), None
     try:
-        for _ in range(max_depth):
+        for depth in range(max_depth):
             row = session_db.get_session(current)
             if not row:
-                return True
+                # The session itself not existing yet means nothing to replay; a missing ancestor
+                # means its lineage can't be proven.
+                return depth > 0
             started = row.get("started_at")
             parent = row.get("parent_session_id")
             if not parent or parent == current:

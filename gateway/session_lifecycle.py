@@ -94,7 +94,15 @@ class SessionLifecycleMixin:
         (agent/recall_scope.py), replaces a routed conversation; time never does."""
         if entry.suspended:
             return "suspended"
-        return "recall_scope_enforced" if _predates_recall_scope_epoch(entry) else None
+        if _predates_recall_scope_epoch(entry):
+            return "recall_scope_enforced"
+        # A new route entry can still point at an old conversation (adopted, recovered, resumed):
+        # judge the conversation's lineage too, so it is replaced once instead of replayed empty.
+        from agent.recall_scope import session_lineage_predates_epoch
+        db = self._db_for_key(entry.session_key)
+        if db is not None and session_lineage_predates_epoch(db, entry.session_id):
+            return "recall_scope_enforced"
+        return None
 
     def _update_entry(self, session_key: str, mutate) -> bool:
         """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing

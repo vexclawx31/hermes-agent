@@ -1033,9 +1033,28 @@ def cronjob(
         handler = _JOB_ACTIONS.get(normalized)
         if handler is None:
             return tool_error(f"Unknown cron action '{action}'", success=False)
+        if refusal := _scoped_job_refusal(job, normalized, a):
+            return refusal
         return handler(job, a)
     except Exception as e:
         return tool_error(str(e), success=False)
+
+
+def _scoped_job_refusal(job: dict[str, Any], action: str, a: dict[str, Any]) -> Optional[str]:
+    """A job that declares ``recall_scope`` runs with that person's or chat's recall
+    (agent/recall_scope.py), so under enforcement the model may not repoint it: no edits,
+    no removal and no extra run prompt. It is managed in jobs.json by its owner instead."""
+    if not job.get("recall_scope"):
+        return None
+    from agent.recall_scope import enforcement_enabled
+    if not enforcement_enabled():
+        return None
+    if action in ("update", "remove") or (action in ("run", "run_now", "trigger") and a.get("prompt")):
+        return tool_error(
+            f"Job '{job.get('id')}' has a recall scope (sender attribution is enforced): it can be "
+            "listed and run as configured, but not changed, removed or given an extra prompt here.",
+            success=False)
+    return None
 
 
 def _script_description(home: str) -> str:

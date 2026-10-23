@@ -589,13 +589,15 @@ _SENDER_BROWSE_SCAN = 60
 class _SenderFilter:
     """Model-chosen sender filters, intersected with the turn's enforced recall scope when there is one.
     ``platform``/``user_id`` are None only under a scope (agent/recall_scope.py), which then decides alone."""
-    __slots__ = ("chat_id", "platform", "require_unthreaded", "scope", "user_id")
+    __slots__ = ("chat_id", "min_timestamp", "platform", "require_unthreaded", "scope", "user_id")
 
     def __init__(self, platform: Optional[str], user_id: Optional[str], chat_id: Optional[str],
                  require_unthreaded: bool, scope: Any = None):
         self.platform, self.user_id, self.chat_id = platform, user_id, chat_id
         self.require_unthreaded = require_unthreaded
         self.scope = scope
+        # Under a scope: rows written before enforcement began are legacy and never returned.
+        self.min_timestamp: Optional[float] = None
 
     def describe(self) -> dict[str, Any]:
         out = {"sender_platform": self.platform, "sender_user_id": self.user_id,
@@ -645,8 +647,10 @@ def _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, requir
         if err:
             return None, err
         if flt is None:
-            return _SenderFilter(None, None, None, False, scope=recall_scope), None
+            flt = _SenderFilter(None, None, None, False)
         flt.scope = recall_scope
+        from agent.recall_scope import enforcement_epoch
+        flt.min_timestamp = enforcement_epoch(True)
         return flt, None
     def _s(v):
         return v.strip() if isinstance(v, str) else ("" if v is None else str(v).strip())
@@ -677,7 +681,9 @@ def _sender_rows(db, session_id: str, flt: "_SenderFilter") -> list[dict[str, An
                 "THEN json_extract(display_metadata, '$.sender.user_id') END) ORDER BY id",
                 (session_id, flt.user_id)).fetchall()
     rows = [dict(r) for r in _q()]
-    return [r for r in rows if flt.matches(r.get("display_metadata"))]
+    floor = flt.min_timestamp
+    return [r for r in rows if flt.matches(r.get("display_metadata"))
+            and (floor is None or (isinstance(r.get("timestamp"), (int, float)) and r["timestamp"] >= floor))]
 
 
 def _count_session_messages(db, session_id: str) -> int:
@@ -785,7 +791,9 @@ def _sender_read(db, session_id: str, flt: "_SenderFilter", head: int = 20, tail
     total, truncated = len(shaped), len(shaped) > head + tail
     return _ok(mode="read", session_id=session_id, link=_session_link(session_id, link_profile),
                session_meta=_sender_meta_block(meta), message_count=total, truncated=truncated,
-               omitted_messages=max(_count_session_messages(db, session_id) - total, 0),
+               # Under a recall scope, how many messages others wrote is itself out of scope.
+               **({} if flt.scope is not None else
+                  {"omitted_messages": max(_count_session_messages(db, session_id) - total, 0)}),
                messages=shaped[:head] + shaped[-tail:] if truncated else shaped,
                sender_filter=flt.describe(), attribution_note=_SENDER_NOTE)
 
@@ -865,6 +873,9 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+    if sender is not None and sender.scope is not None and isinstance(profile, str) and profile.strip():
+        return tool_error("session_search can't read another profile while sender attribution is enforced "
+                          "on this one", success=False)
     # Cross-profile: swap in the named profile's DB (read-only) for every shape;
     # current-lineage guards key off ids that won't collide, so they stay inert.
     try:
@@ -919,6 +930,9 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
     if enforce_scope is None:
         from agent.recall_scope import enforcement_enabled
         enforce_scope = enforcement_enabled()
+    if enforce_scope and isinstance(profile, str) and profile.strip():
+        return tool_error("session_search can't read another profile while sender attribution is enforced "
+                          "on this one", success=False)
     sender, sender_err = _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded,
                                               recall_scope=recall_scope, enforce_scope=enforce_scope)
     if sender_err:

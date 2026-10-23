@@ -904,6 +904,11 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_cwd = runtime_host_value(prompt, "Current working directory")
     if stored_cwd and stored_cwd != str(resolve_agent_cwd()):
         return False
+    # A memory block built for another recall-scope partition (or before enforcement) must never
+    # be replayed into this turn (agent/recall_scope.py); the stored and current values must agree.
+    from agent.system_prompt import recall_scope_trailer_value
+    if (identity_line_value(prompt, "Recall scope") or None) != recall_scope_trailer_value(agent):
+        return False
     # Platform is deliberately NOT an identity field: a surface switch does not invalidate the
     # stored bytes, it only makes their interface section out of date, and that is corrected by
     # agent.surface_switch.stage_surface_switch_note without touching the cached prefix (#104414).

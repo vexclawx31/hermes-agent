@@ -410,6 +410,7 @@ class MemoryManager:
         # Recall scope (agent/recall_scope.py), bound per turn by bind_recall_scope().
         self._recall_scope_enforced: bool = False
         self._recall_scope: Any = None
+        self._recall_scope_key: tuple[bool, Optional[str]] = (False, None)
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
         # the builtin-only path spawns no threads; one worker serializes a provider's writes.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
@@ -515,6 +516,16 @@ class MemoryManager:
         """Set the turn's recall scope (agent/recall_scope.py). Under enforcement only providers that
         declare ``supports_recall_scope`` recall anything, and only when the turn has a scope; each
         such provider is handed the scope (``bind_recall_scope``) and enforces it on every read path."""
+        key = (bool(enforced), scope.key() if scope is not None and hasattr(scope, "key") else None)
+        if key != self._recall_scope_key:
+            # Earlier turns' queued syncs ran under the old scope: they must reach the old
+            # partition before providers switch. If they can't drain, recall nothing this turn.
+            if not self.flush_pending(timeout=10.0) and enforced:
+                logger.warning("Memory sync backlog did not drain before a recall-scope change; "
+                               "withholding provider memory for this turn")
+                scope = None
+                key = (True, None)
+            self._recall_scope_key = key
         self._recall_scope_enforced, self._recall_scope = bool(enforced), scope
         for provider in self._providers:
             if getattr(provider, "supports_recall_scope", False):

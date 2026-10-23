@@ -141,6 +141,56 @@ class _SessionDB:
         return self.rows.get(session_id)
 
 
+def test_a_fork_sharing_the_store_with_the_same_scope_leaves_it_bound(home, monkeypatch):
+    _enforce(monkeypatch)
+    store = MemoryStore()
+    parent = SimpleNamespace(_recall_scope=J_DM, _memory_store=store, _memory_manager=None, _cached_system_prompt="p")
+    apply_turn_recall_scope(parent)
+    store.add("user", "Jamal likes tea")
+    fork = SimpleNamespace(_recall_scope=parent._recall_scope, _memory_store=store, _memory_manager=None,
+                           _cached_system_prompt="f")
+    apply_turn_recall_scope(fork)
+    assert store._scope_partition == J_DM.partition() and store.user_entries == ["Jamal likes tea"]
+    assert fork._cached_system_prompt == "f"  # no rebind, no invalidation
+
+
+def test_prompt_trailer_names_the_partition_and_a_mismatch_is_not_restored(home, monkeypatch):
+    from agent.system_prompt import recall_scope_trailer_value
+    store = MemoryStore()
+    agent = SimpleNamespace(_memory_store=store)
+    assert recall_scope_trailer_value(agent) is None  # unenforced: no trailer line at all
+    store.bind_recall_scope(True, J_DM)
+    assert recall_scope_trailer_value(agent) == J_DM.partition()
+    store.bind_recall_scope(True, None)
+    assert recall_scope_trailer_value(agent) == "none"
+
+
+def test_scoped_store_refuses_to_stage_writes(home):
+    from tools.memory_tool import _scoped_staging_refusal
+    store = MemoryStore()
+    assert _scoped_staging_refusal(store) is None
+    store.bind_recall_scope(True, J_DM)
+    assert "can't be staged" in json.loads(_scoped_staging_refusal(store))["error"]
+
+
+def test_scope_change_drains_queued_syncs_first():
+    order = []
+    manager = _manager(_Provider("scoped", scoped=True))
+    manager.flush_pending = lambda timeout=None: order.append("drain") or True
+    manager.bind_recall_scope(True, J_DM)
+    manager.bind_recall_scope(True, J_DM)  # same scope: no drain
+    manager.bind_recall_scope(True, JOINT)
+    assert order == ["drain", "drain"]
+
+
+def test_undrainable_backlog_withholds_recall_for_the_turn():
+    scoped = _Provider("scoped", scoped=True)
+    manager = _manager(scoped)
+    manager.flush_pending = lambda timeout=None: False
+    manager.bind_recall_scope(True, J_DM)
+    assert manager._recall_providers() == [] and scoped.bound[-1] == (None, True)
+
+
 def test_lineage_check_follows_parents_to_the_root(home, monkeypatch):
     from agent.recall_scope import session_lineage_predates_epoch
     _enforce(monkeypatch)
@@ -157,5 +207,6 @@ def test_lineage_check_follows_parents_to_the_root(home, monkeypatch):
     assert not session_lineage_predates_epoch(db, "fresh")
     assert not session_lineage_predates_epoch(db, "child-of-fresh")
     assert session_lineage_predates_epoch(db, "orphan")  # unprovable lineage fails closed
+    assert not session_lineage_predates_epoch(db, "not-created-yet")  # nothing to replay
     _enforce(monkeypatch, on=False)
     assert not session_lineage_predates_epoch(db, "legacy")
