@@ -4093,6 +4093,7 @@ Use this exact structure:
 
 {_template_sections}"""
 
+        prompt += self._speaker_attribution_rule()
         # Focus guidance goes last so it takes precedence.
         if focus_topic:
             prompt += f"""
@@ -4100,6 +4101,20 @@ Use this exact structure:
 FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
         return prompt
+
+    @staticmethod
+    def _speaker_attribution_rule() -> str:
+        """Under recall-scope enforcement (agent/recall_scope.py), keep speakers distinct; "" otherwise."""
+        from agent.recall_scope import enforcement_enabled
+        if not enforcement_enabled():
+            return ""
+        return (
+            "\n\nSPEAKER ATTRIBUTION: Several people may write in this conversation. A user turn that starts "
+            "with \"[Name | Slack user <@ID>]\" was written by that person; attribute its statements, "
+            "preferences and decisions to that name and ID, and keep each person's statements separate. "
+            "Never merge people or restate one person's words as another's or as \"the user's\". A user "
+            "turn without that prefix in a conversation with several people has an unknown author: write "
+            "\"(author unknown)\" rather than attributing it.")
 
     @staticmethod
     def _temporal_anchoring_rule() -> str:
