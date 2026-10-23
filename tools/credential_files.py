@@ -107,15 +107,19 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
 
 
 def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> list[str]:
-    """Register skill-frontmatter entries (str or dict with ``path``); return missing or refused paths.
+    """Check skill-frontmatter entries (str or dict with ``path``); return the ones the skill won't get.
 
     A skill can't authorize its own mounts: skills are written by the agent itself (``skill_manage``) or
     installed from the hub, and any HERMES_HOME file outside the master-store deny-list (``state.db``,
     ``config.yaml``, a CLI's token cache) would otherwise be bind-mounted into the sandbox the skill's
-    code runs in. Only paths the operator lists verbatim in ``terminal.credential_files`` are registered;
-    anything else is reported back as missing so the skill shows setup-needed.
+    code runs in. On a sandboxed backend only paths the operator lists in ``terminal.credential_files``
+    are available, and they're mounted from that config entry (resolved once when config loads), never
+    re-resolved here, so a later symlink swap can't change what gets mounted. Anything else is reported
+    back so the skill shows setup-needed. The local backend mounts nothing: only absent files are reported.
     """
-    authorized = _config_authorized_paths()
+    local = _terminal_backend() in ("local", "")
+    authorized = set() if local else _config_authorized_paths()
+    home = get_hermes_home()
     missing = []
     for entry in entries:
         if isinstance(entry, dict):
@@ -124,12 +128,13 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
             continue
         if not entry.strip():
             continue
-        rel_path = posixpath.normpath(entry.strip())  # one spelling, so "./x" can't add a second mount
-        if rel_path not in authorized:
-            logger.warning("credential_files: refused skill-declared %r — not listed in terminal.credential_files",
-                           rel_path)
-            missing.append(rel_path)
-        elif not register_credential_file(rel_path, container_base):
+        rel_path = posixpath.normpath(entry.strip())  # one spelling, matching the config side
+        if local:
+            if not (home / rel_path).is_file():
+                missing.append(rel_path)
+        elif rel_path not in authorized:
+            logger.warning("credential_files: %r is not available in the sandbox — list it in "
+                           "terminal.credential_files (takes effect after a restart)", rel_path)
             missing.append(rel_path)
     return missing
 
@@ -157,7 +162,7 @@ def _load_config_files() -> list[dict[str, str]]:
         hermes_home = get_hermes_home()
         cred_files = cfg_get(read_raw_config(), "terminal", "credential_files")
         for item in cred_files if isinstance(cred_files, list) else []:
-            rel = item.strip() if isinstance(item, str) else ""
+            rel = posixpath.normpath(item.strip()) if isinstance(item, str) and item.strip() else ""
             if not rel:
                 continue
             resolved_path = _contained_host_path(
@@ -166,8 +171,13 @@ def _load_config_files() -> list[dict[str, str]]:
                 "credential_files: rejected config path traversal %r (%s)")
             if resolved_path is None or not resolved_path.is_file():
                 continue
-            # The operator's list gets the same master-store deny-list as skills (fails closed).
-            if get_read_block_error is None or get_read_block_error(str(resolved_path)):
+            # The operator's list gets the same master-store deny-list as skills; fails closed per entry.
+            try:
+                denied = get_read_block_error is None or bool(get_read_block_error(str(resolved_path)))
+            except Exception:
+                logger.exception("credential_files: read guard raised for config entry %r", rel)
+                denied = True
+            if denied:
                 logger.warning("credential_files: refused config entry %r — a credential store the agent "
                                "is denied from reading, or the guard is unavailable", rel)
                 continue
