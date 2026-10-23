@@ -1054,7 +1054,7 @@ def build_turn_context(
     install_safe_stdio()
 
     # Reset first: a cached gateway agent must never carry the previous turn's bot author into a human turn.
-    turn_author = parse_turn_author(turn_author)
+    turn_author = parse_turn_author(turn_author, keep_verified=True)
     agent._turn_author = turn_author
     # Before the system prompt (built-in memory block) and any recall: bind the turn's recall scope.
     from agent.recall_scope import apply_turn_recall_scope

@@ -1072,7 +1072,7 @@ DEFAULT_CONFIG = {
 
     "privacy": {
         "redact_pii": False,  # hash user IDs and strip phone numbers from LLM context
-        "recall_scope": "off",  # "enforce": per-turn sender scope on every recall path (agent/recall_scope.py)
+        "recall_scope": "off",  # "attribute": label recalled authors; "enforce": per-turn sender scope on every recall path (agent/recall_scope.py)
     },
     # Text-to-speech. Each provider accepts an optional `max_text_length:` override for the
     # per-request input-character cap; omit to use the provider's documented limit (OpenAI 4096, xAI

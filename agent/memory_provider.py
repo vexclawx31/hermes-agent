@@ -161,6 +161,11 @@ class MemoryProvider(ABC):
     def bind_recall_scope(self, scope: Any, *, enforced: bool) -> None:
         """The turn's :class:`agent.recall_scope.RecallScope` (None = recall nothing when enforced)."""
 
+    def bind_attribution(self, enabled: bool) -> None:
+        """``privacy.recall_scope: attribute`` (or ``enforce``) for this turn: label who wrote what the
+        provider stores from the ``turn_author`` given to ``sync_turn``, and never present one person's
+        words as another's. Called every turn before recall; recall stays unpartitioned."""
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Per-turn tick. kwargs may include remaining_tokens, model, platform, tool_count, author_id, author_name,
         author_is_bot. The author trio names who wrote THIS turn (None, None, False without one): a shared session

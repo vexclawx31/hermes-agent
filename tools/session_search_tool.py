@@ -8,6 +8,7 @@ READ (``session_id`` alone; whole session or head/tail), BROWSE (no args).
 No LLM calls — every shape returns actual DB messages.
 """
 
+import contextvars
 import json
 import logging
 import re
@@ -234,6 +235,26 @@ def _is_compacted_message(db, message_id) -> bool:
     return _is_compacted_state(_get_message_storage_state(db, message_id))
 
 
+# Set per session_search call under ``privacy.recall_scope: attribute`` (agent/recall_scope.py) to the
+# call's author-id redactor: every shaped user row then names its author from the persisted trusted sender.
+_ATTRIBUTE_AUTHORS: contextvars.ContextVar[Any] = contextvars.ContextVar("session_search_attribute", default=None)
+
+
+def _author_tag(m: dict[str, Any], redact: Any = None) -> dict[str, Any]:
+    """Who wrote a stored user row: its trusted persisted sender, else ``{"verified": False}``.
+    Display names and text prefixes in the content never count."""
+    meta = m.get("display_metadata")
+    if isinstance(meta, str):
+        meta = _quiet(lambda: json.loads(meta), {}, "sender metadata decode failed")
+    sender = meta.get("sender") if isinstance(meta, dict) else None
+    if not isinstance(sender, dict) or sender.get("trusted") is not True or not sender.get("user_id"):
+        return {"verified": False}
+    user_id = redact(sender.get("platform"), sender.get("user_id")) if redact else sender.get("user_id")
+    tag = {"platform": sender.get("platform"), "user_id": user_id, "name": sender.get("name"),
+           "chat_type": sender.get("chat_type"), "verified": True}
+    return {k: v for k, v in tag.items() if v is not None}
+
+
 def _shape_message(m: dict[str, Any], anchor_id: Optional[int] = None,
                    max_content_len: Optional[int] = None) -> dict[str, Any]:
     """Slim a message row; keeps ``content`` even when empty (tool-call-only turns)."""
@@ -248,6 +269,8 @@ def _shape_message(m: dict[str, Any], anchor_id: Optional[int] = None,
     if max_content_len and content and len(content) > max_content_len:
         entry.update(content=content[:max_content_len] + "…", content_truncated=True,
                      original_content_chars=len(content))
+    if m.get("role") == "user" and (redact := _ATTRIBUTE_AUTHORS.get()) is not None:
+        entry["author"] = _author_tag(m, redact)
     return {k: v for k, v in entry.items() if v is not None or k == "content"}
 
 
@@ -703,6 +726,7 @@ def _shape_sender_message(row: dict[str, Any], anchor_id: Optional[int] = None,
         meta = _quiet(lambda: json.loads(meta), {}, "sender metadata decode failed")
     sender = dict((meta or {}).get("sender") or {})
     sender.pop("untrusted_reasons", None)
+    sender.pop("name", None)  # display name: shown only in attribution's author tag
     entry["sender"] = sender
     entry["attribution"] = "verified_sender"
     return entry
@@ -944,11 +968,16 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
         if db is None:
             return tool_error(format_session_db_unavailable(), success=False)
         owned_dbs.append(db)
+    # Enforced searches already return each row's verified sender (_shape_sender_message).
+    from agent.recall_scope import attribution_enabled, author_id_redactor
+    attribute = not enforce_scope and _quiet(attribution_enabled, False, "attribution mode check failed")
+    attribute_token = _ATTRIBUTE_AUTHORS.set(author_id_redactor() if attribute else None)
     try:
         return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                          around_message_id, window, sort, profile, detail, owned_dbs,
                          after=after, before=before, exclude_session_ids=exclude_session_ids, sender=sender)
     finally:
+        _ATTRIBUTE_AUTHORS.reset(attribute_token)
         for owned_db in reversed(owned_dbs):
             _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
 

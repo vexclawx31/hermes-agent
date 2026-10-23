@@ -534,6 +534,16 @@ class MemoryManager:
                 except Exception as e:
                     logger.warning("Memory provider '%s' bind_recall_scope failed: %s", provider.name, e)
 
+    def bind_attribution(self, enabled: bool) -> None:
+        """Tell every provider whether this turn labels authors (agent/recall_scope.py attribution)."""
+        for provider in self._providers:
+            bind = getattr(provider, "bind_attribution", None)
+            if callable(bind):
+                try:
+                    bind(bool(enabled))
+                except Exception as e:
+                    logger.warning("Memory provider '%s' bind_attribution failed: %s", provider.name, e)
+
     def _recall_allowed(self, provider: MemoryProvider) -> bool:
         """Whether *provider* may serve recall (prefetch, tools, pre-compress insights) this turn."""
         if not self._recall_scope_enforced:
