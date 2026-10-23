@@ -1067,12 +1067,11 @@ def build_turn_context(
         conversation_history = recovered_history
     # A conversation that began before recall-scope enforcement holds unattributed history:
     # never replay it to the model, however the session came back (agent/recall_scope.py).
-    # Nor one built under another recall scope (resumed or branched into another audience).
-    from agent.recall_scope import session_lineage_predates_epoch, session_scope_mismatch
-    from agent.system_prompt import recall_scope_trailer_value
+    # Nor one that belongs to another route (resumed or branched into another audience).
+    from agent.recall_scope import session_lineage_predates_epoch, session_route_mismatch
     _db, _sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", "")
-    if conversation_history and (session_lineage_predates_epoch(_db, _sid) or session_scope_mismatch(
-            _db, _sid, recall_scope_trailer_value(agent))):
+    if conversation_history and (session_lineage_predates_epoch(_db, _sid) or session_route_mismatch(
+            _db, _sid, getattr(agent, "_gateway_session_key", None))):
         conversation_history = []
 
     # Tag log records on this thread with the session ID for ``hermes logs``; bind the

@@ -775,7 +775,8 @@ def _sender_discover(db, query: str, flt: "_SenderFilter", limit: int, sort: Opt
         results.append(entry)
     return _discover_payload(db, query, detail, results, sessions_searched=len(seen),
                              sender_filter=flt.describe(), attribution_note=_SENDER_NOTE,
-                             omitted_unverified_hits=unverified_hits)
+                             # Under a scope, whether others wrote a match is itself out of scope.
+                             **({} if flt.scope is not None else {"omitted_unverified_hits": unverified_hits}))
 
 
 def _sender_read(db, session_id: str, flt: "_SenderFilter", head: int = 20, tail: int = 10,

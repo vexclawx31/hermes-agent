@@ -1042,18 +1042,18 @@ def cronjob(
 
 def _scoped_job_refusal(job: dict[str, Any], action: str, a: dict[str, Any]) -> Optional[str]:
     """A job that declares ``recall_scope`` runs with that person's or chat's recall
-    (agent/recall_scope.py), so under enforcement the model may not repoint it: no edits,
-    no removal and no extra run prompt. It is managed in jobs.json by its owner instead."""
+    (agent/recall_scope.py), so under enforcement the model may not repoint or trigger it: no
+    edits, removal or manual runs. It is managed in jobs.json by its owner instead."""
     if not job.get("recall_scope"):
         return None
     from agent.recall_scope import enforcement_enabled
     if not enforcement_enabled():
         return None
-    if action in ("update", "remove") or (action in ("run", "run_now", "trigger") and a.get("prompt")):
+    if action in ("update", "remove", "run", "run_now", "trigger"):
+        # A run's output comes back into the conversation that triggered it, whatever its audience.
         return tool_error(
             f"Job '{job.get('id')}' has a recall scope (sender attribution is enforced): it can be "
-            "listed and run as configured, but not changed, removed or given an extra prompt here.",
-            success=False)
+            "listed here, but not run, changed or removed; it runs on its schedule.", success=False)
     return None
 
 

@@ -191,24 +191,35 @@ def test_undrainable_backlog_withholds_recall_for_the_turn():
     assert manager._recall_providers() == [] and scoped.bound[-1] == (None, True)
 
 
-def test_replay_requires_the_conversation_to_be_built_under_this_scope(home, monkeypatch):
-    from agent.recall_scope import session_scope_mismatch
+def test_replay_requires_every_keyed_session_in_the_lineage_to_be_this_route(home, monkeypatch):
+    from agent.recall_scope import session_route_mismatch
     _enforce(monkeypatch)
-    jamal, joint = J_DM.partition(), JOINT.partition()
+    dm, joint = "agent:calix:slack:dm:DJAMAL0001", "agent:calix:slack:group:CJOINT0001"
     db = _SessionDB({
-        "jamal-dm": {"system_prompt": f"...\n\nModel: m\nRecall scope: {jamal}", "parent_session_id": None},
-        "jamal-child": {"system_prompt": None, "parent_session_id": "jamal-dm"},  # compression child
-        "legacy": {"system_prompt": "...\n\nModel: m", "parent_session_id": None},
-        "no-prompt": {"system_prompt": None, "parent_session_id": None},
+        "jamal-dm": {"session_key": dm, "parent_session_id": None},
+        "jamal-child": {"session_key": None, "parent_session_id": "jamal-dm"},  # compression bookkeeping
+        "branch-into-joint": {"session_key": joint, "parent_session_id": "jamal-dm"},
+        "orphan": {"session_key": dm, "parent_session_id": "missing"},
     })
-    assert not session_scope_mismatch(db, "jamal-dm", jamal)
-    assert not session_scope_mismatch(db, "jamal-child", jamal)
-    assert session_scope_mismatch(db, "jamal-dm", joint)  # Jamal's DM resumed into a joint audience
-    assert session_scope_mismatch(db, "jamal-child", joint)
-    assert session_scope_mismatch(db, "legacy", jamal)
-    assert session_scope_mismatch(db, "no-prompt", jamal)
+    assert not session_route_mismatch(db, "jamal-dm", dm)
+    assert not session_route_mismatch(db, "jamal-child", dm)
+    assert session_route_mismatch(db, "jamal-dm", joint)  # Jamal's DM resumed in a joint channel
+    assert session_route_mismatch(db, "jamal-child", joint)
+    assert session_route_mismatch(db, "branch-into-joint", joint)  # its parent is Jamal's DM
+    assert session_route_mismatch(db, "orphan", dm)  # unprovable lineage
+    assert not session_route_mismatch(db, "not-created-yet", dm)
     _enforce(monkeypatch, on=False)
-    assert not session_scope_mismatch(db, "jamal-dm", joint)
+    assert not session_route_mismatch(db, "jamal-dm", joint)
+
+
+def test_an_unscoped_turn_does_not_change_what_the_next_turn_may_replay(home, monkeypatch):
+    # The route key is fixed at session creation: no turn (scoped or not) can rewrite it.
+    from agent.recall_scope import session_route_mismatch
+    _enforce(monkeypatch)
+    dm = "agent:calix:slack:dm:DJAMAL0001"
+    db = _SessionDB({"jamal-dm": {"session_key": dm, "parent_session_id": None,
+                                  "system_prompt": "...\n\nRecall scope: none"}})
+    assert not session_route_mismatch(db, "jamal-dm", dm)
 
 
 def test_lineage_check_follows_parents_to_the_root(home, monkeypatch):

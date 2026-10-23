@@ -27,9 +27,15 @@ def test_scoped_job_cannot_be_repointed(enforce, action, args):
     assert out["success"] is False and "recall scope" in out["error"]
 
 
-def test_scoped_job_can_still_run_as_configured(enforce):
-    assert _scoped_job_refusal(SCOPED, "run", {"prompt": ""}) is None
-    assert _scoped_job_refusal(SCOPED, "run_now", {}) is None
+@pytest.mark.parametrize("action", ["run", "run_now", "trigger"])
+def test_scoped_job_cannot_be_triggered_by_the_model_even_unchanged(enforce, action):
+    # Its output would come back into the triggering conversation, whatever that audience is.
+    out = json.loads(_scoped_job_refusal(SCOPED, action, {}))
+    assert out["success"] is False and "runs on its schedule" in out["error"]
+
+
+def test_listing_is_not_refused(enforce):
+    assert _scoped_job_refusal(SCOPED, "list", {}) is None
 
 
 def test_unscoped_jobs_and_unenforced_profiles_are_unaffected(monkeypatch):
