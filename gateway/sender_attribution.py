@@ -66,3 +66,26 @@ def sender_metadata(event: Any, source: Any = None) -> dict[str, Any]:
     if reasons:
         sender["untrusted_reasons"] = reasons
     return {SENDER_METADATA_KEY: sender}
+
+
+def trusted_turn_scope(source: Any):
+    """The recall scope of a live turn (agent/recall_scope.py), or None when its sender is not proven.
+
+    Only a native-ingress receipt (gateway/ingress_identity.py) that names this same sender and chat
+    proves it; routing hints, restored sources and display names never do."""
+    from agent.recall_scope import scope_for_source
+    from gateway.ingress_identity import get_trusted_ingress
+
+    if source is None:
+        return None
+    try:
+        ingress = get_trusted_ingress()
+    except Exception:
+        return None
+    if ingress is None or _platform_name(source) != str(ingress.platform).lower():
+        return None
+    if str(getattr(source, "user_id", "") or "") != str(ingress.user_id or "") or \
+            str(getattr(source, "chat_id", "") or "") != str(ingress.chat_id or ""):
+        return None
+    return scope_for_source(ingress.platform, ingress.user_id, ingress.chat_id, ingress.chat_type,
+                            is_bot=bool(getattr(source, "is_bot", False)))

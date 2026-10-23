@@ -9,6 +9,7 @@ import time
 
 import pytest
 
+from agent.recall_scope import scope_for_source
 from hermes_state import SessionDB
 from tools.session_search_tool import SESSION_SEARCH_SCHEMA, session_search
 
@@ -175,3 +176,55 @@ def test_unscoped_search_unchanged(db):
     out = _call(db, query="lasagna", detail="full", limit=10)
     assert out["success"] is True
     assert "sender_filter" not in out
+
+
+# ---------------------------------------------------------------------------
+# Enforced recall scope (agent/recall_scope.py): core decides, model args only narrow
+# ---------------------------------------------------------------------------
+ALICE_DM = scope_for_source("slack", ALICE, "DALICE0001", "dm")
+CHAN_SCOPE = scope_for_source("slack", ALICE, CHAN, "group")
+
+
+def test_enforced_without_scope_fails_closed(db):
+    out = _call(db, query="lasagna", enforce_scope=True)
+    assert out["success"] is False and "no verified recall scope" in out["error"]
+
+
+def test_enforced_dm_scope_needs_no_model_args_and_ignores_others(db):
+    out = _call(db, query="lasagna", enforce_scope=True, recall_scope=ALICE_DM, limit=10, detail="full")
+    contents = _all_contents(out)
+    assert contents and all("Bob" not in c and "overrated" not in c and "legacy" not in c for c in contents)
+    assert "[Alice] lasagna elsewhere" in contents  # Alice's own words in any chat
+    assert "lasagna on telegram" not in contents
+    assert out["sender_filter"]["recall_scope"]["origin"] == "dm"
+
+
+def test_enforced_model_args_cannot_widen(db):
+    out = _call(db, query="lasagna", enforce_scope=True, recall_scope=ALICE_DM, limit=10,
+                sender_platform="slack", sender_user_id=BOB)
+    assert _all_contents(out) == []
+
+
+def test_enforced_chat_scope_keeps_chat_and_drops_other_chats(db):
+    out = _call(db, query="lasagna", enforce_scope=True, recall_scope=CHAN_SCOPE, limit=10, detail="full")
+    contents = _all_contents(out)
+    assert "[Bob] I secretly hate lasagna" in contents  # same audience, attributed to Bob
+    assert "[Alice] lasagna elsewhere" not in contents  # same person, other chat: other audience
+    assert "[Alice] legacy lasagna note" not in contents
+    assert all(m.get("attribution") == "verified_sender" for r in out["results"] for m in r["messages"])
+
+
+def test_enforced_read_browse_and_scroll(db):
+    read = _call(db, session_id="s_bob", enforce_scope=True, recall_scope=ALICE_DM)
+    assert read["messages"] == []
+    browse = _call(db, enforce_scope=True, recall_scope=ALICE_DM)
+    assert [r["session_id"] for r in browse["results"]] == ["s_shared"]
+    bob_row = db._conn.execute("SELECT id FROM messages WHERE session_id='s_bob'").fetchone()[0]
+    scroll = _call(db, session_id="s_bob", around_message_id=bob_row, enforce_scope=True, recall_scope=ALICE_DM)
+    assert scroll["success"] is False
+
+
+def test_enforcement_defaults_from_profile_config(db, monkeypatch):
+    monkeypatch.setattr("agent.recall_scope.enforcement_enabled", lambda config=None: True)
+    out = _call(db, query="lasagna")
+    assert out["success"] is False

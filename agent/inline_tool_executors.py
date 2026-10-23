@@ -133,9 +133,12 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
             ("session_id", "session_id"), ("around_message_id", "around_message_id"),
             ("window", "window", 5), ("sort", "sort"), ("profile", "profile"),
             ("detail", "detail", "adaptive"), ("after", "after"), ("before", "before"),
-            ("exclude_session_ids", "exclude_session_ids"),
+            ("exclude_session_ids", "exclude_session_ids"), ("sender_platform", "sender_platform"),
+            ("sender_user_id", "sender_user_id"), ("sender_chat_id", "sender_chat_id"),
+            ("require_unthreaded", "require_unthreaded"),
         ),
         db=session_db, current_session_id=agent.session_id,
+        recall_scope=getattr(agent, "_recall_scope", None),
     )
 
 

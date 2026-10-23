@@ -587,15 +587,22 @@ _SENDER_BROWSE_SCAN = 60
 
 
 class _SenderFilter:
-    __slots__ = ("chat_id", "platform", "require_unthreaded", "user_id")
+    """Model-chosen sender filters, intersected with the turn's enforced recall scope when there is one.
+    ``platform``/``user_id`` are None only under a scope (agent/recall_scope.py), which then decides alone."""
+    __slots__ = ("chat_id", "platform", "require_unthreaded", "scope", "user_id")
 
-    def __init__(self, platform: str, user_id: str, chat_id: Optional[str], require_unthreaded: bool):
+    def __init__(self, platform: Optional[str], user_id: Optional[str], chat_id: Optional[str],
+                 require_unthreaded: bool, scope: Any = None):
         self.platform, self.user_id, self.chat_id = platform, user_id, chat_id
         self.require_unthreaded = require_unthreaded
+        self.scope = scope
 
     def describe(self) -> dict[str, Any]:
-        return {"sender_platform": self.platform, "sender_user_id": self.user_id,
-                "sender_chat_id": self.chat_id, "require_unthreaded": self.require_unthreaded}
+        out = {"sender_platform": self.platform, "sender_user_id": self.user_id,
+               "sender_chat_id": self.chat_id, "require_unthreaded": self.require_unthreaded}
+        if self.scope is not None:
+            out["recall_scope"] = self.scope.describe()
+        return out
 
     def matches(self, display_metadata: Any) -> bool:
         """True only for a trusted, structurally complete sender object matching every filter."""
@@ -607,9 +614,15 @@ class _SenderFilter:
         sender = display_metadata.get("sender") if isinstance(display_metadata, dict) else None
         if not isinstance(sender, dict) or sender.get("trusted") is not True:
             return False
-        if str(sender.get("platform") or "").strip().lower() != self.platform:
+        if self.scope is not None:
+            from agent.recall_scope import sender_label
+            if not self.scope.allows({sender_label(display_metadata)}):
+                return False
+        elif not self.platform or not self.user_id:
             return False
-        if str(sender.get("user_id") or "") != self.user_id:
+        if self.platform and str(sender.get("platform") or "").strip().lower() != self.platform:
+            return False
+        if self.user_id and str(sender.get("user_id") or "") != self.user_id:
             return False
         if self.chat_id is not None and str(sender.get("chat_id") or "") != self.chat_id:
             return False
@@ -618,9 +631,23 @@ class _SenderFilter:
         return True
 
 
-def _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded):
+def _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded,
+                         recall_scope=None, enforce_scope=False):
     """``(filter_or_None, error_json_or_None)``. Any sender arg turns the mode on; an incomplete
-    filter is refused rather than silently widened to an unscoped search."""
+    filter is refused rather than silently widened to an unscoped search. Under an enforced recall
+    scope the mode is always on, the scope always applies and model args can only narrow it; with
+    enforcement on and no scope the search is refused (unknown requester fails closed)."""
+    if enforce_scope:
+        if recall_scope is None:
+            return None, tool_error("session_search is unavailable: this turn has no verified recall scope "
+                                    "(sender attribution is enforced on this profile)", success=False)
+        flt, err = _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded)
+        if err:
+            return None, err
+        if flt is None:
+            return _SenderFilter(None, None, None, False, scope=recall_scope), None
+        flt.scope = recall_scope
+        return flt, None
     def _s(v):
         return v.strip() if isinstance(v, str) else ("" if v is None else str(v).strip())
     platform, user_id, chat_id = _s(sender_platform).lower(), _s(sender_user_id), _s(sender_chat_id)
@@ -637,14 +664,17 @@ def _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, requir
 
 def _sender_rows(db, session_id: str, flt: "_SenderFilter") -> list[dict[str, Any]]:
     """Visible user rows in *session_id* whose persisted sender matches *flt*, in id order.
-    Visible = live (active=1) or compaction-archived (active=0, compacted=1); rewind/undo rows stay hidden."""
+    Visible = live (active=1) or compaction-archived (active=0, compacted=1); rewind/undo rows stay hidden.
+    SQL only narrows to rows that carry a sender; ``flt.matches`` decides."""
     def _q():
         with db._lock:
             return db._conn.execute(
                 "SELECT id, session_id, role, content, timestamp, display_metadata FROM messages "
                 "WHERE session_id = ? AND role = 'user' AND (active = 1 OR compacted = 1) "
                 "AND CASE WHEN json_valid(display_metadata) "
-                "THEN json_extract(display_metadata, '$.sender.user_id') END = ? ORDER BY id",
+                "THEN json_extract(display_metadata, '$.sender.user_id') END = coalesce(?, "
+                "CASE WHEN json_valid(display_metadata) "
+                "THEN json_extract(display_metadata, '$.sender.user_id') END) ORDER BY id",
                 (session_id, flt.user_id)).fetchall()
     rows = [dict(r) for r in _q()]
     return [r for r in rows if flt.matches(r.get("display_metadata"))]
@@ -880,12 +910,17 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
                    window: int = 5, sort: str | None = None, profile: str | None = None, detail: str = "adaptive",
                    after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None,
                    sender_platform: str | None = None, sender_user_id: str | None = None,
-                   sender_chat_id: str | None = None, require_unthreaded: bool | None = None) -> str:
+                   sender_chat_id: str | None = None, require_unthreaded: bool | None = None,
+                   recall_scope: Any = None, enforce_scope: bool | None = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
     from hermes_state import format_session_db_unavailable
     from hermes_state_registry import acquire, release_or_close
-    sender, sender_err = _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded)
+    if enforce_scope is None:
+        from agent.recall_scope import enforcement_enabled
+        enforce_scope = enforcement_enabled()
+    sender, sender_err = _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded,
+                                              recall_scope=recall_scope, enforce_scope=enforce_scope)
     if sender_err:
         return sender_err
     owned_dbs: list[Any] = []
