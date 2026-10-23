@@ -191,6 +191,26 @@ def test_undrainable_backlog_withholds_recall_for_the_turn():
     assert manager._recall_providers() == [] and scoped.bound[-1] == (None, True)
 
 
+def test_replay_requires_the_conversation_to_be_built_under_this_scope(home, monkeypatch):
+    from agent.recall_scope import session_scope_mismatch
+    _enforce(monkeypatch)
+    jamal, joint = J_DM.partition(), JOINT.partition()
+    db = _SessionDB({
+        "jamal-dm": {"system_prompt": f"...\n\nModel: m\nRecall scope: {jamal}", "parent_session_id": None},
+        "jamal-child": {"system_prompt": None, "parent_session_id": "jamal-dm"},  # compression child
+        "legacy": {"system_prompt": "...\n\nModel: m", "parent_session_id": None},
+        "no-prompt": {"system_prompt": None, "parent_session_id": None},
+    })
+    assert not session_scope_mismatch(db, "jamal-dm", jamal)
+    assert not session_scope_mismatch(db, "jamal-child", jamal)
+    assert session_scope_mismatch(db, "jamal-dm", joint)  # Jamal's DM resumed into a joint audience
+    assert session_scope_mismatch(db, "jamal-child", joint)
+    assert session_scope_mismatch(db, "legacy", jamal)
+    assert session_scope_mismatch(db, "no-prompt", jamal)
+    _enforce(monkeypatch, on=False)
+    assert not session_scope_mismatch(db, "jamal-dm", joint)
+
+
 def test_lineage_check_follows_parents_to_the_root(home, monkeypatch):
     from agent.recall_scope import session_lineage_predates_epoch
     _enforce(monkeypatch)

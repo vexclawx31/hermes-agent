@@ -1107,6 +1107,18 @@ _ASSISTANT_REPLAY_FIELDS: tuple[str, ...] = (
     "finish_reason")
 
 
+def _persisted_sender(msg: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The persisted ``display_metadata.sender`` object of a stored user row, if any."""
+    meta = msg.get("display_metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            return None
+    sender = meta.get("sender") if isinstance(meta, dict) else None
+    return dict(sender) if isinstance(sender, dict) else None
+
+
 def _build_replay_entry(
     role: str, content: Any, msg: dict[str, Any], preserve_timestamp: bool = False
 ) -> dict[str, Any]:
@@ -1142,6 +1154,10 @@ def _build_replay_entry(
             entry[_rkey] = _rval
     if preserve_timestamp and msg.get("timestamp"):
         entry["timestamp"] = msg["timestamp"]
+    if role == "user" and (sender := _persisted_sender(msg)) is not None:
+        # View-only (underscore keys never reach a provider): who wrote this row, for the
+        # compressor's attribution labels (agent/context_compressor.py, agent/recall_scope.py).
+        entry["_sender"] = sender
     # Replay rebuilds the SAME conversation for its next turn: every role keeps its uid and merge witness, so a
     # context engine sees the uids the store holds. Tool-call uid maps stay with the rows that still carry
     # their calls (those pass through whole); on a plain row a leftover map would name calls it no longer has.

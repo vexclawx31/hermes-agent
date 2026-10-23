@@ -296,3 +296,32 @@ def session_lineage_predates_epoch(session_db: Any, session_id: str, *, max_dept
     except Exception:
         return True
     return not isinstance(started, (int, float)) or started < since
+
+
+def session_scope_mismatch(session_db: Any, session_id: str, partition: Optional[str], *,
+                           max_depth: int = 64) -> bool:
+    """True when enforcement is on and *session_id*'s conversation was not built under *partition*.
+
+    The stored system prompt's ``Recall scope`` trailer line (agent/system_prompt.py) records the
+    partition a conversation was built under; the nearest one up its lineage speaks for it (a
+    compression child may not have persisted its own prompt yet). A conversation resumed or branched
+    into another audience therefore never replays. No record anywhere: unprovable, mismatch."""
+    if not enforcement_enabled() or session_db is None or not session_id:
+        return False
+    from agent.surface_switch import identity_line_value
+    current = str(session_id)
+    try:
+        for _ in range(max_depth):
+            row = session_db.get_session(current)
+            if not row:
+                return True
+            prompt = row.get("system_prompt")
+            if prompt:
+                return (identity_line_value(prompt, "Recall scope") or None) != partition
+            parent = row.get("parent_session_id")
+            if not parent or parent == current:
+                return True
+            current = parent
+    except Exception:
+        return True
+    return True
