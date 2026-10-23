@@ -151,6 +151,16 @@ class MemoryProvider(ABC):
 
     # -- Optional hooks (override to opt in) ---------------------------------
 
+    # -- Recall scope (agent/recall_scope.py) ---------------------------------
+    # With ``privacy.recall_scope: enforce`` a provider that leaves this False gets no prefetch,
+    # tool calls or pre-compress hook. A provider that sets it True receives the turn's scope before
+    # anything else runs and must apply it to EVERY read path (prefetch, background prefetch caches,
+    # tools, reflect), returning nothing when the scope is None.
+    supports_recall_scope: bool = False
+
+    def bind_recall_scope(self, scope: Any, *, enforced: bool) -> None:
+        """The turn's :class:`agent.recall_scope.RecallScope` (None = recall nothing when enforced)."""
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Per-turn tick. kwargs may include remaining_tokens, model, platform, tool_count, author_id, author_name,
         author_is_bot. The author trio names who wrote THIS turn (None, None, False without one): a shared session

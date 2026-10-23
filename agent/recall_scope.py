@@ -90,6 +90,22 @@ class RecallScope:
         """Stable identity for caches that must not serve one scope's results to another."""
         return "|".join(sorted(self.patterns))
 
+    def partition(self) -> str:
+        """Filesystem/bank-safe name of this scope's storage partition (memory dir, provider bank)."""
+        import hashlib
+        return "scope-" + hashlib.sha256(self.key().encode()).hexdigest()[:16]
+
+    def covers(self, other: "RecallScope") -> bool:
+        """True when everything *other* may see, this scope may see too (pattern containment)."""
+        def _covered(pattern: str) -> bool:
+            op, ou, oc = _split(pattern) or ("", "", "")
+            for mine in self.patterns:
+                mp, mu, mc = _split(mine) or ("", "", "")
+                if mp == op and mu in (WILDCARD, ou) and mc in (WILDCARD, oc):
+                    return True
+            return False
+        return bool(other.patterns) and all(_covered(p) for p in other.patterns)
+
     def describe(self) -> dict[str, Any]:
         return {"patterns": sorted(self.patterns), "origin": self.origin}
 
@@ -200,3 +216,70 @@ def provenance_from_metadata(display_metadata: Any) -> Optional[frozenset[str]]:
     if not isinstance(raw, list):
         return None
     return frozenset(label if isinstance(label, str) and label else UNKNOWN_LABEL for label in raw) or None
+
+
+# ---------------------------------------------------------------------------
+# Enforcement epoch: a session is a provenance partition only if it began under enforcement
+# ---------------------------------------------------------------------------
+# Every input of a session that started under enforcement was scope-filtered (recall, memory
+# partition, history of that same scoped session), so its transcript, summaries and outputs stay
+# inside its scope. A session that predates enforcement holds unattributed history: it is not
+# resumed, only replaced (its rows stay on disk, untouched).
+EPOCH_FILENAME = "recall_scope_epoch.json"
+
+
+def _epoch_path(hermes_home: Any = None):
+    from pathlib import Path
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+        hermes_home = get_hermes_home()
+    return Path(hermes_home) / "state" / EPOCH_FILENAME
+
+
+def enforcement_epoch(enforced: bool, hermes_home: Any = None, now: Optional[float] = None) -> Optional[float]:
+    """Start time of the current enforcement period (created on first use), or None when off.
+
+    Turning enforcement off forgets the epoch, so turning it back on starts a new one and every
+    session from the unenforced gap is replaced too."""
+    import os
+    import time
+    path = _epoch_path(hermes_home)
+    if not enforced:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")).get("since")
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, AttributeError):
+        # Unreadable epoch: start a new one (replaces sessions once more; never trusts old ones).
+        pass
+    since = float(now if now is not None else time.time())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"since": since}), encoding="utf-8")
+    os.replace(tmp, path)
+    return since
+
+
+def apply_turn_recall_scope(agent: Any) -> None:
+    """Bind the turn's scope to the agent's recall paths, before the system prompt or any recall.
+
+    ``agent._recall_scope`` is set per turn by its caller (gateway: trusted ingress; cron: the job's
+    declaration). The built-in memory store moves to the scope's partition and the memory manager
+    gates providers; a changed partition invalidates the cached system prompt (its memory block)."""
+    enforced = enforcement_enabled()
+    scope = getattr(agent, "_recall_scope", None) if enforced else None
+    if not isinstance(scope, RecallScope):
+        scope = None
+    store = getattr(agent, "_memory_store", None)
+    if store is not None and hasattr(store, "bind_recall_scope") and store.bind_recall_scope(enforced, scope):
+        agent._cached_system_prompt = None
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is not None and hasattr(manager, "bind_recall_scope"):
+        manager.bind_recall_scope(enforced, scope)
