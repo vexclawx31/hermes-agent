@@ -2080,6 +2080,11 @@ display:
 #   # Names and usernames are NOT affected (user-chosen, publicly visible).
 #   # Routing/delivery still uses the original values internally.
 #   redact_pii: false
+#   # Sender attribution for recall (agent/recall_scope.py). "enforce" scopes every recall path
+#   # (session_search, memory providers, built-in MEMORY.md/USER.md, cron context_from, history
+#   # replay) to the turn's verified sender or chat, or a cron job's `recall_scope`; unattributed
+#   # history is never recalled and conversations that predate enforcement start fresh once.
+#   recall_scope: off
 
 # =============================================================================
 # Shell-script hooks
