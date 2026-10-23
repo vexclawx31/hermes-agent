@@ -131,3 +131,31 @@ def test_sessions_predating_the_epoch_are_replaced(home, monkeypatch):
     assert _predates_recall_scope_epoch(old) and not _predates_recall_scope_epoch(new)
     _enforce(monkeypatch, on=False)
     assert not _predates_recall_scope_epoch(old)
+
+
+class _SessionDB:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def get_session(self, session_id):
+        return self.rows.get(session_id)
+
+
+def test_lineage_check_follows_parents_to_the_root(home, monkeypatch):
+    from agent.recall_scope import session_lineage_predates_epoch
+    _enforce(monkeypatch)
+    since = enforcement_epoch(True)
+    db = _SessionDB({
+        "legacy": {"started_at": since - 100, "parent_session_id": None},
+        "child-of-legacy": {"started_at": since + 5, "parent_session_id": "legacy"},
+        "fresh": {"started_at": since + 1, "parent_session_id": None},
+        "child-of-fresh": {"started_at": since + 9, "parent_session_id": "fresh"},
+        "orphan": {"started_at": since + 9, "parent_session_id": "missing"},
+    })
+    assert session_lineage_predates_epoch(db, "legacy")
+    assert session_lineage_predates_epoch(db, "child-of-legacy")  # a resumed/compressed old conversation
+    assert not session_lineage_predates_epoch(db, "fresh")
+    assert not session_lineage_predates_epoch(db, "child-of-fresh")
+    assert session_lineage_predates_epoch(db, "orphan")  # unprovable lineage fails closed
+    _enforce(monkeypatch, on=False)
+    assert not session_lineage_predates_epoch(db, "legacy")

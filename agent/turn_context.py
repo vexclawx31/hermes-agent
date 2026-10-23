@@ -1065,6 +1065,12 @@ def build_turn_context(
     recovered_history = recover_rotated_compression_session(agent)
     if recovered_history is not None:
         conversation_history = recovered_history
+    # A conversation that began before recall-scope enforcement holds unattributed history:
+    # never replay it to the model, however the session came back (agent/recall_scope.py).
+    from agent.recall_scope import session_lineage_predates_epoch
+    if conversation_history and session_lineage_predates_epoch(
+            getattr(agent, "_session_db", None), getattr(agent, "session_id", "")):
+        conversation_history = []
 
     # Tag log records on this thread with the session ID for ``hermes logs``; bind the
     # skill write-origin ContextVar; restore the primary runtime after a fallback turn.

@@ -283,3 +283,34 @@ def apply_turn_recall_scope(agent: Any) -> None:
     manager = getattr(agent, "_memory_manager", None)
     if manager is not None and hasattr(manager, "bind_recall_scope"):
         manager.bind_recall_scope(enforced, scope)
+
+
+def session_lineage_predates_epoch(session_db: Any, session_id: str, *, max_depth: int = 64) -> bool:
+    """True when enforcement is on and *session_id*'s lineage root started before the epoch.
+
+    Covers every way an old conversation can come back besides routing (/resume, /branch, a
+    compression child of an old session). Unreadable lineage counts as old: fail closed."""
+    if not enforcement_enabled():
+        return False
+    try:
+        since = enforcement_epoch(True)
+    except Exception:
+        return True
+    if since is None or session_db is None or not session_id:
+        return session_db is not None and bool(session_id)
+    current, started = str(session_id), None
+    try:
+        for _ in range(max_depth):
+            row = session_db.get_session(current)
+            if not row:
+                return True
+            started = row.get("started_at")
+            parent = row.get("parent_session_id")
+            if not parent or parent == current:
+                break
+            current = parent
+        else:
+            return True
+    except Exception:
+        return True
+    return not isinstance(started, (int, float)) or started < since
