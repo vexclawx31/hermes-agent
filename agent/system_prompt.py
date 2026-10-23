@@ -509,8 +509,18 @@ def _timestamp_line(agent: Any) -> str:
     if getattr(agent, "_bot_chat_timeless_prompt", False):
         timestamp_line = f"Timezone: {', '.join(_bits)}" if _bits else ""
     trailer = (("Session ID", agent.session_id if agent.pass_session_id else None), ("Model", agent.model),
-               ("Provider", agent.provider), ("Platform", agent.platform))
+               ("Provider", agent.provider), ("Platform", agent.platform),
+               ("Recall scope", recall_scope_trailer_value(agent)))
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
+
+
+def recall_scope_trailer_value(agent: Any) -> Optional[str]:
+    """The memory partition this prompt's memory block was built for (agent/recall_scope.py):
+    None when unenforced (no trailer line), "none" when enforced without a scope."""
+    partition = getattr(getattr(agent, "_memory_store", None), "_scope_partition", None)
+    if not isinstance(partition, str):
+        return None
+    return partition or "none"
 
 
 def _memory_parts(agent: Any) -> list[str]:

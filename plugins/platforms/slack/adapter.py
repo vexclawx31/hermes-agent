@@ -6085,6 +6085,10 @@ class SlackAdapter(BasePlatformAdapter):
         name = await self._resolve_user_name(display_user, chat_id=channel_id, team_id=team_id)
         safe_name = neutralize_untrusted_inline_text(name)
         safe_text = neutralize_untrusted_inline_text(msg_text, max_chars=0)  # untruncated
+        if not is_bot and _SLACK_USER_ID.fullmatch(msg_user or "") and _recall_scope_enforced():
+            # Sender attribution (agent/recall_scope.py): the platform id, not the editable display
+            # name, says who wrote the line, in the same shape as the inbound speaker prefix.
+            safe_name = f"{safe_name} | Slack user <@{msg_user}>"
         return f"{prefix}{trust_tag}{safe_name}: {safe_text}"
 
     async def _fetch_thread_parent_text(
@@ -7070,3 +7074,11 @@ def register(ctx) -> None:
         max_message_length=39000,
         emoji="💼",
         allow_update_command=True)
+
+
+_SLACK_USER_ID = re.compile(r"[UW][A-Z0-9]{2,}")
+
+
+def _recall_scope_enforced() -> bool:
+    from agent.recall_scope import enforcement_enabled
+    return enforcement_enabled()

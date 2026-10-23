@@ -1719,6 +1719,9 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            # Set every turn (None when unproven) so a cached agent never keeps the previous turn's scope.
+            from gateway.sender_attribution import trusted_turn_scope
+            agent._recall_scope = trusted_turn_scope(ctx.source)
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)

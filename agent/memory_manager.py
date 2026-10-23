@@ -407,6 +407,10 @@ class MemoryManager:
         self._external_prefetch_timeout = timeout
         self._external_prefetch_threads: dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
+        # Recall scope (agent/recall_scope.py), bound per turn by bind_recall_scope().
+        self._recall_scope_enforced: bool = False
+        self._recall_scope: Any = None
+        self._recall_scope_key: tuple[bool, Optional[str]] = (False, None)
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
         # the builtin-only path spawns no threads; one worker serializes a provider's writes.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
@@ -508,6 +512,37 @@ class MemoryManager:
     # providers get just the user's instruction (None for a bare invocation).
     _strip_skill_scaffolding = staticmethod(extract_user_instruction_from_skill_message)
 
+    def bind_recall_scope(self, enforced: bool, scope: Any = None) -> None:
+        """Set the turn's recall scope (agent/recall_scope.py). Under enforcement only providers that
+        declare ``supports_recall_scope`` recall anything, and only when the turn has a scope; each
+        such provider is handed the scope (``bind_recall_scope``) and enforces it on every read path."""
+        key = (bool(enforced), scope.key() if scope is not None and hasattr(scope, "key") else None)
+        if key != self._recall_scope_key:
+            # Earlier turns' queued syncs ran under the old scope: they must reach the old
+            # partition before providers switch. If they can't drain, recall nothing this turn.
+            if not self.flush_pending(timeout=10.0) and enforced:
+                logger.warning("Memory sync backlog did not drain before a recall-scope change; "
+                               "withholding provider memory for this turn")
+                scope = None
+                key = (True, None)
+            self._recall_scope_key = key
+        self._recall_scope_enforced, self._recall_scope = bool(enforced), scope
+        for provider in self._providers:
+            if getattr(provider, "supports_recall_scope", False):
+                try:
+                    provider.bind_recall_scope(scope if enforced else None, enforced=bool(enforced))
+                except Exception as e:
+                    logger.warning("Memory provider '%s' bind_recall_scope failed: %s", provider.name, e)
+
+    def _recall_allowed(self, provider: MemoryProvider) -> bool:
+        """Whether *provider* may serve recall (prefetch, tools, pre-compress insights) this turn."""
+        if not self._recall_scope_enforced:
+            return True
+        return self._recall_scope is not None and bool(getattr(provider, "supports_recall_scope", False))
+
+    def _recall_providers(self) -> list[MemoryProvider]:
+        return [p for p in self._providers if self._recall_allowed(p)]
+
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
         clean_query = self._strip_skill_scaffolding(query)
@@ -516,6 +551,7 @@ class MemoryManager:
         clean_query = _redact_for_provider(clean_query)
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
+            providers=self._recall_providers(),
         )
         return "\n\n".join(p for p in parts if p and p.strip())
 
@@ -580,7 +616,7 @@ class MemoryManager:
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
-        providers = list(self._providers)
+        providers = self._recall_providers()
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query:
             return
@@ -717,6 +753,9 @@ class MemoryManager:
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        if not self._recall_allowed(provider):
+            return tool_error(f"Memory tool '{tool_name}' is unavailable: sender attribution is enforced on this "
+                              "profile and this turn has no verified recall scope, or the provider cannot honour one.")
         args = _redact_for_provider(args)
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         try:
@@ -816,7 +855,7 @@ class MemoryManager:
         parts = []
         checkpoint_succeeded = False
         messages, evidence_messages = _redact_for_provider(messages or [], evidence_messages)
-        for provider in self._providers:
+        for provider in self._recall_providers():
             version = self._checkpoint_api_version(provider)
             if version is None:
                 version = _LEGACY_PRE_COMPRESS_API_VERSION

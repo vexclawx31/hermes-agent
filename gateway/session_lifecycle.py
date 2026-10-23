@@ -90,8 +90,24 @@ class SessionLifecycleMixin:
         return row is None or row.get("end_reason") is not None
 
     def _route_reset_reason(self, entry: SessionEntry) -> Optional[str]:
-        """Only explicit suspension replaces a routed conversation; time never does."""
-        return "suspended" if entry.suspended else None
+        """Only explicit suspension, or a session that predates recall-scope enforcement
+        (agent/recall_scope.py), replaces a routed conversation; time never does."""
+        if entry.suspended:
+            return "suspended"
+        from agent.recall_scope import enforcement_enabled
+        if not enforcement_enabled():
+            _predates_recall_scope_epoch(entry)  # forgets a stale epoch; never resets here
+            return None
+        if _predates_recall_scope_epoch(entry):
+            return "recall_scope_enforced"
+        # A new route entry can still point at an old conversation (adopted, recovered, resumed) or
+        # at another route's conversation (/resume across chats): replace it once, never replay it.
+        from agent.recall_scope import session_lineage_predates_epoch, session_route_mismatch
+        db = self._db_for_key(entry.session_key)
+        if db is not None and (session_lineage_predates_epoch(db, entry.session_id)
+                               or session_route_mismatch(db, entry.session_id, entry.session_key)):
+            return "recall_scope_enforced"
+        return None
 
     def _update_entry(self, session_key: str, mutate) -> bool:
         """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing
@@ -249,3 +265,23 @@ class SessionLifecycleMixin:
             logger.info("SessionStore pruned %d entries older than %d days",
                         len(removed_keys), max_age_days)
         return len(removed_keys)
+
+
+def _predates_recall_scope_epoch(entry: SessionEntry) -> bool:
+    """True when enforcement is on and *entry* began before it (its history is unattributed)."""
+    from agent.recall_scope import enforcement_enabled, enforcement_epoch
+    enforced = enforcement_enabled()
+    try:
+        since = enforcement_epoch(enforced)
+    except Exception:
+        # Enforced but unprovable: replace the session rather than replay unattributed history.
+        logger.warning("recall scope epoch unavailable; replacing the session", exc_info=True)
+        return enforced
+    if since is None:
+        return False
+    created = entry.created_at
+    try:
+        created_ts = created.timestamp()
+    except Exception:
+        return True
+    return created_ts < since

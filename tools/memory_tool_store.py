@@ -191,6 +191,9 @@ class MemoryStore:
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
         self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
+        # Recall-scope partition (bind_recall_scope): None = unenforced legacy files, "" = no scope.
+        self._scope_partition: Optional[str] = None
+        self._unscoped_flags = (memory_enabled, user_profile_enabled)
 
     # Per-turn counter of failed at-capacity consolidation attempts; reset at each turn boundary by
     # reset_consolidation_failures() (#42405).
@@ -295,10 +298,35 @@ class MemoryStore:
                 with suppress(OSError):
                     _flock(True)
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(self, target: str) -> Path:
         from tools import memory_tool  # get_memory_dir is monkeypatched there
-        return memory_tool.get_memory_dir() / ("USER.md" if target == "user" else "MEMORY.md")
+        base = memory_tool.get_memory_dir()
+        partition = self._scope_partition
+        if partition:
+            base = base / "scoped" / partition
+        return base / ("USER.md" if target == "user" else "MEMORY.md")
+
+    def bind_recall_scope(self, enforced: bool, scope: Any = None) -> bool:
+        """Point the store at the turn's recall-scope partition (agent/recall_scope.py).
+
+        Under enforcement each scope reads and writes its own ``memories/scoped/<partition>/``
+        files, and the unpartitioned legacy files are never read. Without a scope both targets
+        are off for the turn. Returns True when the partition changed (the snapshot was reloaded,
+        so a cached system prompt built from the old one is stale)."""
+        partition = (scope.partition() if scope is not None else "") if enforced else None
+        if partition == self._scope_partition:
+            return False
+        if self._scope_partition is None:
+            self._unscoped_flags = (self.memory_enabled, self.user_profile_enabled)
+        self._scope_partition = partition
+        if partition == "":
+            self.memory_enabled = self.user_profile_enabled = False
+            self.memory_entries, self.user_entries = [], []
+            self._system_prompt_snapshot = {"memory": "", "user": ""}
+            return True
+        self.memory_enabled, self.user_profile_enabled = self._unscoped_flags
+        self.load_from_disk()
+        return True
 
     def _entries_for(self, target: str) -> list[str]:
         return self.user_entries if target == "user" else self.memory_entries

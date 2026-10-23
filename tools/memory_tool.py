@@ -81,6 +81,16 @@ def _pin_matched_entries(store: MemoryStore, payload: dict[str, Any]) -> Optiona
     return None if result.get("success") else json.dumps(result, ensure_ascii=False)
 
 
+def _scoped_staging_refusal(store: MemoryStore) -> Optional[str]:
+    """Pending writes are profile-wide (shown and applied from any chat, to the unpartitioned
+    files), so a recall-scope partitioned store (agent/recall_scope.py) never stages: refuse."""
+    if getattr(store, "_scope_partition", None) is None:
+        return None
+    FAILURE_CLASS.set("gate_refused")
+    return tool_error("This memory write needs approval, but approvals can't be staged while sender "
+                      "attribution is enforced on this profile. Nothing was written or staged.", success=False)
+
+
 def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[str, Any]) -> Optional[str]:
     """JSON tool-result string when the write must NOT proceed (blocked or staged
     for approval), None to proceed. Fails open if the gate module can't load."""
@@ -96,6 +106,8 @@ def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[
         return tool_error(decision.message, success=False)
     if (unmatched := _pin_matched_entries(store, payload)) is not None:
         return unmatched
+    if (refusal := _scoped_staging_refusal(store)) is not None:
+        return refusal
     FAILURE_CLASS.set("staged")
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message},
@@ -198,6 +210,8 @@ def _background_delete_gate(store, action, operations, target="memory", content=
     try:
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched
+        if (refusal := _scoped_staging_refusal(store)) is not None:
+            return refusal
         from tools import write_approval as wa
         FAILURE_CLASS.set("staged")
         record = wa.stage_write(

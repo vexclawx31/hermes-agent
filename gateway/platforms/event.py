@@ -41,6 +41,14 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+def _event_sender_key(event: Any) -> tuple[Optional[str], Optional[str]]:
+    """``(platform, user_id)`` of an event's author; ``(None, None)`` when unknown."""
+    source = getattr(event, "source", None)
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+    user_id = getattr(source, "user_id", None) or getattr(event, "user_id", None)
+    return (str(platform) if platform else None, str(user_id) if user_id else None)
+
+
 @dataclass
 class MessageEvent:
     """Incoming message from a platform — the normalized shape all adapters produce."""
@@ -106,9 +114,16 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Set when another sender's event was merged into this one (see gateway/sender_attribution.py).
+    _mixed_senders: bool = field(default=False, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
-        """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        """One turn now answers *other* too: an addressed message wins, then an unknown one.
+        Every merge site calls this, so it also marks a merge across senders: the persisted row
+        can then no longer be attributed to this event's sender alone."""
+        if other is not self and (getattr(other, "_mixed_senders", False)
+                                  or _event_sender_key(other) != _event_sender_key(self)):
+            self._mixed_senders = True
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
 

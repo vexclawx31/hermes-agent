@@ -2208,12 +2208,16 @@ def _normalize_newlines(text: str) -> str:
 
 
 def _run_doc_header(job: dict, title: str, job_id: str, prompt: str, *, prompt_stamp: str = "") -> str:
-    """Header of the persisted run document (title, ids, schedule, prompt)."""
+    """Header of the persisted run document (title, ids, schedule, recall scope, prompt).
+    The recall-scope line records the scope this run ran under, which is what ``context_from``
+    later checks (cron/scheduler_prompt.py), not the job's then-current configuration."""
+    from cron.scheduler_prompt import recall_scope_header_line
     return (
         f"# Cron Job: {title}\n\n"
         f"**Job ID:** {job_id}\n"
         f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"**Schedule:** {job.get('schedule_display', 'N/A')}\n\n"
+        f"**Schedule:** {job.get('schedule_display', 'N/A')}\n"
+        f"{recall_scope_header_line(job)}\n"
         f"{prompt_stamp}{_PROMPT_HEADING}{prompt}{_PROMPT_SEPARATOR}"
     )
 
@@ -2465,7 +2469,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
-    return AIAgent(
+    agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -2497,6 +2501,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_id=session_id,
         session_db=session_db,
     )
+    # A cron run has no inbound sender: its recall scope is the job's declaration (or none).
+    from agent.recall_scope import scope_from_patterns
+    agent._recall_scope = scope_from_patterns(job.get("recall_scope"), origin="cron")
+    return agent
 
 
 class _FireAudit:

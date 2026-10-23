@@ -1243,6 +1243,14 @@ class SessionStore(
     # Compression repoint is store bookkeeping, not user activity — leave ``updated_at`` alone so a
     # background compression on an idle session cannot make it look fresh to the
     # restart-resume freshness gate (#85709).
+    def _foreign_route_under_recall_scope(self, session_key: str, target_session_id: str) -> bool:
+        """True when enforcement is on and *target_session_id*'s conversation is keyed to another route."""
+        from agent.recall_scope import enforcement_enabled, session_route_mismatch
+        if not enforcement_enabled():
+            return False
+        db = self._db_for_key(session_key)
+        return db is not None and session_route_mismatch(db, target_session_id, session_key)
+
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
         preserve_prompt_pin: bool = True,
@@ -1255,7 +1263,13 @@ class SessionStore(
         across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
         Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
         starts a different conversation on the same routing key.
+        Under recall-scope enforcement (agent/recall_scope.py) a session that belongs to another
+        route is never adopted: ``None``, so a conversation can't move to another audience.
         """
+        if self._foreign_route_under_recall_scope(session_key, target_session_id):
+            logger.warning("Session switch for %s refused: %s belongs to another route (recall scope enforced)",
+                           session_key, target_session_id)
+            return None
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:

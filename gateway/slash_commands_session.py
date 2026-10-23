@@ -874,6 +874,8 @@ class GatewaySessionCommandsMixin:
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
+        if refusal := _recall_scope_refusal("/resume"):
+            return refusal
         if not self._session_db:
             return self._session_db_unavailable_reply()
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
@@ -1017,6 +1019,8 @@ class GatewaySessionCommandsMixin:
         to the clone and leave this chat on the original session; ``--here`` (and every platform
         without threads) switches the current chat onto the clone instead (#66023).
         """
+        if refusal := _recall_scope_refusal("/branch"):
+            return refusal
         import json as _json
         import uuid as _uuid
         from datetime import datetime as _dt
@@ -1122,3 +1126,13 @@ class GatewaySessionCommandsMixin:
         if threads is not None:
             await threads.mark_async(str(thread_id))
         return branch_dest_source(source, parent_id=parent_id, thread_id=str(thread_id), title=title)
+
+
+def _recall_scope_refusal(command: str) -> Optional[str]:
+    """Under recall-scope enforcement (agent/recall_scope.py) a conversation never moves to another
+    chat or audience: /resume and /branch are off for the profile."""
+    from agent.recall_scope import enforcement_enabled
+    if not enforcement_enabled():
+        return None
+    return (f"{command} is turned off on this agent: sender attribution is enforced, so a "
+            "conversation can't be moved or copied to another chat. Start a new one instead.")

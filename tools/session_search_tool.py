@@ -574,9 +574,296 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
               "means you've hit that end of the session."), **extra)
 
 
+# ---------------------------------------------------------------------------
+# Sender-scoped mode: MESSAGE-level attribution from the persisted
+# ``display_metadata.sender`` object (gateway/sender_attribution.py). Session
+# participation never qualifies a message; unknown attribution fails closed.
+# ---------------------------------------------------------------------------
+_SENDER_NOTE = (
+    "Sender-scoped: only user messages whose persisted platform sender matches the filter are "
+    "returned. Assistant replies, other participants' messages, session titles, previews and "
+    "messages with missing, untrusted or ambiguous sender attribution are omitted.")
+_SENDER_BROWSE_SCAN = 60
+
+
+class _SenderFilter:
+    """Model-chosen sender filters, intersected with the turn's enforced recall scope when there is one.
+    ``platform``/``user_id`` are None only under a scope (agent/recall_scope.py), which then decides alone."""
+    __slots__ = ("chat_id", "min_timestamp", "platform", "require_unthreaded", "scope", "user_id")
+
+    def __init__(self, platform: Optional[str], user_id: Optional[str], chat_id: Optional[str],
+                 require_unthreaded: bool, scope: Any = None):
+        self.platform, self.user_id, self.chat_id = platform, user_id, chat_id
+        self.require_unthreaded = require_unthreaded
+        self.scope = scope
+        # Under a scope: rows written before enforcement began are legacy and never returned.
+        self.min_timestamp: Optional[float] = None
+
+    def describe(self) -> dict[str, Any]:
+        out = {"sender_platform": self.platform, "sender_user_id": self.user_id,
+               "sender_chat_id": self.chat_id, "require_unthreaded": self.require_unthreaded}
+        if self.scope is not None:
+            out["recall_scope"] = self.scope.describe()
+        return out
+
+    def matches(self, display_metadata: Any) -> bool:
+        """True only for a trusted, structurally complete sender object matching every filter."""
+        if isinstance(display_metadata, str):
+            try:
+                display_metadata = json.loads(display_metadata)
+            except (TypeError, ValueError):
+                return False
+        sender = display_metadata.get("sender") if isinstance(display_metadata, dict) else None
+        if not isinstance(sender, dict) or sender.get("trusted") is not True:
+            return False
+        if self.scope is not None:
+            from agent.recall_scope import sender_label
+            if not self.scope.allows({sender_label(display_metadata)}):
+                return False
+        elif not self.platform or not self.user_id:
+            return False
+        if self.platform and str(sender.get("platform") or "").strip().lower() != self.platform:
+            return False
+        if self.user_id and str(sender.get("user_id") or "") != self.user_id:
+            return False
+        if self.chat_id is not None and str(sender.get("chat_id") or "") != self.chat_id:
+            return False
+        if self.require_unthreaded and sender.get("thread_reply") is not False:
+            return False
+        return True
+
+
+def _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded,
+                         recall_scope=None, enforce_scope=False):
+    """``(filter_or_None, error_json_or_None)``. Any sender arg turns the mode on; an incomplete
+    filter is refused rather than silently widened to an unscoped search. Under an enforced recall
+    scope the mode is always on, the scope always applies and model args can only narrow it; with
+    enforcement on and no scope the search is refused (unknown requester fails closed)."""
+    if enforce_scope:
+        if recall_scope is None:
+            return None, tool_error("session_search is unavailable: this turn has no verified recall scope "
+                                    "(sender attribution is enforced on this profile)", success=False)
+        flt, err = _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded)
+        if err:
+            return None, err
+        if flt is None:
+            flt = _SenderFilter(None, None, None, False)
+        flt.scope = recall_scope
+        from agent.recall_scope import enforcement_epoch
+        flt.min_timestamp = enforcement_epoch(True)
+        return flt, None
+    def _s(v):
+        return v.strip() if isinstance(v, str) else ("" if v is None else str(v).strip())
+    platform, user_id, chat_id = _s(sender_platform).lower(), _s(sender_user_id), _s(sender_chat_id)
+    flag = require_unthreaded
+    if isinstance(flag, str):
+        flag = flag.strip().lower() in ("true", "1", "yes")
+    if not (platform or user_id or chat_id or flag):
+        return None, None
+    if not platform or not user_id:
+        return None, tool_error("sender-scoped search requires both sender_platform and sender_user_id "
+                                "(refusing to widen to an unscoped search)", success=False)
+    return _SenderFilter(platform, user_id, chat_id or None, bool(flag)), None
+
+
+def _sender_rows(db, session_id: str, flt: "_SenderFilter") -> list[dict[str, Any]]:
+    """Visible user rows in *session_id* whose persisted sender matches *flt*, in id order.
+    Visible = live (active=1) or compaction-archived (active=0, compacted=1); rewind/undo rows stay hidden.
+    SQL only narrows to rows that carry a sender; ``flt.matches`` decides."""
+    def _q():
+        with db._lock:
+            return db._conn.execute(
+                "SELECT id, session_id, role, content, timestamp, display_metadata FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND (active = 1 OR compacted = 1) "
+                "AND CASE WHEN json_valid(display_metadata) "
+                "THEN json_extract(display_metadata, '$.sender.user_id') END = coalesce(?, "
+                "CASE WHEN json_valid(display_metadata) "
+                "THEN json_extract(display_metadata, '$.sender.user_id') END) ORDER BY id",
+                (session_id, flt.user_id)).fetchall()
+    rows = [dict(r) for r in _q()]
+    floor = flt.min_timestamp
+    return [r for r in rows if flt.matches(r.get("display_metadata"))
+            and (floor is None or (isinstance(r.get("timestamp"), (int, float)) and r["timestamp"] >= floor))]
+
+
+def _count_session_messages(db, session_id: str) -> int:
+    def _q():
+        with db._lock:
+            return db._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1)",
+                (session_id,)).fetchone()[0]
+    return int(_quiet(_q, 0, "count messages failed for %s", session_id) or 0)
+
+
+def _shape_sender_message(row: dict[str, Any], anchor_id: Optional[int] = None,
+                          max_content_len: Optional[int] = 4000) -> dict[str, Any]:
+    entry = _shape_message(row, anchor_id=anchor_id, max_content_len=max_content_len)
+    meta = row.get("display_metadata")
+    if isinstance(meta, str):
+        meta = _quiet(lambda: json.loads(meta), {}, "sender metadata decode failed")
+    sender = dict((meta or {}).get("sender") or {})
+    sender.pop("untrusted_reasons", None)
+    entry["sender"] = sender
+    entry["attribution"] = "verified_sender"
+    return entry
+
+
+def _sender_meta_block(meta: dict[str, Any]) -> dict[str, Any]:
+    """Session metadata without the title: titles are generated from any participant's text."""
+    return {"when": _format_timestamp(meta.get("started_at")), "source": meta.get("source")}
+
+
+def _window_around(rows: list[dict[str, Any]], anchor_id: int, window: int) -> tuple[list, int, int]:
+    ids = [r["id"] for r in rows]
+    idx = ids.index(anchor_id)
+    lo, hi = max(0, idx - window), min(len(rows), idx + window + 1)
+    return rows[lo:hi], lo, len(rows) - hi
+
+
+def _sender_discover(db, query: str, flt: "_SenderFilter", limit: int, sort: Optional[str], detail: str,
+                     current_session_id: Optional[str], link_profile: Optional[str],
+                     after_ts: Optional[int], before_ts: Optional[int],
+                     exclude_session_ids: Optional[list[str]]) -> str:
+    """Discovery restricted to verified-sender user rows (no title match, no bookends, no assistant rows)."""
+    current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
+    excluded_roots = _excluded_lineage_roots(db, exclude_session_ids or [])
+    raw_results, err = _loud(lambda: db.search_messages(
+        query=query, role_filter=["user"], exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+        limit=_DISCOVER_SCAN_LIMIT, offset=0, sort=sort, fields=_DISCOVER_SEARCH_FIELDS,
+        after_ts=after_ts, before_ts=before_ts), "FTS5 search failed: %s", "Search failed")
+    if err:
+        return err
+    raw_results = sorted(raw_results, key=lambda r: (r.get("source") or "") in _DEMOTED_SESSION_SOURCES)
+    verified_cache: dict[str, dict[int, dict[str, Any]]] = {}
+    seen: dict[str, dict[str, Any]] = {}
+    unverified_hits = 0
+    for r in raw_results:
+        if len(seen) >= limit:
+            break
+        raw_sid = r["session_id"]
+        resolved_sid = _resolve_lineage(db, raw_sid)
+        if raw_sid in excluded_roots or resolved_sid in excluded_roots:
+            continue
+        is_compacted_hit = _is_compacted_message(db, r.get("id"))
+        if current_lineage_root and resolved_sid == current_lineage_root and not (
+                _session_left_live_context(db, raw_sid) or is_compacted_hit):
+            continue
+        if current_session_id and raw_sid == current_session_id and not is_compacted_hit:
+            continue
+        if raw_sid not in verified_cache:
+            verified_cache[raw_sid] = {row["id"]: row for row in _quiet(
+                lambda: _sender_rows(db, raw_sid, flt), [], "sender rows failed for %s", raw_sid)}
+        if r.get("id") not in verified_cache[raw_sid]:
+            unverified_hits += 1
+            continue
+        seen.setdefault(resolved_sid, {**r, "_lineage_root": resolved_sid})
+    results = []
+    for lineage_root, hit in seen.items():
+        sid, mid = hit["session_id"], hit["id"]
+        rows = list(verified_cache[sid].values())
+        full = detail == "full" or not results
+        window_rows, before, after = _window_around(rows, mid, 5 if full else 0)
+        meta = _get_session_meta(db, lineage_root) or _get_session_meta(db, sid)
+        entry = {"session_id": sid, "when": _format_timestamp(meta.get("started_at") or hit.get("session_started")),
+                 "source": meta.get("source") or hit.get("source", "unknown"), "matched_role": "user",
+                 "match_message_id": mid,
+                 "messages": [_shape_sender_message(m, anchor_id=mid) for m in window_rows],
+                 "sender_messages_before": before, "sender_messages_after": after,
+                 "detail": "full" if full else "compact", "link": _session_link(sid, link_profile)}
+        if lineage_root != sid:
+            entry["parent_session_id"] = lineage_root
+        results.append(entry)
+    return _discover_payload(db, query, detail, results, sessions_searched=len(seen),
+                             sender_filter=flt.describe(), attribution_note=_SENDER_NOTE,
+                             # Under a scope, whether others wrote a match is itself out of scope.
+                             **({} if flt.scope is not None else {"omitted_unverified_hits": unverified_hits}))
+
+
+def _sender_read(db, session_id: str, flt: "_SenderFilter", head: int = 20, tail: int = 10,
+                 link_profile: Optional[str] = None) -> str:
+    meta = _get_session_meta(db, session_id)
+    if not meta:
+        return tool_error(f"session_id not found: {session_id}", success=False)
+    rows, err = _loud(lambda: _sender_rows(db, session_id, flt), "sender read failed for %s: %s",
+                      "failed to load session", session_id)
+    if err:
+        return err
+    shaped = [_shape_sender_message(m, max_content_len=_READ_MAX_CONTENT) for m in rows]
+    total, truncated = len(shaped), len(shaped) > head + tail
+    return _ok(mode="read", session_id=session_id, link=_session_link(session_id, link_profile),
+               session_meta=_sender_meta_block(meta), message_count=total, truncated=truncated,
+               # Under a recall scope, how many messages others wrote is itself out of scope.
+               **({} if flt.scope is not None else
+                  {"omitted_messages": max(_count_session_messages(db, session_id) - total, 0)}),
+               messages=shaped[:head] + shaped[-tail:] if truncated else shaped,
+               sender_filter=flt.describe(), attribution_note=_SENDER_NOTE)
+
+
+def _sender_scroll(db, session_id: str, around_message_id, flt: "_SenderFilter", window: int = 5,
+                   current_session_id: Optional[str] = None) -> str:
+    try:
+        around_message_id = int(around_message_id)
+    except (TypeError, ValueError):
+        return tool_error("scroll requires integer around_message_id", success=False)
+    window = _clamp_int(window, 5, 1, 20)
+    anchor_state = _get_message_storage_state(db, around_message_id)
+    owning = (anchor_state or {}).get("session_id")
+    if current_session_id and _anchor_in_live_context(db, anchor_state, owning or session_id, current_session_id):
+        return tool_error("scroll rejected: anchor lives in the current session lineage (already in your active context)", success=False)
+    if owning and owning != session_id and _same_lineage(db, session_id, owning):
+        session_id = owning
+    meta = _get_session_meta(db, session_id)
+    if not meta:
+        return tool_error(f"session_id not found: {session_id}", success=False)
+    rows, err = _loud(lambda: _sender_rows(db, session_id, flt), "sender scroll failed: %s", "failed to load messages")
+    if err:
+        return err
+    if around_message_id not in {r["id"] for r in rows}:
+        return tool_error(f"around_message_id {around_message_id} is not a verified message from this sender "
+                          f"in session_id {session_id}", success=False)
+    window_rows, before, after = _window_around(rows, around_message_id, window)
+    return _ok(mode="scroll", session_id=session_id, around_message_id=around_message_id,
+               session_meta=_sender_meta_block(meta), window=window,
+               messages=[_shape_sender_message(m, anchor_id=around_message_id) for m in window_rows],
+               sender_messages_before=before, sender_messages_after=after,
+               sender_filter=flt.describe(), attribution_note=_SENDER_NOTE)
+
+
+def _sender_browse(db, flt: "_SenderFilter", limit: int, current_session_id: Optional[str],
+                   link_profile: Optional[str]) -> str:
+    def _browse():
+        bounded_list = getattr(db, "list_recent_sessions_bounded", None)
+        if bounded_list is None:
+            raise RuntimeError("session database does not support bounded recent-session browse")
+        sessions = bounded_list(limit=_SENDER_BROWSE_SCAN, exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                                timeout_seconds=3.0)
+        results = []
+        for s in sessions:
+            sid = s.get("id", "")
+            if not sid or sid == current_session_id:
+                continue
+            rows = _quiet(lambda: _sender_rows(db, sid, flt), [], "sender rows failed for %s", sid)
+            if not rows:
+                continue
+            results.append({"session_id": sid, "link": _session_link(sid, link_profile),
+                            "source": s.get("source", ""), "started_at": s.get("started_at", ""),
+                            "sender_message_count": len(rows),
+                            "last_sender_message_id": rows[-1]["id"],
+                            "last_sender_message_at": rows[-1].get("timestamp")})
+            if len(results) >= limit:
+                break
+        return _ok(mode="browse", results=results, count=len(results), sender_filter=flt.describe(),
+                   attribution_note=_SENDER_NOTE, message=(
+                       f"Showing {len(results)} recent sessions containing verified messages from this "
+                       "sender. Read one with session_id (same sender filters)."))
+
+    out, err = _loud(_browse, "Error listing sender sessions: %s", "Failed to list recent sessions")
+    return err or out
+
+
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               around_message_id, window, sort, profile, detail, owned_dbs,
-              after=None, before=None, exclude_session_ids=None) -> str:
+              after=None, before=None, exclude_session_ids=None, sender=None) -> str:
     """Mode dispatch (see module docstring); scroll wins when an anchor is set.
     Profile DBs opened here are appended to *owned_dbs* for the caller to close."""
     # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
@@ -587,6 +874,9 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+    if sender is not None and sender.scope is not None and isinstance(profile, str) and profile.strip():
+        return tool_error("session_search can't read another profile while sender attribution is enforced "
+                          "on this one", success=False)
     # Cross-profile: swap in the named profile's DB (read-only) for every shape;
     # current-lineage guards key off ids that won't collide, so they stay inert.
     try:
@@ -597,17 +887,28 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
         db, current_session_id = profile_db, None
         owned_dbs.append(profile_db)
     if isinstance(session_id, str) and session_id.strip():
+        if sender is not None:
+            if around_message_id is not None:
+                return _sender_scroll(db, session_id.strip(), around_message_id, sender, window, current_session_id)
+            return _sender_read(db, session_id.strip(), sender, link_profile=profile)
         if around_message_id is not None:
             return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
         return _read_scoped(db, session_id.strip(), profile)
     limit = _clamp_int(limit, 3, 1, 10)
     if not query or not isinstance(query, str) or not query.strip():
+        if sender is not None:
+            return _sender_browse(db, sender, limit, current_session_id, link_profile=profile)
         return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
     sort_norm = sort.strip().lower() if isinstance(sort, str) else None
     try:
         after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
     except ValueError as e:
         return tool_error(str(e), success=False)
+    if sender is not None:
+        return _sender_discover(
+            db, query.strip(), sender, limit, sort_norm if sort_norm in ("newest", "oldest") else None,
+            "full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
+            current_session_id, profile, after_ts, before_ts, _normalize_exclude_session_ids(exclude_session_ids))
     return _discover(
         db=db, query=query.strip(), limit=limit, sort=sort_norm if sort_norm in ("newest", "oldest") else None,
         role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
@@ -619,11 +920,24 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
 def session_search(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
                    current_session_id: str | None = None, session_id: str | None = None, around_message_id: int | None = None,
                    window: int = 5, sort: str | None = None, profile: str | None = None, detail: str = "adaptive",
-                   after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None) -> str:
+                   after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None,
+                   sender_platform: str | None = None, sender_user_id: str | None = None,
+                   sender_chat_id: str | None = None, require_unthreaded: bool | None = None,
+                   recall_scope: Any = None, enforce_scope: bool | None = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
     from hermes_state import format_session_db_unavailable
     from hermes_state_registry import acquire, release_or_close
+    if enforce_scope is None:
+        from agent.recall_scope import enforcement_enabled
+        enforce_scope = enforcement_enabled()
+    if enforce_scope and isinstance(profile, str) and profile.strip():
+        return tool_error("session_search can't read another profile while sender attribution is enforced "
+                          "on this one", success=False)
+    sender, sender_err = _parse_sender_filter(sender_platform, sender_user_id, sender_chat_id, require_unthreaded,
+                                              recall_scope=recall_scope, enforce_scope=enforce_scope)
+    if sender_err:
+        return sender_err
     owned_dbs: list[Any] = []
     if db is None:
         db = _quiet(acquire, None, "SessionDB unavailable for session_search")
@@ -633,7 +947,7 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
     try:
         return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                          around_message_id, window, sort, profile, detail, owned_dbs,
-                         after=after, before=before, exclude_session_ids=exclude_session_ids)
+                         after=after, before=before, exclude_session_ids=exclude_session_ids, sender=sender)
     finally:
         for owned_db in reversed(owned_dbs):
             _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
@@ -766,6 +1080,28 @@ SESSION_SEARCH_SCHEMA = {
                     "behaviour) or 'tool' to search tool output only."
                 ),
             },
+            "sender_platform": {
+                "type": "string",
+                "description": (
+                    "Optional sender scope (all shapes). Platform of the person whose OWN "
+                    "messages you want, e.g. 'slack'. Requires sender_user_id. When set, only "
+                    "user messages with a verified persisted sender matching every sender_* "
+                    "filter are returned; assistant replies, other participants, titles and "
+                    "previews are omitted, and unattributed messages are excluded."
+                ),
+            },
+            "sender_user_id": {
+                "type": "string",
+                "description": "Optional sender scope. Platform user id (e.g. Slack U…). Requires sender_platform.",
+            },
+            "sender_chat_id": {
+                "type": "string",
+                "description": "Optional sender scope. Only messages the sender posted in this chat/channel id.",
+            },
+            "require_unthreaded": {
+                "type": "boolean",
+                "description": "Optional sender scope. Only top-level messages (exclude thread replies).",
+            },
             "profile": {
                 "type": "string",
                 "description": (
@@ -791,6 +1127,7 @@ registry.register(
         query=args.get("query") or "", limit=args.get("limit", 3), window=args.get("window", 5),
         detail=args.get("detail", "adaptive"), db=kw.get("db"), current_session_id=kw.get("current_session_id"),
         **{k: args.get(k) for k in ("role_filter", "session_id", "around_message_id", "sort", "profile",
-                                    "after", "before", "exclude_session_ids")}),
+                                    "after", "before", "exclude_session_ids", "sender_platform",
+                                    "sender_user_id", "sender_chat_id", "require_unthreaded")}),
     check_fn=check_session_search_requirements,
     emoji="🔍")

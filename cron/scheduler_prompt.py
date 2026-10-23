@@ -126,10 +126,39 @@ def _clip_to_context_budget(text: str) -> str:
     return f"{text[:keep]}\n\n[... {omitted} chars omitted ...]\n\n{text[-keep:]}"
 
 
+_RECALL_SCOPE_HEADER = "**Recall scope:** "
+
+
+def recall_scope_header_line(job: dict) -> str:
+    """Run-document header line recording the scope a run ran under ("" when it has none)."""
+    from agent.recall_scope import scope_from_patterns
+    scope = scope_from_patterns(job.get("recall_scope"))
+    return f"{_RECALL_SCOPE_HEADER}{scope.key()}\n" if scope is not None else ""
+
+
+def _recorded_recall_scope(header: str):
+    """The scope a past run recorded in its header, or None (legacy or unscoped run)."""
+    from agent.recall_scope import scope_from_patterns
+    for line in header.splitlines():
+        if line.startswith(_RECALL_SCOPE_HEADER):
+            return scope_from_patterns(line[len(_RECALL_SCOPE_HEADER):].strip().split("|"))
+    return None
+
+
 def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
-    """Prepend the latest output of each ``context_from`` job; returns ``(prompt, injected)``."""
+    """Prepend the latest output of each ``context_from`` job; returns ``(prompt, injected)``.
+
+    Under recall-scope enforcement (agent/recall_scope.py) an output is eligible only if the scope
+    its run RECORDED is covered by this job's scope; legacy outputs record none and are skipped."""
     context_from = job.get("context_from")
     if not context_from:
+        return prompt, False
+    from agent.recall_scope import enforcement_enabled, scope_from_patterns
+    enforced = enforcement_enabled()
+    current_scope = scope_from_patterns(job.get("recall_scope")) if enforced else None
+    if enforced and current_scope is None:
+        logger.info("context_from: job_id=%r has no recall scope under enforcement; nothing injected",
+                    job.get("id"))
         return prompt, False
     from cron.jobs import get_cron_output_dir
     output_dir = get_cron_output_dir()
@@ -167,6 +196,10 @@ def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
                 )
                 if not candidate.strip() or silent_audit:
                     continue
+                if enforced:
+                    recorded = _recorded_recall_scope(header)
+                    if recorded is None or not current_scope.covers(recorded):
+                        continue  # unknown or wider provenance: never injected
                 answer = _archive_answer(candidate)
                 if answer is None:
                     continue  # [SILENT]/blank response — try an older archive
