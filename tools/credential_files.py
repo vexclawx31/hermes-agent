@@ -107,7 +107,15 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
 
 
 def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> list[str]:
-    """Register skill-frontmatter entries (str or dict with ``path``); return missing paths."""
+    """Register skill-frontmatter entries (str or dict with ``path``); return missing or refused paths.
+
+    A skill can't authorize its own mounts: skills are written by the agent itself (``skill_manage``) or
+    installed from the hub, and any HERMES_HOME file outside the master-store deny-list (``state.db``,
+    ``config.yaml``, a CLI's token cache) would otherwise be bind-mounted into the sandbox the skill's
+    code runs in. Only paths the operator lists verbatim in ``terminal.credential_files`` are registered;
+    anything else is reported back as missing so the skill shows setup-needed.
+    """
+    authorized = _config_authorized_paths()
     missing = []
     for entry in entries:
         if isinstance(entry, dict):
@@ -115,9 +123,22 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
         elif not isinstance(entry, str):
             continue
         rel_path = entry.strip()
-        if rel_path and not register_credential_file(rel_path, container_base):
+        if not rel_path:
+            continue
+        if posixpath.normpath(rel_path) not in authorized:
+            logger.warning("credential_files: refused skill-declared %r — not listed in terminal.credential_files",
+                           rel_path)
+            missing.append(rel_path)
+        elif not register_credential_file(rel_path, container_base):
             missing.append(rel_path)
     return missing
+
+
+def _config_authorized_paths() -> set[str]:
+    """Normalized HERMES_HOME-relative paths the operator authorized in ``terminal.credential_files``."""
+    prefix = "/root/.hermes/"
+    return {posixpath.normpath(entry["container_path"][len(prefix):])
+            for entry in _load_config_files() if entry["container_path"].startswith(prefix)}
 
 
 def _load_config_files() -> list[dict[str, str]]:
@@ -143,8 +164,14 @@ def _load_config_files() -> list[dict[str, str]]:
                 rel, hermes_home,
                 "credential_files: rejected absolute config path %r",
                 "credential_files: rejected config path traversal %r (%s)")
-            if resolved_path is not None and resolved_path.is_file():
-                result.append(_mount(resolved_path, f"/root/.hermes/{rel}"))
+            if resolved_path is None or not resolved_path.is_file():
+                continue
+            # The operator's list gets the same master-store deny-list as skills (fails closed).
+            if get_read_block_error is None or get_read_block_error(str(resolved_path)):
+                logger.warning("credential_files: refused config entry %r — a credential store the agent "
+                               "is denied from reading, or the guard is unavailable", rel)
+                continue
+            result.append(_mount(resolved_path, f"/root/.hermes/{rel}"))
     except Exception as e:
         logger.warning("Could not read terminal.credential_files from config: %s", e)
 
