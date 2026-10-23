@@ -55,12 +55,14 @@ def local_origin() -> str:
     return (_clean_text(host) or "").replace("/", "")
 
 
-def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
+def parse_turn_author(raw: Any, *, keep_verified: bool = False) -> Optional[dict[str, Any]]:
     """Normalize a dict or JSON string into ``{"id", "name", "is_bot"}``; None for anything else or without id and name.
     The id is whatever the transport knows the sender by: ``bot:<profile>`` on a bot-mode delivery inside one
     install, ``bot:<connection>/<profile>`` when the Desktop relayed it from another machine,
     ``bot:<hostname>/<profile>`` on a peer dm, the platform user id elsewhere.
-    An ``origin`` field qualifies a bare ``bot:<profile>`` id the same way."""
+    An ``origin`` field qualifies a bare ``bot:<profile>`` id the same way.
+    ``verified`` (the gateway's trusted-sender flag, agent/recall_scope.py attribution) survives only with
+    ``keep_verified``: a client-supplied author (API server, env) can never claim it."""
     try:
         if isinstance(raw, (str, bytes)):
             raw = json.loads(raw)
@@ -73,6 +75,8 @@ def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
         }
         if author["id"] is None and author["name"] is None:
             return None
+        if keep_verified and isinstance(raw.get("verified"), bool):
+            author["verified"] = raw["verified"]
         origin = _clean_text(raw.get("origin"))
         if origin and author["id"] and author["id"].startswith("bot:") and "/" not in author["id"]:
             author["id"] = _clean_text(bot_author_id(author["id"][len("bot:"):], origin))

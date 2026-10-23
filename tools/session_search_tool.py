@@ -725,6 +725,7 @@ def _shape_sender_message(row: dict[str, Any], anchor_id: Optional[int] = None,
         meta = _quiet(lambda: json.loads(meta), {}, "sender metadata decode failed")
     sender = dict((meta or {}).get("sender") or {})
     sender.pop("untrusted_reasons", None)
+    sender.pop("name", None)  # display name: shown only in attribution's author tag
     entry["sender"] = sender
     entry["attribution"] = "verified_sender"
     return entry
