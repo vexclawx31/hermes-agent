@@ -168,18 +168,60 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
         assert missing == ["absent.json"], "an existing token isn't 'missing' on the local backend"
         assert mounts == []
 
-    def test_symlink_swap_after_authorization_mounts_the_original(self, tmp_path):
+    def test_symlink_swap_after_authorization_is_not_mounted(self, tmp_path):
         home = self._home(tmp_path)
         _authorize(home, ["service_token.json"])
-        env = {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}
-        with patch.dict(os.environ, env):
-            assert get_credential_file_mounts()[0]["host_path"] == str((home / "service_token.json").resolve())
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
+            assert [m["container_path"] for m in get_credential_file_mounts()] == ["/root/.hermes/service_token.json"]
             original = home / "service_token.json"
             original.rename(home / "service_token.orig")
             original.symlink_to(home / "state.db")
-            assert register_credential_files(["service_token.json"]) == []
-            hosts = [m["host_path"] for m in get_credential_file_mounts()]
-        assert str((home / "state.db").resolve()) not in hosts
+            mounts = get_credential_file_mounts()
+            assert register_credential_files(["service_token.json"]) == ["service_token.json"]
+        assert mounts == [], "a swapped-in symlink must not be mounted under the authorized name"
+
+    def test_parent_directory_swap_is_not_mounted(self, tmp_path):
+        home = self._home(tmp_path)
+        (home / "svc").mkdir()
+        (home / "svc" / "token.json").write_text("{}")
+        _authorize(home, ["svc/token.json"])
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
+            assert len(get_credential_file_mounts()) == 1
+            (home / "svc").rename(home / "svc.orig")
+            (home / "svc").symlink_to(home / "cli-tool")
+            (home / "cli-tool" / "token.json").write_text("other tool's token")
+            assert get_credential_file_mounts() == []
+
+    def test_file_created_after_startup_is_picked_up(self, tmp_path):
+        home = self._home(tmp_path)
+        _authorize(home, ["late_token.json"])
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
+            assert register_credential_files(["late_token.json"]) == ["late_token.json"]
+            assert get_credential_file_mounts() == []
+            (home / "late_token.json").write_text("{}")  # e.g. OAuth setup finishes mid-session
+            assert register_credential_files(["late_token.json"]) == []
+            assert [m["container_path"] for m in get_credential_file_mounts()] == ["/root/.hermes/late_token.json"]
+
+    def test_guard_exception_drops_only_that_entry(self, tmp_path):
+        import tools.credential_files as cred_mod
+        home = self._home(tmp_path)
+        (home / "other.json").write_text("{}")
+        _authorize(home, ["service_token.json", "other.json"])
+
+        def guard(path):
+            if path.endswith("other.json"):
+                raise RuntimeError("guard failure")
+            return None
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}), \
+                patch.object(cred_mod, "get_read_block_error", guard):
+            mounts = get_credential_file_mounts()
+        assert [m["container_path"] for m in mounts] == ["/root/.hermes/service_token.json"]
+
+    def test_local_backend_reports_absolute_and_traversal_paths(self, tmp_path):
+        home = self._home(tmp_path)
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "local"}):
+            assert register_credential_files(["/etc/hosts", "../outside.json", "service_token.json"]) == [
+                "/etc/hosts", "../outside.json"]
 
     def test_config_spelling_is_normalized(self, tmp_path):
         home = self._home(tmp_path)
