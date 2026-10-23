@@ -78,7 +78,7 @@ class TestGoogleWorkspaceCredentialFiles:
         cred_mod._config_files = {}
         try:
             entries = _parse_frontmatter(SKILL_MD.read_text(encoding="utf-8")).get("required_credential_files", [])
-            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "docker"}):
                 missing = register_credential_files(entries)
                 assert set(missing) == _EXPECTED_PATHS
                 assert get_credential_file_mounts() == []

@@ -98,7 +98,7 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
     def test_unauthorized_profile_file_is_refused(self, tmp_path, rel_path):
         home = self._home(tmp_path)
         _authorize(home, ["service_token.json"])
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files([{"path": rel_path}])
             mounts = get_credential_file_mounts()
         assert missing == [rel_path], "a refused declaration is reported back as missing"
@@ -106,7 +106,7 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
 
     def test_no_config_means_no_skill_mounts(self, tmp_path):
         home = self._home(tmp_path)
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files(["service_token.json", "state.db"])
             mounts = get_credential_file_mounts()
         assert missing == ["service_token.json", "state.db"]
@@ -115,7 +115,7 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
     def test_authorized_path_mounts_once(self, tmp_path):
         home = self._home(tmp_path)
         _authorize(home, ["service_token.json"])
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files(["./service_token.json"])
             mounts = get_credential_file_mounts()
         assert missing == []
@@ -124,7 +124,7 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
     def test_authorization_is_by_exact_path_not_prefix(self, tmp_path):
         home = self._home(tmp_path)
         _authorize(home, ["cli-tool/token_cache.json"])
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files(["cli-tool/credentials.enc", "cli-tool"])
         assert missing == ["cli-tool/credentials.enc", "cli-tool"]
 
@@ -132,7 +132,7 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
         home = self._home(tmp_path)
         (home / "alias.json").symlink_to(home / "state.db")
         _authorize(home, ["service_token.json"])
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             missing = register_credential_files(["alias.json"])
             mounts = get_credential_file_mounts()
         assert missing == ["alias.json"]
@@ -144,7 +144,7 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
         outside.write_text("{}")
         (home / "escape.json").symlink_to(outside)
         _authorize(home, ["escape.json"])
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             assert register_credential_files(["escape.json"]) == ["escape.json"]
             assert get_credential_file_mounts() == []
 
@@ -155,9 +155,38 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
         for name in (".env", "auth.json", "mcp-tokens/srv.json"):
             (home / name).write_text("secret")
         _authorize(home, [rel_path])
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
             assert get_credential_file_mounts() == []
             assert register_credential_files([rel_path]) == [rel_path]
+
+
+    def test_local_backend_reports_only_absent_files(self, tmp_path):
+        home = self._home(tmp_path)
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "local"}):
+            missing = register_credential_files(["service_token.json", "state.db", "absent.json"])
+            mounts = get_credential_file_mounts()
+        assert missing == ["absent.json"], "an existing token isn't 'missing' on the local backend"
+        assert mounts == []
+
+    def test_symlink_swap_after_authorization_mounts_the_original(self, tmp_path):
+        home = self._home(tmp_path)
+        _authorize(home, ["service_token.json"])
+        env = {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}
+        with patch.dict(os.environ, env):
+            assert get_credential_file_mounts()[0]["host_path"] == str((home / "service_token.json").resolve())
+            original = home / "service_token.json"
+            original.rename(home / "service_token.orig")
+            original.symlink_to(home / "state.db")
+            assert register_credential_files(["service_token.json"]) == []
+            hosts = [m["host_path"] for m in get_credential_file_mounts()]
+        assert str((home / "state.db").resolve()) not in hosts
+
+    def test_config_spelling_is_normalized(self, tmp_path):
+        home = self._home(tmp_path)
+        _authorize(home, ["./service_token.json"])
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
+            assert register_credential_files(["service_token.json"]) == []
+            assert [m["container_path"] for m in get_credential_file_mounts()] == ["/root/.hermes/service_token.json"]
 
 
 class TestSkillsDirectoryMount:
