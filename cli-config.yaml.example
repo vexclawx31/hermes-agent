@@ -73,6 +73,18 @@ plugins:
   # command, runs without it and leaves config.yaml untouched.
   auto_install_left_core: false
 
+  # Per-plugin host API grants (all default off), keyed by the plugin's registry key:
+  # entries:
+  #   my-plugin:
+  #     # Let the plugin start or continue messaging-gateway turns (ctx.inject_message
+  #     # with session_key or origin).
+  #     allow_gateway_injection: true
+  #     # Also let it name the agent that wrote the injected text
+  #     # (ctx.inject_message(author={"id": ..., "name": ...})). The turn is shown and
+  #     # recorded as that agent; routing and authorization still use the origin.
+  #     # Requires allow_gateway_injection.
+  #     allow_injection_author: true
+
 # =============================================================================
 # Model Configuration
 # =============================================================================
