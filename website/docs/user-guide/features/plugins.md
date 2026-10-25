@@ -972,9 +972,10 @@ ctx.inject_message(
 - The turn is shown and recorded as that agent, never as the origin's user: the speaker tag is `[<name> (agent plugin:<plugin>/<id>)]` in every chat type, memory providers receive `turn_author` `{"id": "plugin:<plugin>/<id>", "name", "is_bot": true, "verified": false, "origin": "plugin", "plugin"}`, and the transcript row carries a display-only `plugin_author` record (no `sender`), which context summaries and `session_search` show as an unverified agent.
 - Routing and authorization are unchanged: they still use the `origin` (or the stored session route), and its user must pass the gateway's current authorization. The author never widens who may start a turn.
 - Every authored turn counts once against the chat's bot loop guard (`gateway.bot_loop_guard`, the same per-chat budget native bots share). When the budget trips, further authored turns in that chat are dropped and logged during the cooldown; human messages are never counted or blocked.
-- An authored event is never a control event: it cannot run slash commands or answer approval, clarify, slash-confirm or update prompts. In a busy session it queues as its own turn and is never merged with a human's message.
+- An authored event is never a control event: it cannot run slash commands or answer approval, clarify, slash-confirm or update prompts. In a busy session it queues as its own turn and is never merged with a human's message in either direction: a human message (text, photo or follow-up) that arrives while an authored event is queued takes its own place behind it and runs as the human's own turn.
 - The marking is attribution, not a sandbox: the turn runs with the session's normal tools and approval policy.
-- Returns `False` when the permission below is missing, the values are invalid, `role` is not `"user"`, or the host is the classic CLI or the Ink TUI (no author support there).
+- An authored call is never delivered to the classic CLI or the Ink TUI / desktop host (no author support there): with a `session_key` it goes to the messaging gateway or nowhere.
+- The `True`/`False` contract is the same as for gateway injection: `True` means the live gateway accepted the request for asynchronous dispatch, not that the turn ran (authorization and loop-guard refusals at dispatch are logged). `False` additionally covers a missing permission below, invalid `author` values, a `role` other than `"user"`, and the CLI / TUI hosts.
 
 Grant it per plugin, on top of gateway injection:
 
