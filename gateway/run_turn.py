@@ -29,7 +29,7 @@ from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
-from gateway.sender_attribution import sender_metadata
+from gateway.sender_attribution import plugin_author_metadata, sender_metadata
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -1818,6 +1818,8 @@ class GatewayTurnMixin:
             _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
         if _sender := sender_metadata(event, getattr(event, "source", None)):
             _user_entry["display_metadata"] = {**(_user_entry.get("display_metadata") or {}), **_sender}
+        if _plugin_author := plugin_author_metadata(event):
+            _user_entry["display_metadata"] = {**(_user_entry.get("display_metadata") or {}), **_plugin_author}
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
@@ -2211,9 +2213,11 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event),
-                    **sender_metadata(event, getattr(event, "source", None) or _turn_source)},
+                    **sender_metadata(event, getattr(event, "source", None) or _turn_source),
+                    **plugin_author_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                **self._plugin_author_turn_kwargs(event),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2922,6 +2926,15 @@ class GatewayTurnMixin:
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
+
+    @staticmethod
+    def _plugin_author_turn_kwargs(event: Any) -> dict[str, Any]:
+        """``{"plugin_author": <PluginAuthor>}`` for a plugin-authored event, else ``{}`` so a human
+        turn's ``_run_agent`` call stays exactly as it was. A merged event keeps the bot author for
+        the turn (never the human's: at worst a downgrade); only its persisted record is withheld."""
+        from agent.plugin_author import event_plugin_author
+        author = event_plugin_author(event)
+        return {"plugin_author": author} if author is not None else {}
 
     async def _run_agent(
         self, message: str, context_prompt: str, history: list[dict[str, Any]],
@@ -3944,7 +3957,9 @@ class GatewayTurnMixin:
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event),
-                    **sender_metadata(pending_event, next_source)} or None,
+                    **sender_metadata(pending_event, next_source), **plugin_author_metadata(pending_event)} or None,
+                # The author rides the queued event itself, never next_source's human.
+                **self._plugin_author_turn_kwargs(pending_event),
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4273,6 +4288,7 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        plugin_author: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4311,6 +4327,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
+            plugin_author=plugin_author,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(

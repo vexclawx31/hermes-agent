@@ -75,6 +75,20 @@ def sender_metadata(event: Any, source: Any = None) -> dict[str, Any]:
     return {SENDER_METADATA_KEY: sender}
 
 
+def plugin_author_metadata(event: Any) -> dict[str, Any]:
+    """``{"plugin_author": {...}}`` (agent/plugin_author.py) for a plugin-authored event, else ``{}``.
+
+    Display-only and written next to, never inside, ``sender``: a plugin-authored event is internal,
+    so :func:`sender_metadata` writes no sender for it and the two never meet on one row. A merged
+    event (``_mixed_senders``) can no longer be attributed to the author alone and writes neither."""
+    from agent.plugin_author import PLUGIN_AUTHOR_KEY, event_plugin_author
+
+    author = event_plugin_author(event)
+    if author is None or getattr(event, "_mixed_senders", False):
+        return {}
+    return {PLUGIN_AUTHOR_KEY: author.display_record()}
+
+
 def trusted_turn_scope(source: Any):
     """The recall scope of a live turn (agent/recall_scope.py), or None when its sender is not proven.
 
