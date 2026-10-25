@@ -62,17 +62,26 @@ def parse_turn_author(raw: Any, *, keep_verified: bool = False) -> Optional[dict
     ``bot:<hostname>/<profile>`` on a peer dm, the platform user id elsewhere.
     An ``origin`` field qualifies a bare ``bot:<profile>`` id the same way.
     ``verified`` (the gateway's trusted-sender flag, agent/recall_scope.py attribution) survives only with
-    ``keep_verified``: a client-supplied author (API server, env) can never claim it."""
+    ``keep_verified``: a client-supplied author (API server, env) can never claim it.
+    Plugin authors (agent/plugin_author.py) are gateway-built only: with ``keep_verified`` a ``plugin:``
+    id marked ``origin: "plugin"`` is re-validated and kept exactly (or refused); without it a
+    ``plugin:`` id is refused. Everywhere else ``origin`` keeps its one meaning (qualifying a bare
+    ``bot:`` id, unchanged for bot-relay callers), so a client can never mint a plugin author."""
     try:
         if isinstance(raw, (str, bytes)):
             raw = json.loads(raw)
         if not isinstance(raw, Mapping):
             return None
+        if keep_verified and raw.get("origin") == "plugin" and str(raw.get("id") or "").startswith("plugin:"):
+            from agent.plugin_author import gateway_turn_author
+            return gateway_turn_author(raw)
         author = {
             "id": _clean_text(raw.get("id")),
             "name": _clean_text(raw.get("name")),
             "is_bot": _bot_flag(raw.get("is_bot")),
         }
+        if not keep_verified and author["id"] and author["id"].lower().startswith("plugin:"):
+            return None
         if author["id"] is None and author["name"] is None:
             return None
         if keep_verified and isinstance(raw.get("verified"), bool):
