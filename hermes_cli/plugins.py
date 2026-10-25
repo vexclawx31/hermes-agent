@@ -602,7 +602,7 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
-        origin: Mapping[str, Any] | None = None,
+        origin: Mapping[str, Any] | None = None, author: Mapping[str, Any] | None = None,
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -614,10 +614,18 @@ class PluginContext:
         chat's session in THIS plugin's own profile and runs a turn there; the plugin cannot
         target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
+        ``author`` (``{"id": str, "name": str}``, exactly those keys) names the agent that wrote
+        *content* when the plugin relays another agent's words: the turn is recorded and shown as
+        that agent (``plugin:<plugin_id>/<id>``), never as the origin's human, while routing and
+        authorization stay on the origin. Messaging gateway only (CLI and TUI return ``False``),
+        ``role="user"`` only, and it needs ``plugins.entries.<plugin_id>.allow_injection_author``
+        on top of ``allow_gateway_injection``. Invalid values are refused, never cleaned up.
         ``True`` means a host accepted the request, not that the turn completed.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        if author is None:
+            return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin, author=author)
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns (read from the plugin's
@@ -628,6 +636,18 @@ class PluginContext:
         except Exception:
             return False
         return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_gateway_injection") is True
+
+    def _gateway_injection_author_allowed(self) -> bool:
+        """Return whether this plugin may name the author of its injected gateway turns:
+        ``allow_injection_author: true`` AND ``allow_gateway_injection: true`` in the plugin's own
+        profile config. Fail closed on any read error."""
+        try:
+            with _plugin_home_scope(self._manager.home_path):
+                cfg = load_config_readonly() or {}
+        except Exception:
+            return False
+        entry = _plugin_settings_entry(cfg, self.plugin_id) or {}
+        return entry.get("allow_gateway_injection") is True and entry.get("allow_injection_author") is True
 
     @_serialized_replacement
     def register_cli_command(
