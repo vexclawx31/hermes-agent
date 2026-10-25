@@ -1119,6 +1119,14 @@ def _persisted_sender(msg: dict[str, Any]) -> Optional[dict[str, Any]]:
     return dict(sender) if isinstance(sender, dict) else None
 
 
+def _persisted_plugin_author(msg: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The display-only ``plugin_author`` record of a stored user row when well-formed and alone
+    (agent/plugin_author.py), else None. Display only: it never authorizes or verifies anything."""
+    from agent.plugin_author import display_plugin_author
+    author = display_plugin_author(msg.get("display_metadata"))
+    return author.display_record() if author is not None else None
+
+
 def _build_replay_entry(
     role: str, content: Any, msg: dict[str, Any], preserve_timestamp: bool = False
 ) -> dict[str, Any]:
@@ -1158,6 +1166,9 @@ def _build_replay_entry(
         # View-only (underscore keys never reach a provider): who wrote this row, for the
         # compressor's attribution labels (agent/context_compressor.py, agent/recall_scope.py).
         entry["_sender"] = sender
+    elif role == "user" and (plugin_author := _persisted_plugin_author(msg)) is not None:
+        # View-only, like ``_sender``: the agent a plugin named as this row's author (display only).
+        entry["_plugin_author"] = plugin_author
     # Replay rebuilds the SAME conversation for its next turn: every role keeps its uid and merge witness, so a
     # context engine sees the uids the store holds. Tool-call uid maps stay with the rows that still carry
     # their calls (those pass through whole); on a plain row a leftover map would name calls it no longer has.

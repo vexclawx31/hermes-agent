@@ -2148,16 +2148,25 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 
 def _summary_author_label(msg: dict[str, Any], redact: Any = None) -> str:
     """``platform:<id> verified, shown as <name>`` (name when known; display only) from a user row's persisted
-    trusted sender, else ``author unknown``."""
+    trusted sender; ``agent plugin:<p>/<id>, shown as <name>`` from a well-formed display-only plugin
+    author record (agent/plugin_author.py) with no sender; else ``author unknown``."""
     sender = msg.get("_sender")
-    if sender is None:
+    plugin_record = msg.get("_plugin_author")
+    if sender is None or plugin_record is None:
         meta = msg.get("display_metadata")
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
             except (TypeError, ValueError):
                 meta = None
-        sender = meta.get("sender") if isinstance(meta, dict) else None
+        if sender is None:
+            sender = meta.get("sender") if isinstance(meta, dict) else None
+        if plugin_record is None:
+            plugin_record = meta.get("plugin_author") if isinstance(meta, dict) else None
+    if plugin_record is not None:
+        from agent.recall_scope import plugin_author_label
+        label = None if sender is not None else plugin_author_label({"plugin_author": plugin_record})
+        return " ".join(re.sub(r"[\[\]()<>]", " ", label).split()) if label else "author unknown"
     if not isinstance(sender, dict) or sender.get("trusted") is not True:
         return "author unknown"
     platform, user_id = str(sender.get("platform") or "").strip(), str(sender.get("user_id") or "").strip()

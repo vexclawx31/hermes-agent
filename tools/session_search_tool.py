@@ -246,6 +246,13 @@ def _author_tag(m: dict[str, Any], redact: Any = None) -> dict[str, Any]:
     meta = m.get("display_metadata")
     if isinstance(meta, str):
         meta = _quiet(lambda: json.loads(meta), {}, "sender metadata decode failed")
+    if isinstance(meta, dict) and "plugin_author" in meta:
+        # Display-only agent record (agent/plugin_author.py): never verified; alongside a sender, unknown.
+        from agent.plugin_author import display_plugin_author
+        author = display_plugin_author(meta)
+        if author is None:
+            return {"verified": False}
+        return {"agent": author.label, "name": author.name, "origin": "plugin", "verified": False}
     sender = meta.get("sender") if isinstance(meta, dict) else None
     if not isinstance(sender, dict) or sender.get("trusted") is not True or not sender.get("user_id"):
         return {"verified": False}
