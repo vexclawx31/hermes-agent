@@ -1800,10 +1800,9 @@ class EphemeralReply(str):
 
 def crosses_author_boundary(existing: Any, event: Any) -> bool:
     """True when two events must never share one turn: a plugin-authored event and anything not
-    written by the same plugin author, or an internal event and a non-internal one. Merging them
-    would run one party's words under the other's identity (and control rights)."""
-    return (event_plugin_author(existing) != event_plugin_author(event)
-            or bool(getattr(existing, "internal", False)) != bool(getattr(event, "internal", False)))
+    written by the same plugin author. Merging them would run one party's words under the other's
+    identity (and control rights). Inert without a plugin author: every other merge is as before."""
+    return event_plugin_author(existing) != event_plugin_author(event)
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
@@ -1811,7 +1810,7 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
                                 queue_behind: Optional[Callable[[MessageEvent], None]] = None) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
-    replace. Never across an author/internal boundary (:func:`crosses_author_boundary`): the
+    replace. Never across a plugin-author boundary (:func:`crosses_author_boundary`): the
     incoming event then takes its own place behind the slot through ``queue_behind`` (the runner's
     FIFO); without one, the queued event is kept and the incoming one is logged and not merged."""
     existing = pending_messages.get(session_key)

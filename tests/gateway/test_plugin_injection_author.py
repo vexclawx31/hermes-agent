@@ -519,11 +519,27 @@ def test_authored_event_never_shares_a_slot_with_a_human_event():
 
 
 def test_same_author_events_still_merge_and_humans_are_unchanged():
-    """The guard only splits across an author/internal boundary: two human texts still merge."""
+    """The guard only splits across a plugin-author boundary: two human texts still merge."""
     first, second = MessageEvent(text="a", source=_human_source()), MessageEvent(text="b", source=_human_source())
     pending, behind = {"k": first}, []
     merge_pending_message_event(pending, "k", second, merge_text=True, queue_behind=behind.append)
     assert behind == [] and first.text == "a\nb"
+
+
+@pytest.mark.parametrize("control", [True, False], ids=["wake", "plugin_injection_without_author"])
+def test_human_photo_still_merges_into_a_non_authored_internal_event_as_on_base(control):
+    """Inert without a plugin author: a human photo arriving while a non-authored internal event
+    (a gateway wake, or a plugin injection without ``author``) waits merges exactly as on base."""
+    waiting = MessageEvent(text="background job finished", source=_human_source(message_id=None), internal=True,
+                           allow_gateway_control=control)
+    photo = MessageEvent(text="look", message_type=MessageType.PHOTO, source=_human_source(),
+                         media_urls=["/x.png"], media_types=["image/png"])
+    pending, behind = {"k": waiting}, []
+    merge_pending_message_event(pending, "k", photo, queue_behind=behind.append)
+    assert behind == [] and pending == {"k": waiting}
+    assert waiting.media_urls == ["/x.png"] and waiting.message_type == MessageType.PHOTO
+    assert waiting.text == "background job finished\n\nlook"
+    assert waiting._mixed_senders is False  # same (platform, user_id) sender key as on base
 
 
 # ── P4: loop guard ────────────────────────────────────────────────────────────────────────────

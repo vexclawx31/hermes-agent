@@ -588,7 +588,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            # Never into a slot across an author/internal boundary: the event takes its FIFO place.
+            # Never into a slot across a plugin-author boundary: the event takes its FIFO place.
             merge_pending_message_event(
                 adapter._pending_messages, _quick_key, event, merge_text=merge_text,
                 queue_behind=lambda queued: self._enqueue_fifo(_quick_key, queued, adapter))
