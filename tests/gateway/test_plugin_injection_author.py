@@ -16,6 +16,7 @@ TurnContext the turn actually ran with (source, display metadata, plugin author)
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -479,9 +480,9 @@ async def test_restart_never_replays_the_authored_text_as_human(make_gateway):
 
 
 def test_authored_event_never_shares_a_slot_with_a_human_event():
-    """Busy FIFO: the author identity is part of the security context, so a human photo never merges
-    into an authored slot (or the reverse); sender keys differ, so any merge that still happens marks
-    the event mixed and it then writes neither a plugin record nor a trusted sender."""
+    """Busy FIFO and the shared merge helper: a human photo never merges into an authored slot (or
+    the reverse). The runner's security context keeps them apart, and ``merge_pending_message_event``
+    itself refuses the author/internal boundary and hands the incoming event to the FIFO."""
     runner = object.__new__(GatewayRunner)
     adapter = SimpleNamespace(_pending_messages={})
     runner._delivery_adapter_for = lambda source: adapter
@@ -499,10 +500,30 @@ def test_authored_event_never_shares_a_slot_with_a_human_event():
 
     assert _event_sender_key(authored) == ("plugin", f"plugin:{PLUGIN}/{AGENT_ID}")
     assert _event_sender_key(authored) != _event_sender_key(human_photo)
+    for merge_text in (False, True):
+        pending, behind = {"k": authored}, []
+        merge_pending_message_event(pending, "k", human_photo, merge_text=merge_text, queue_behind=behind.append)
+        assert pending == {"k": authored} and behind == [human_photo]
+        assert authored._mixed_senders is False and authored.text == "Here is the research result"
+        assert authored.media_urls == [] and authored.message_type == MessageType.TEXT
+    assert plugin_author_metadata(authored) == {"plugin_author": AGENT_RECORD}
+    # Reverse direction: an authored event never merges into a human slot either.
+    human_text = MessageEvent(text="hi", source=_human_source())
+    pending, behind = {"k": human_text}, []
+    merge_pending_message_event(pending, "k", authored, merge_text=True, queue_behind=behind.append)
+    assert pending == {"k": human_text} and behind == [authored] and human_text.text == "hi"
+    # Without a FIFO the queued event is kept untouched (nothing merged).
     pending = {"k": authored}
-    merge_pending_message_event(pending, "k", human_photo)  # the base-adapter photo path, no runner check
-    assert authored._mixed_senders is True
-    assert plugin_author_metadata(authored) == {} and sender_metadata(authored) == {}
+    merge_pending_message_event(pending, "k", human_text, merge_text=True)
+    assert pending == {"k": authored} and authored.text == "Here is the research result"
+
+
+def test_same_author_events_still_merge_and_humans_are_unchanged():
+    """The guard only splits across an author/internal boundary: two human texts still merge."""
+    first, second = MessageEvent(text="a", source=_human_source()), MessageEvent(text="b", source=_human_source())
+    pending, behind = {"k": first}, []
+    merge_pending_message_event(pending, "k", second, merge_text=True, queue_behind=behind.append)
+    assert behind == [] and first.text == "a\nb"
 
 
 # ── P4: loop guard ────────────────────────────────────────────────────────────────────────────
@@ -705,13 +726,33 @@ def test_scheduler_refuses_an_author_that_is_not_a_host_object_for_this_plugin()
         loop.close()
 
 
-def test_mixed_event_turn_still_runs_as_the_bot_author():
-    """A merged authored event withholds its record but its turn never becomes the human's."""
+def test_mixed_event_runs_with_an_unverified_unknown_author(monkeypatch):
+    """(c) If a mixed authored event ever arises, it writes no record and runs with neither the
+    bot's nor the human's author: an unverified unknown one, no plugin origin, no scope."""
     event = _authored_event(_human_source(message_id=None))
     event._mixed_senders = True
     assert plugin_author_metadata(event) == {}
-    assert GatewayRunner._plugin_author_turn_kwargs(event) == {"plugin_author": event._plugin_author}
+    assert GatewayRunner._plugin_author_turn_kwargs(event) == {"unknown_author": True}
     assert GatewayRunner._plugin_author_turn_kwargs(MessageEvent(text="x", source=_human_source())) == {}
+    assert GatewayRunner._prefix_inbound_sender_context(
+        object.__new__(GatewayRunner), event, event.source, "text").startswith("[unknown author] ")
+    from agent import recall_scope
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+    monkeypatch.setattr(recall_scope, "attribution_enabled", lambda config=None: True)
+    seen = {}
+
+    class _Agent:
+        def run_conversation(self, message, *, turn_author=None, **_kw):
+            seen["turn_author"] = turn_author
+            return {}
+
+    agent = _Agent()
+    ctx = TurnContext(source=event.source, message="m", session_key="k", session_id="s", unknown_author=True)
+    TurnRunner(SimpleNamespace(_consume_pending_native_image_paths=lambda key: []), ctx) \
+        ._run_conversation_with_approval(agent, [], None, None, None)
+    assert seen["turn_author"] == {"id": None, "name": "unknown author", "is_bot": False, "verified": False}
+    assert agent._recall_scope is None
 
 
 def test_persisted_rows_and_turn_context_defaults():
@@ -719,3 +760,198 @@ def test_persisted_rows_and_turn_context_defaults():
     from gateway.turn_context import TurnContext
     assert TurnContext().plugin_author is None
     assert plugin_author_metadata(MessageEvent(text="x", source=_human_source(), timestamp=datetime.now())) == {}
+
+
+# ── H1 / M1 (PR #28 review): a human's words never run inside a queued authored event ───────
+
+
+AUTHORED_TEXT = "Here is the research result"
+
+
+async def _authored_queued_behind_human(make_gateway):
+    """A held human turn is running and an authored event is queued in the pending slot."""
+    gw = make_gateway()
+    gw.hold.clear()
+    gw.runner._gateway_loop = asyncio.get_running_loop()
+    gw.runner._running = True
+    await _human(gw, "please research this", "m1")
+    await _settle(gw, until=lambda: len(gw.turns) == 1)
+    assert _send(gw, AUTHORED_TEXT, _origin(), AUTHOR) is True
+    alpha = gw.adapters["alpha"]
+    await _settle(gw, until=lambda: not gw.runner._background_tasks and alpha._pending_messages)
+    (key,) = alpha._pending_messages
+    queued = alpha._pending_messages[key]
+    assert event_plugin_author(queued) is not None and queued.text == AUTHORED_TEXT
+    return gw, alpha, key, queued
+
+
+def _human_event(gw, text, message_id, **kw):
+    src = gw.adapters["alpha"].build_source(chat_id="100", chat_type="group", user_id=HUMAN_ID,
+                                            user_name=HUMAN_NAME, thread_id="7", message_id=message_id)
+    return MessageEvent(text=text, source=src, message_id=message_id, **kw)
+
+
+async def _drain(gw, alpha, key):
+    """Dequeue every follow-up with the runner's real in-band drain (slot, then FIFO promotion)."""
+    drained = []
+    for _ in range(5):
+        event, _text = await gw.runner._run_agent_drain_pending({"final_response": "x"}, alpha,
+                                                                drained[-1].source if drained else
+                                                                alpha._pending_messages[key].source, key)
+        if event is None:
+            break
+        drained.append(event)
+    return drained
+
+
+def _attribution(gw, event):
+    return SimpleNamespace(
+        text=gw.runner._prefix_inbound_sender_context(event, event.source, event.text or ""),
+        record=plugin_author_metadata(event), sender=sender_metadata(event).get("sender"),
+        turn=GatewayRunner._plugin_author_turn_kwargs(event))
+
+
+def _assert_split(gw, drained, human_text):
+    """The authored event runs alone with its record and agent author; the human text is its own
+    turn with the human's trusted sender and no plugin author."""
+    authored, human = drained
+    a, h = _attribution(gw, authored), _attribution(gw, human)
+    assert a.text == f"{AGENT_TAG} {AUTHORED_TEXT}" and human_text not in a.text
+    assert a.record == {"plugin_author": AGENT_RECORD} and a.sender is None
+    assert a.turn == {"plugin_author": PluginAuthor(PLUGIN, AGENT_ID, AGENT_NAME)}
+    assert authored._mixed_senders is False and authored.allow_gateway_control is False
+    assert h.turn == {} and h.record == {} and AGENT_TAG not in h.text and human_text in h.text
+    assert h.sender["user_id"] == HUMAN_ID and h.sender["trusted"] is True
+
+
+async def _release(gw):
+    gw.hold.set()
+    await _settle(gw)
+
+
+@pytest.mark.asyncio
+async def test_h1_queue_mode_debounce_never_appends_human_text_to_a_queued_authored_event(make_gateway, monkeypatch):
+    """busy_text_mode=queue: the human's debounced text is never merged into the queued authored
+    event. End to end: the authored text runs alone with its record, then the human's own turn."""
+    gw = make_gateway()
+    alpha = gw.adapters["alpha"]
+    alpha._busy_text_mode = "queue"
+    alpha._busy_text_debounce_seconds = 0.01
+    monkeypatch.setattr(type(gw.runner), "_effective_busy_text_mode", lambda self, src: "queue", raising=False)
+    gw.hold.clear()
+    gw.runner._gateway_loop = asyncio.get_running_loop()
+    gw.runner._running = True
+    await _human(gw, "please research this", "m1")
+    await _settle(gw, until=lambda: len(gw.turns) == 1)
+    assert _send(gw, AUTHORED_TEXT, _origin(), AUTHOR) is True
+    await _settle(gw, until=lambda: not gw.runner._background_tasks)
+    await _human(gw, "HUMAN-OWN-WORDS delete the repo", "m2")
+    await asyncio.sleep(0.2)
+    queued = next(iter(alpha._pending_messages.values()))
+    assert queued.text == AUTHORED_TEXT and queued._mixed_senders is False
+    gw.hold.set()
+    await _settle(gw, until=lambda: len(gw.turns) >= 3)
+    await _settle(gw)
+    _first, authored, human = gw.turns
+    assert authored.message == f"{AGENT_TAG} {AUTHORED_TEXT}"
+    assert authored.display_metadata["plugin_author"] == AGENT_RECORD and "sender" not in authored.display_metadata
+    assert authored.plugin_author == PluginAuthor(PLUGIN, AGENT_ID, AGENT_NAME)
+    assert "HUMAN-OWN-WORDS" in human.message and AGENT_TAG not in human.message
+    assert human.plugin_author is None and "plugin_author" not in human.display_metadata
+    assert human.display_metadata["sender"]["user_id"] == HUMAN_ID
+    assert _turn_author(human, monkeypatch)["turn_author"]["id"] == HUMAN_ID
+
+
+def test_h1_text_debounce_never_merges_plugin_authored_events():
+    adapter = _RecordingAdapter("x")
+    authored = _authored_event(_human_source(message_id=None))
+    human = MessageEvent(text="hi", source=_human_source())
+    assert adapter._can_merge_text_debounce_events(authored, human) is False
+    assert adapter._can_merge_text_debounce_events(human, authored) is False
+    assert adapter._can_merge_text_debounce_events(human, MessageEvent(text="b", source=_human_source())) is True
+
+
+@pytest.mark.asyncio
+async def test_h1_telegram_photo_follow_up_takes_its_own_fifo_place(make_gateway):
+    gw, alpha, key, queued = await _authored_queued_behind_human(make_gateway)
+    photo = _human_event(gw, "HUMAN caption", "m3", message_type=MessageType.PHOTO,
+                         media_urls=["/x.png"], media_types=["image/png"])
+    handled, _ = await gw.runner._hm_busy_slash_or_photo(photo, photo.source, key)
+    assert handled is True
+    assert alpha._pending_messages[key] is queued and queued.text == AUTHORED_TEXT and not queued.media_urls
+    drained = await _drain(gw, alpha, key)
+    assert drained == [queued, photo]
+    _assert_split(gw, drained, "HUMAN caption")
+    await _release(gw)
+
+
+@pytest.mark.asyncio
+async def test_h1_telegram_grace_window_follow_up_takes_its_own_fifo_place(make_gateway):
+    gw, alpha, key, queued = await _authored_queued_behind_human(make_gateway)
+    gw.runner._session_state(key).turn.started_ts = time.time()
+    text = _human_event(gw, "HUMAN grace words", "m4")
+    assert gw.runner._hm_busy_telegram_grace_queue(text, text.source, key, "interrupt") is True
+    assert alpha._pending_messages[key] is queued and queued.text == AUTHORED_TEXT
+    drained = await _drain(gw, alpha, key)
+    assert drained == [queued, text]
+    _assert_split(gw, drained, "HUMAN grace words")
+    await _release(gw)
+
+
+@pytest.mark.asyncio
+async def test_h1_agent_pending_sentinel_follow_up_takes_its_own_fifo_place(make_gateway):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    gw, alpha, key, queued = await _authored_queued_behind_human(make_gateway)
+    state = gw.runner._session_state(key)
+    saved_agent, saved_started = state.turn.agent, state.turn.started_ts
+    state.turn.agent, state.turn.started_ts = _AGENT_PENDING_SENTINEL, 0
+    text = _human_event(gw, "HUMAN sentinel words", "m5")
+    try:
+        assert await gw.runner._hm_handle_running_session_message(text, text.source, key) is None
+    finally:
+        state.turn.agent, state.turn.started_ts = saved_agent, saved_started
+    assert alpha._pending_messages[key] is queued and queued.text == AUTHORED_TEXT
+    drained = await _drain(gw, alpha, key)
+    assert drained == [queued, text]
+    _assert_split(gw, drained, "HUMAN sentinel words")
+    await _release(gw)
+
+
+@pytest.mark.asyncio
+async def test_h1_base_adapter_queue_path_takes_its_own_fifo_place(make_gateway):
+    """The base adapter's non-debounce busy path (no runner busy handler) splits too."""
+    gw, alpha, key, queued = await _authored_queued_behind_human(make_gateway)
+    text = _human_event(gw, "HUMAN base words", "m6")
+    merge_pending_message_event(alpha._pending_messages, key, text, merge_text=True,
+                                queue_behind=alpha._queue_behind_pending(key))
+    assert alpha._pending_messages[key] is queued and queued.text == AUTHORED_TEXT
+    drained = await _drain(gw, alpha, key)
+    assert drained == [queued, text]
+    _assert_split(gw, drained, "HUMAN base words")
+    await _release(gw)
+
+
+@pytest.mark.asyncio
+async def test_m1_depth_cap_requeue_never_gives_authored_text_human_control():
+    """At the interrupt-depth cap the follow-up is re-queued; into a slot holding a caption-less
+    human photo it must not merge (which would hand authored "/yolo" the photo's gateway control).
+    It takes its own FIFO place, still non-control."""
+    runner = _followup_runner()
+    adapter = SimpleNamespace(_pending_messages={})
+    runner._delivery_adapter_for = MagicMock(return_value=adapter)
+    fifo = []
+    runner._enqueue_fifo = lambda key, event, adapter: fifo.append(event)
+    photo = MessageEvent(text="", message_type=MessageType.PHOTO, source=_human_source(),
+                         media_urls=["/x.png"], media_types=["image/png"])
+    adapter._pending_messages["k"] = photo
+    authored = _authored_event(_human_source(message_id=None), text="/yolo")
+    turn_ctx = SimpleNamespace(source=_human_source(), session_id="sid", session_key="k", run_generation=1,
+                               _interrupt_depth=runner._MAX_INTERRUPT_DEPTH, history=[],
+                               _status_thread_metadata=None, context_prompt=None, result_holder=[None])
+    await GatewayRunner._run_agent_queued_followup(
+        runner, turn_ctx, adapter=adapter, pending="/yolo", pending_event=authored,
+        response="r", result={"interrupted": True, "messages": []}, stream_task=None)
+    assert adapter._pending_messages["k"] is photo and photo.text == "" and photo.allow_gateway_control is True
+    assert fifo == [authored] and authored.text == "/yolo"
+    assert authored.allow_gateway_control is False and authored.is_command() is False
+    runner._run_agent.assert_not_called()

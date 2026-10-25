@@ -588,7 +588,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            # Never into a slot across an author/internal boundary: the event takes its FIFO place.
+            merge_pending_message_event(
+                adapter._pending_messages, _quick_key, event, merge_text=merge_text,
+                queue_behind=lambda queued: self._enqueue_fifo(_quick_key, queued, adapter))
 
     async def _hm_busy_slash_or_photo(
         self, event: MessageEvent, source: SessionSource, _quick_key: str
@@ -1432,7 +1435,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         if _plugin_author is not None:
             # Name and id were validated by the host (agent/plugin_author.py): no brackets, newlines
             # or controls, so the tag cannot be closed early or pose as another speaker.
-            message_text = f"[{_plugin_author.name_tag()}] {message_text}"
+            # A merged (mixed) event cannot be attributed to the agent alone: no one is named.
+            _tag = "unknown author" if getattr(event, "_mixed_senders", False) else _plugin_author.name_tag()
+            message_text = f"[{_tag}] {message_text}"
             if getattr(event, "channel_context", None):
                 message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
             return message_text

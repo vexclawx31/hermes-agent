@@ -30,9 +30,11 @@ LABEL_PREFIX = "plugin:"
 _PLUGIN_KEY_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _AUTHOR_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}")
 _NAME_MAX = 64
-# Control, surrogate, private-use, unassigned; line/paragraph separators would break a one-line tag.
-_NAME_BAD_CATEGORIES = frozenset({"Cc", "Cs", "Co", "Cn", "Zl", "Zp"})
-_NAME_BAD_CHARS = frozenset("[]<>\n") | frozenset(chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
+# Control, format (zero-width, bidi marks, BOM), surrogate, private-use, unassigned; line/paragraph
+# separators would break a one-line tag.
+_NAME_BAD_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+# Tag delimiters: brackets close the speaker tag; ( ) : would let a name forge "(agent plugin:...)".
+_NAME_BAD_CHARS = frozenset("[]<>()\n:") | frozenset(chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
 _AUTHOR_KEYS = frozenset({"id", "name"})
 _RECORD_KEYS = frozenset({"v", "plugin", "id", "name"})
 
@@ -48,8 +50,9 @@ def valid_author_id(value: Any) -> bool:
 
 
 def valid_author_name(value: Any) -> bool:
-    """A display name: 1-64 code points as given, not blank, without control / separator /
-    surrogate / private-use / unassigned characters, bidi controls, or any of ``[ ] < > \\n``."""
+    """A display name: 1-64 code points as given, not blank, without control / format / separator /
+    surrogate / private-use / unassigned characters, bidi controls, or any of ``[ ] < > ( ) :`` or a
+    newline (so no name can close the speaker tag or forge an ``(agent plugin:...)`` suffix)."""
     if not isinstance(value, str) or not 1 <= len(value) <= _NAME_MAX or not value.strip():
         return False
     return not any(ch in _NAME_BAD_CHARS or unicodedata.category(ch) in _NAME_BAD_CATEGORIES for ch in value)

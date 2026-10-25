@@ -2930,11 +2930,16 @@ class GatewayTurnMixin:
     @staticmethod
     def _plugin_author_turn_kwargs(event: Any) -> dict[str, Any]:
         """``{"plugin_author": <PluginAuthor>}`` for a plugin-authored event, else ``{}`` so a human
-        turn's ``_run_agent`` call stays exactly as it was. A merged event keeps the bot author for
-        the turn (never the human's: at worst a downgrade); only its persisted record is withheld."""
+        turn's ``_run_agent`` call stays exactly as it was. A plugin-authored event that still got
+        merged with another sender's (``_mixed_senders``; the merge sites refuse this) runs with an
+        unverified, unknown author instead: neither the bot's nor the human's."""
         from agent.plugin_author import event_plugin_author
         author = event_plugin_author(event)
-        return {"plugin_author": author} if author is not None else {}
+        if author is None:
+            return {}
+        if getattr(event, "_mixed_senders", False):
+            return {"unknown_author": True}
+        return {"plugin_author": author}
 
     async def _run_agent(
         self, message: str, context_prompt: str, history: list[dict[str, Any]],
@@ -3848,7 +3853,9 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                merge_pending_message_event(
+                    adapter._pending_messages, session_key, pending_event,
+                    queue_behind=lambda queued: self._enqueue_fifo(session_key, queued, adapter))
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
@@ -4289,6 +4296,7 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
         plugin_author: Optional[Any] = None,
+        unknown_author: bool = False,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4327,7 +4335,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
-            plugin_author=plugin_author,
+            plugin_author=plugin_author, unknown_author=unknown_author,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(

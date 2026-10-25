@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 from agent.i18n import t
+from agent.plugin_author import event_plugin_author
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
 
@@ -1797,12 +1798,30 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+def crosses_author_boundary(existing: Any, event: Any) -> bool:
+    """True when two events must never share one turn: a plugin-authored event and anything not
+    written by the same plugin author, or an internal event and a non-internal one. Merging them
+    would run one party's words under the other's identity (and control rights)."""
+    return (event_plugin_author(existing) != event_plugin_author(event)
+            or bool(getattr(existing, "internal", False)) != bool(getattr(event, "internal", False)))
+
+
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
-                                event: MessageEvent, *, merge_text: bool = False) -> None:
+                                event: MessageEvent, *, merge_text: bool = False,
+                                queue_behind: Optional[Callable[[MessageEvent], None]] = None) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
-    replace."""
+    replace. Never across an author/internal boundary (:func:`crosses_author_boundary`): the
+    incoming event then takes its own place behind the slot through ``queue_behind`` (the runner's
+    FIFO); without one, the queued event is kept and the incoming one is logged and not merged."""
     existing = pending_messages.get(session_key)
+    if existing is not None and existing is not event and crosses_author_boundary(existing, event):
+        if queue_behind is not None:
+            queue_behind(event)
+        else:
+            logger.warning("Pending follow-up for session %s not merged across an author boundary and "
+                           "no FIFO is available; keeping the queued event", session_key)
+        return
     if existing:
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
@@ -3819,8 +3838,18 @@ class BasePlatformAdapter(ABC):
                          self.name, getattr(event, "session_key", "?"), len(event.text or ""))
         return result
 
+    def _queue_behind_pending(self, session_key: str) -> Optional[Callable[[MessageEvent], None]]:
+        """The runner's FIFO for an event that must not merge into this session's pending slot."""
+        enqueue = getattr(getattr(self, "gateway_runner", None), "_enqueue_fifo", None)
+        if not callable(enqueue):
+            return None
+        return lambda queued: enqueue(session_key, queued, self)
+
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Return True when two text debounce events came from the same sender. A plugin-authored
+        event never merges: its origin's ``user_id`` is the human's, but its words are not."""
+        if event_plugin_author(existing) is not None or event_plugin_author(event) is not None:
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -3857,7 +3886,8 @@ class BasePlatformAdapter(ABC):
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                    merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True,
+                                                queue_behind=self._queue_behind_pending(session_key))
                 return
         now = time.monotonic()
         if state is None:
@@ -4169,7 +4199,8 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event)
+            merge_pending_message_event(self._pending_messages, session_key, event,
+                                        queue_behind=self._queue_behind_pending(session_key))
             event._gateway_accepted = True
             return
         if self._is_queue_text_debounce_candidate(event):
@@ -4181,7 +4212,8 @@ class BasePlatformAdapter(ABC):
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
             merge_pending_message_event(self._pending_messages, session_key, event,
-                                        merge_text=event.message_type == MessageType.TEXT)
+                                        merge_text=event.message_type == MessageType.TEXT,
+                                        queue_behind=self._queue_behind_pending(session_key))
             event._gateway_accepted = True
 
     def _get_human_delay(self) -> float:

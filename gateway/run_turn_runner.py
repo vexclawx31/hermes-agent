@@ -58,6 +58,9 @@ def _turn_author_verified(ctx: Any) -> bool:
             and str(sender.get("user_id") or "") == str(getattr(ctx.source, "user_id", None) or "-"))
 
 
+UNKNOWN_TURN_AUTHOR = {"id": None, "name": "unknown author", "is_bot": False, "verified": False}
+
+
 def _live_plugin_author(ctx: Any):
     """The host ``PluginAuthor`` of a plugin-injected turn, read ONLY from ``TurnContext.plugin_author``
     (filled from the live event). Display metadata never makes a turn plugin-authored."""
@@ -1713,7 +1716,11 @@ class TurnRunner:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             plugin_author = _live_plugin_author(ctx)
-            if plugin_author is not None and _accepts_keyword(agent.run_conversation, "turn_author"):
+            unknown_author = getattr(ctx, "unknown_author", False) is True
+            if unknown_author and _accepts_keyword(agent.run_conversation, "turn_author"):
+                # Mixed plugin + other-sender text: nobody can be named as its author.
+                kwargs["turn_author"] = dict(UNKNOWN_TURN_AUTHOR)
+            elif plugin_author is not None and _accepts_keyword(agent.run_conversation, "turn_author"):
                 # A plugin-authored turn: the agent the plugin named, as a bot, never the origin's human.
                 kwargs["turn_author"] = plugin_author.turn_author()
             elif _accepts_keyword(agent.run_conversation, "turn_author"):
@@ -1751,7 +1758,8 @@ class TurnRunner:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             # Set every turn (None when unproven) so a cached agent never keeps the previous turn's scope.
             from gateway.sender_attribution import trusted_turn_scope
-            agent._recall_scope = None if plugin_author is not None else trusted_turn_scope(ctx.source)
+            agent._recall_scope = (None if plugin_author is not None or unknown_author
+                                   else trusted_turn_scope(ctx.source))
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
