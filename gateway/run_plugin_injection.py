@@ -38,26 +38,38 @@ class GatewayPluginInjectionMixin:
     def _schedule_plugin_message_injection(
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
+        author: Any = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
         With ``origin`` the profile, origin and adapter checks run here, synchronously, so the plugin
-        gets ``False`` for a chat it may not start; authorization is rechecked at dispatch."""
+        gets ``False`` for a chat it may not start; authorization is rechecked at dispatch.
+        ``author`` is the host-built ``PluginAuthor`` (agent/plugin_author.py) of the calling plugin."""
         from gateway.run import safe_schedule_threadsafe
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
+        author_kwargs: dict[str, Any] = {}
+        if author is not None:
+            from agent.plugin_author import PluginAuthor
+            if type(author) is not PluginAuthor or author.plugin != plugin_id:
+                logger.warning("Plugin message injection refused: plugin=%s author is not a host PluginAuthor "
+                               "for this plugin", plugin_id)
+                return False
+            author_kwargs["author"] = author
 
         if origin is not None:
             source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
             if source is None:
                 return False
             target = f"origin={source.platform.value}/{source.chat_id}"
-            coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id)
+            coro = self._dispatch_plugin_origin_injection(
+                source=source, content=content, plugin_id=plugin_id, **author_kwargs,
+            )
         else:
             target = f"session={session_key}"
             coro = self._dispatch_plugin_message_injection(
-                session_key=session_key, content=content, plugin_id=plugin_id,
+                session_key=session_key, content=content, plugin_id=plugin_id, **author_kwargs,
             )
         try:
             current_loop = asyncio.get_running_loop()
@@ -123,8 +135,40 @@ class GatewayPluginInjectionMixin:
                            plugin_id, target)
         return authorized
 
+    def _admit_plugin_author_turn(self, source: SessionSource, author: Any, *, plugin_id: str, target: str) -> bool:
+        """Charge the bot loop guard ONCE for a plugin-authored turn, at dispatch, as a bot message in
+        the origin's chat (a copy with ``is_bot=True``; the turn's own source stays the human's, so
+        authorization and routing are unchanged). False = tripped or cooling down: drop the turn."""
+        from gateway.session_identity import replace_source
+        try:
+            admitted = self._admit_bot_message_for_source(replace_source(source, is_bot=True))
+        except Exception:
+            logger.warning("Plugin message injection loop-guard check failed: plugin=%s %s",
+                           plugin_id, target, exc_info=True)
+            return False
+        if not admitted:
+            logger.warning("Plugin message injection dropped by the bot loop guard: plugin=%s author=%s %s",
+                           plugin_id, author.label, target)
+        return admitted
+
+    @staticmethod
+    def _plugin_injection_event(*, content: str, source: SessionSource, metadata: dict, author: Any = None) -> MessageEvent:
+        """The injected event. Never a control event (P3): it cannot run slash or gateway commands
+        or answer approval, clarify, slash-confirm or update prompts. With an author, the host
+        object rides the event (``_plugin_author``) and the loop-guard charge is marked spent."""
+        event = MessageEvent(
+            text=content, message_type=MessageType.TEXT, source=source, internal=True,
+            allow_gateway_control=False, metadata=metadata,
+        )
+        if author is not None:
+            if event.allow_gateway_control is not False:  # explicit, survives python -O
+                raise RuntimeError("a plugin-authored event must never carry gateway control")
+            event._plugin_author = author
+            event._bot_loop_admitted = True
+        return event
+
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str, author: Any = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not self._plugin_injection_accepting():
@@ -141,11 +185,13 @@ class GatewayPluginInjectionMixin:
         adapter = self._delivery_adapter_for(source)
         if adapter is None:
             return False
+        if author is not None and not self._admit_plugin_author_turn(
+                source, author, plugin_id=plugin_id, target=f"session={session_key}"):
+            return False
 
         async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
-                text=content, message_type=MessageType.TEXT, source=source, internal=True,
-                allow_gateway_control=False,
+            await adapter.handle_message(self._plugin_injection_event(
+                content=content, source=source, author=author,
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                     "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
@@ -216,7 +262,7 @@ class GatewayPluginInjectionMixin:
         return source
 
     async def _dispatch_plugin_origin_injection(
-        self, *, source: SessionSource, content: str, plugin_id: str
+        self, *, source: SessionSource, content: str, plugin_id: str, author: Any = None,
     ) -> bool:
         """Start (or continue) the session at a plugin-supplied origin through the adapter's normal
         message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
@@ -229,11 +275,12 @@ class GatewayPluginInjectionMixin:
             return False
         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=target):
             return False
+        if author is not None and not self._admit_plugin_author_turn(source, author, plugin_id=plugin_id, target=target):
+            return False
         session_key = self._session_key_for_source(source)
         async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
-                text=content, message_type=MessageType.TEXT, source=source, internal=True,
-                allow_gateway_control=False,
+            await adapter.handle_message(self._plugin_injection_event(
+                content=content, source=source, author=author,
                 # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,

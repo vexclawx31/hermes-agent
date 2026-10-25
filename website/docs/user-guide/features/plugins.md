@@ -926,7 +926,7 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, origin: Mapping[str, Any] | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, origin: Mapping[str, Any] | None = None, author: Mapping[str, str] | None = None) -> bool`
 
 In CLI mode:
 
@@ -954,6 +954,38 @@ Starting a session with `origin` (gateway mode only):
 - A plugin can never target another profile. `False` is returned (with the reason in the gateway log) when the origin names a different `profile`, when the gateway's own profile routing sends that chat to a different profile, when the plugin's profile is not served by this gateway, or when that profile has no connected adapter for `platform` — another profile's bot is never borrowed. On a multiplexed gateway the turn runs under the plugin's profile home and secrets.
 - Authorisation is not bypassed: the origin's user must pass the gateway's current allowlists, pairing, or allow-all configuration for that profile, the same check as the `session_key` path. Choose a `user_id` that is authorised, or the request is dropped at dispatch and logged.
 - The same text rules apply: no slash commands, approvals, or prompt resolution. The permission below is read from the plugin's own profile `config.yaml`.
+
+Naming the agent that wrote the text with `author` (messaging gateway only):
+
+```python
+# Relay another agent's reply into the requester's thread, attributed to that agent
+ctx.inject_message(
+    "Here is the research summary you asked for: ...",
+    origin={"platform": "telegram", "chat_id": "-1001234", "chat_type": "group", "thread_id": "7",
+            "user_id": "123456789", "user_name": "Requester"},   # routing + authorization, as above
+    author={"id": "research", "name": "Research Agent"},        # who wrote the text
+)
+```
+
+- `author` must be a mapping with exactly `id` and `name`. Anything else (`is_bot`, `verified`, `origin`, ...) is refused. Plugin code supplies it, never model output.
+- Validation rejects, it never cleans, truncates or case-folds: `id` matches `^[a-z0-9][a-z0-9_-]{0,47}$` (ASCII only); `name` is 1-64 characters, not blank, with no control, separator, private-use, unassigned or bidi-control characters and none of `[ ] < >` or a newline. The plugin's own registry key must match `^[a-z][a-z0-9_-]{0,31}$` to use the capability.
+- The turn is shown and recorded as that agent, never as the origin's user: the speaker tag is `[<name> (agent plugin:<plugin>/<id>)]` in every chat type, memory providers receive `turn_author` `{"id": "plugin:<plugin>/<id>", "name", "is_bot": true, "verified": false, "origin": "plugin", "plugin"}`, and the transcript row carries a display-only `plugin_author` record (no `sender`), which context summaries and `session_search` show as an unverified agent.
+- Routing and authorization are unchanged: they still use the `origin` (or the stored session route), and its user must pass the gateway's current authorization. The author never widens who may start a turn.
+- Every authored turn counts once against the chat's bot loop guard (`gateway.bot_loop_guard`, the same per-chat budget native bots share). When the budget trips, further authored turns in that chat are dropped and logged during the cooldown; human messages are never counted or blocked.
+- An authored event is never a control event: it cannot run slash commands or answer approval, clarify, slash-confirm or update prompts. In a busy session it queues as its own turn and is never merged with a human's message in either direction: a human message (text, photo or follow-up) that arrives while an authored event is queued takes its own place behind it and runs as the human's own turn.
+- The marking is attribution, not a sandbox: the turn runs with the session's normal tools and approval policy.
+- An authored call is never delivered to the classic CLI or the Ink TUI / desktop host (no author support there): with a `session_key` it goes to the messaging gateway or nowhere.
+- The `True`/`False` contract is the same as for gateway injection: `True` means the live gateway accepted the request for asynchronous dispatch, not that the turn ran (authorization and loop-guard refusals at dispatch are logged). `False` additionally covers a missing permission below, invalid `author` values, a `role` other than `"user"`, and the CLI / TUI hosts.
+
+Grant it per plugin, on top of gateway injection:
+
+```yaml
+plugins:
+  entries:
+    my-plugin:
+      allow_gateway_injection: true
+      allow_injection_author: true
+```
 
 Ink TUI (`hermes --tui`) and the desktop / dashboard chat are a third host. They do not set the classic CLI reference and they do not register on the messaging-gateway injector — those two hosts stay separate so a live gateway cannot clobber the TUI (or the reverse). Pass the session's durable `session_key` (the `ses_…` id), not the ephemeral UI session id. Hermes queues the text on that session's prompt queue: a busy session keeps the message for the next turn, an idle session starts one. A key that is not a live TUI session is left for the messaging gateway when one is running, and is never rerouted to a different chat.
 

@@ -62,6 +62,12 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
     persist_user_display_metadata: Optional[dict] = None
+    # Host-built author of a plugin-injected turn (agent/plugin_author.PluginAuthor), from the live
+    # event only. The turn runner reads THIS for turn_author, never display metadata.
+    plugin_author: Any = None
+    # A plugin-authored event merged with another sender's: the turn runs with an unverified,
+    # unknown author (no bot, no human, no plugin origin).
+    unknown_author: bool = False
     user_config: Any = None
     mute_notification_reply: bool = False
     voice_turn: bool = False  # a voice-note turn: runs on auxiliary.voice_chat

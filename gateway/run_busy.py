@@ -15,6 +15,7 @@ import json
 import os
 import time
 from agent.i18n import DEFAULT_LANGUAGE, t
+from agent.plugin_author import event_plugin_author
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
@@ -388,6 +389,8 @@ class GatewayBusySessionMixin:
             getattr(existing, "internal", False) == getattr(event, "internal", False)
             and getattr(existing, "allow_gateway_control", True)
             == getattr(event, "allow_gateway_control", True)
+            # A plugin-authored event never shares a slot with a human or another author's event.
+            and event_plugin_author(existing) == event_plugin_author(event)
             and all(
                 (getattr(existing, "metadata", None) or {}).get(key)
                 == (getattr(event, "metadata", None) or {}).get(key)

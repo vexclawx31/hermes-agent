@@ -10,6 +10,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from agent.plugin_author import event_plugin_author
 from gateway.session import SessionSource
 
 # Desktop attachment reference tags prepended by buildContextText before the
@@ -42,7 +43,11 @@ class ProcessingOutcome(Enum):
 
 
 def _event_sender_key(event: Any) -> tuple[Optional[str], Optional[str]]:
-    """``(platform, user_id)`` of an event's author; ``(None, None)`` when unknown."""
+    """``(platform, user_id)`` of an event's author; ``(None, None)`` when unknown. A plugin-authored
+    event (``_plugin_author``) is keyed by that author, never by its origin's human."""
+    plugin_author = event_plugin_author(event)
+    if plugin_author is not None:
+        return plugin_author.identity
     source = getattr(event, "source", None)
     platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
     user_id = getattr(source, "user_id", None) or getattr(event, "user_id", None)
@@ -116,6 +121,9 @@ class MessageEvent:
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
     # Set when another sender's event was merged into this one (see gateway/sender_attribution.py).
     _mixed_senders: bool = field(default=False, init=False, repr=False, compare=False)
+    # Host-built author of a plugin-injected turn (agent/plugin_author.PluginAuthor). Set only by the
+    # gateway's plugin injection dispatch after construction; never from ingress metadata.
+    _plugin_author: Any = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one.

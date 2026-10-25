@@ -20,6 +20,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from agent.i18n import t
+from agent.plugin_author import event_plugin_author
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
@@ -587,7 +588,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            # Never into a slot across a plugin-author boundary: the event takes its FIFO place.
+            merge_pending_message_event(
+                adapter._pending_messages, _quick_key, event, merge_text=merge_text,
+                queue_behind=lambda queued: self._enqueue_fifo(_quick_key, queued, adapter))
 
     async def _hm_busy_slash_or_photo(
         self, event: MessageEvent, source: SessionSource, _quick_key: str
@@ -1425,7 +1429,18 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             logger.debug("Failed to restore one-turn model override", exc_info=True)
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
-        """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
+        """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context.
+        A plugin-authored event is tagged with its author in every chat type, never its origin's human."""
+        _plugin_author = event_plugin_author(event)
+        if _plugin_author is not None:
+            # Name and id were validated by the host (agent/plugin_author.py): no brackets, newlines
+            # or controls, so the tag cannot be closed early or pose as another speaker.
+            # A merged (mixed) event cannot be attributed to the agent alone: no one is named.
+            _tag = "unknown author" if getattr(event, "_mixed_senders", False) else _plugin_author.name_tag()
+            message_text = f"[{_tag}] {message_text}"
+            if getattr(event, "channel_context", None):
+                message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
+            return message_text
         _is_shared_multi_user = is_shared_multi_user_session(
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),

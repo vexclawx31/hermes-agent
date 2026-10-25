@@ -263,6 +263,17 @@ def sender_label(display_metadata: Any) -> str:
     return make_label(sender.get("platform"), sender.get("user_id"), sender.get("chat_id"))
 
 
+def plugin_author_label(display_metadata: Any) -> Optional[str]:
+    """``agent plugin:<plugin>/<id>, shown as <name>`` for a row whose display-only
+    ``plugin_author`` record (agent/plugin_author.py) is well-formed and alone (no ``sender``), else
+    None. Display text only: it never enters a scope, a ``verified`` flag or a recall label."""
+    from agent.plugin_author import display_plugin_author
+    author = display_plugin_author(display_metadata)
+    if author is None:
+        return None
+    return f"agent {author.label}, shown as {author.name}"
+
+
 # ---------------------------------------------------------------------------
 # Enforcement epoch: a session is a provenance partition only if it began under enforcement
 # ---------------------------------------------------------------------------
