@@ -206,7 +206,7 @@ def test_user_target_refused_before_resolution():
 def test_channel_send_checked_at_both_stages():
     result, sent, resolved, calls = _send(f"slack:{SLACK_CHANNEL}", "enforce", _slack_rule)
     assert result == {"success": True, "message_id": "m1"}
-    assert sent == [SLACK_CHANNEL]
+    assert sent == [SLACK_CHANNEL] and resolved == []  # a channel id opens no conversation
     assert [c["stage"] for c in calls] == ["target", "resolved"]
     assert all(c["path"] == "core" for c in calls)
 
@@ -215,6 +215,7 @@ def test_unset_policy_keeps_todays_behaviour():
     result, sent, resolved, calls = _send(f"slack:{SLACK_USER}", None, _slack_rule)
     assert result == {"success": True, "message_id": "m1"}
     assert sent == [SLACK_DM] and calls == []
+    assert resolved == [f"user:{SLACK_USER}"]  # today's user->DM resolution still runs
 
 
 @pytest.mark.parametrize("action", ["react", "unreact"])

@@ -129,11 +129,8 @@ VALID_HOOKS: set[str] = {
     # "should_rotate_credential"/"should_fallback": bool, "message": str, "error_context": dict}.
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
-    # authorize_outbound_send: gateway/outbound_policy.py asks before a core send (send_message_tool, cron delivery)
-    # on a platform whose ``outbound_policy`` mode is set. Return {"allow": bool, "reason": str} or None.
-    "authorize_outbound_send",
     "transform_api_error_classification", "on_session_start", "on_session_end",
-    "on_session_finalize", "on_session_reset",
+    "on_session_finalize", "on_session_reset", "authorize_outbound_send",  # contract: gateway/outbound_policy.py
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE

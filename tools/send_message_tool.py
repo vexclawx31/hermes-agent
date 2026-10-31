@@ -206,6 +206,30 @@ def _handle_react(args, remove=False):
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 
+def _pre_resolution_result(platform_name, chat_id, thread_id, message):
+    """An early tool result before any target resolution, or None to continue. The outbound policy checks the RAW
+    target first, because resolving a Slack user target opens a conversation (conversations.open) even if the
+    send is then refused; then a cron job's duplicate send is skipped."""
+    from gateway.outbound_policy import authorize_outbound
+    denial = authorize_outbound(platform_name, action="send", chat_id=chat_id, thread_id=thread_id, text=message,
+                                path="core", stage="target")
+    if denial:
+        return tool_error(denial)
+    duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
+    return json.dumps(duplicate_skip) if duplicate_skip else None
+
+
+def _resolved_egress_denial(platform_name, chat_id, thread_id, pconfig, message):
+    """The relay-attestation refusal, then the outbound policy's refusal, for the RESOLVED destination; or None."""
+    relay_denial = _authorize_relay_target(platform_name, chat_id, thread_id,
+                                           native_token=getattr(pconfig, "token", None))
+    if relay_denial:
+        return relay_denial
+    from gateway.outbound_policy import authorize_outbound
+    return authorize_outbound(platform_name, action="send", chat_id=chat_id, thread_id=thread_id, text=message,
+                              path="core", stage="resolved")
+
+
 def _handle_send(args):
     target, message = args.get("target", ""), args.get("message", "")
     if not target or not message:
@@ -245,15 +269,8 @@ def _handle_send(args):
         chat_id, err = _home_chat_id(config, platform, platform_name)
         if err:
             return tool_error(err)
-    # Outbound policy, stage 1: the RAW target, before Slack user->DM resolution, because resolving a user
-    # target opens a conversation (conversations.open) even if the send is then refused.
-    from gateway.outbound_policy import authorize_outbound
-    _policy_denial = authorize_outbound(platform_name, action="send", chat_id=chat_id, thread_id=thread_id,
-                                        text=cleaned_message, path="core", stage="target")
-    if _policy_denial:
-        return tool_error(_policy_denial)
-    if duplicate_skip := _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id):
-        return json.dumps(duplicate_skip)
+    if early_result := _pre_resolution_result(platform_name, chat_id, thread_id, cleaned_message):
+        return early_result
     # Slack: resolve user targets to DM channel IDs before sending. _parse_target_ref emits internal
     # ``user:U...`` / ``user_name:@handle`` targets; a bare U... id can also arrive from session metadata or
     # the home-channel config. All are opened via conversations.open (fixes #19236).
@@ -271,15 +288,9 @@ def _handle_send(args):
     # turns those cases red.
     # thread_id is part of the DESTINATION: on Discord the thread is the literal
     # REST target, so an attested parent must not vouch for an arbitrary thread.
-    _relay_denial = _authorize_relay_target(platform_name, chat_id, thread_id,
-                                            native_token=getattr(pconfig, "token", None))
+    _relay_denial = _resolved_egress_denial(platform_name, chat_id, thread_id, pconfig, cleaned_message)
     if _relay_denial:
         return tool_error(_relay_denial)
-    # Outbound policy, stage 2: the resolved destination.
-    _policy_denial = authorize_outbound(platform_name, action="send", chat_id=chat_id, thread_id=thread_id,
-                                        text=cleaned_message, path="core", stage="resolved")
-    if _policy_denial:
-        return tool_error(_policy_denial)
 
     try:
         from model_tools import _run_async
