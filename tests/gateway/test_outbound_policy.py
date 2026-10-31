@@ -103,9 +103,62 @@ def test_hook_receives_bound_fields():
         op.authorize_outbound("slack", action="send", chat_id=SLACK_CHANNEL, thread_id="1700000000.000100", text="t",
                               path="cron", cron_job_id="job1", cron_target="explicit:slack:C0123456789",
                               config=_cfg("enforce"))
+    call_id = calls[0].pop("call_id")
+    assert isinstance(call_id, str) and len(call_id) == 32
     assert calls[0] == {"platform": "slack", "action": "send", "chat_id": SLACK_CHANNEL,
                         "thread_id": "1700000000.000100", "text": "t", "path": "cron", "stage": "resolved",
                         "cron_job_id": "job1", "cron_target": "explicit:slack:C0123456789"}
+
+
+@pytest.mark.parametrize("name", ["Slack", "SLACK", " slack "])
+def test_platform_name_case_never_skips_the_policy(name):
+    calls = []
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=_hook([{"allow": False, "reason": "no"}], calls)):
+        out = op.authorize_outbound(name, action="send", chat_id=SLACK_CHANNEL, path="cron", config=_cfg("enforce"))
+    assert out == "Refusing to send to slack: no"
+    assert calls[0]["platform"] == "slack"
+    assert op.policy_mode(name, _cfg("enforce")) == "enforce"
+
+
+@pytest.mark.parametrize("verdicts", [
+    [{"allow": True}, {"allow": False, "reason": "second plugin refuses"}],
+    [{"allow": False, "reason": "second plugin refuses"}, {"allow": True}],
+])
+def test_any_refusal_wins_over_an_allow(verdicts):
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=_hook(verdicts)):
+        out = op.authorize_outbound("slack", action="send", chat_id=SLACK_CHANNEL, path="core", config=_cfg("enforce"))
+    assert out == "Refusing to send to slack: second plugin refuses"
+
+
+def test_concurrent_checks_each_get_a_verdict(monkeypatch):
+    """Two sends at once are two calls: the second must not be skipped as a duplicate of the first."""
+    import threading
+    from hermes_cli.plugins import PluginManager
+
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0)
+    entered, release = threading.Barrier(2, timeout=5.0), threading.Event()
+
+    def slow_allow(**_kwargs):
+        entered.wait()
+        release.wait(timeout=5.0)
+        return {"allow": True}
+
+    manager = PluginManager()
+    manager._hooks[op.HOOK] = [slow_allow]
+    results = []
+
+    def check():
+        results.append(op.authorize_outbound("slack", action="send", chat_id=SLACK_CHANNEL, path="cron",
+                                             cron_job_id="j", config=_cfg("enforce")))
+
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=manager.invoke_hook):
+        threads = [threading.Thread(target=check) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        release.set()
+        for thread in threads:
+            thread.join(timeout=10.0)
+    assert results == [None, None]
 
 
 # ---- send_message_tool: user targets are refused BEFORE user->DM resolution
@@ -162,6 +215,20 @@ def test_unset_policy_keeps_todays_behaviour():
     result, sent, resolved, calls = _send(f"slack:{SLACK_USER}", None, _slack_rule)
     assert result == {"success": True, "message_id": "m1"}
     assert sent == [SLACK_DM] and calls == []
+
+
+@pytest.mark.parametrize("action", ["react", "unreact"])
+def test_reactions_are_checked_as_their_own_action(action):
+    calls = []
+    with patch("tools.send_message_tool._authorize_relay_target", return_value=None), \
+            patch("tools.send_message_tool._live_adapter") as live_adapter, \
+            patch("hermes_cli.config.load_config_readonly", return_value=_cfg("enforce")), \
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_hook([{"allow": False, "reason": "no react grant"}], calls)):
+        result = json.loads(send_message_tool({"action": action, "target": f"slack:{SLACK_CHANNEL}",
+                                               "emoji": "white_check_mark", "message_id": "1700000000.000100"}))
+    assert "no react grant" in result["error"]
+    live_adapter.assert_not_called()
+    assert [(c["action"], c["path"], c["chat_id"]) for c in calls] == [(action, "core", SLACK_CHANNEL)]
 
 
 def test_enforce_without_plugin_refuses():

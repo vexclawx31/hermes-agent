@@ -245,8 +245,6 @@ def _handle_send(args):
         chat_id, err = _home_chat_id(config, platform, platform_name)
         if err:
             return tool_error(err)
-    if duplicate_skip := _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id):
-        return json.dumps(duplicate_skip)
     # Outbound policy, stage 1: the RAW target, before Slack user->DM resolution, because resolving a user
     # target opens a conversation (conversations.open) even if the send is then refused.
     from gateway.outbound_policy import authorize_outbound
@@ -254,6 +252,8 @@ def _handle_send(args):
                                         text=cleaned_message, path="core", stage="target")
     if _policy_denial:
         return tool_error(_policy_denial)
+    if duplicate_skip := _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id):
+        return json.dumps(duplicate_skip)
     # Slack: resolve user targets to DM channel IDs before sending. _parse_target_ref emits internal
     # ``user:U...`` / ``user_name:@handle`` targets; a bare U... id can also arrive from session metadata or
     # the home-channel config. All are opened via conversations.open (fixes #19236).

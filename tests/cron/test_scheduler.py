@@ -2253,6 +2253,25 @@ class TestCronContinuableSurfaceInChannel:
             adapter._session_store = MagicMock()
         return adapter
 
+    @pytest.mark.parametrize("allow", [False, True])
+    def test_outbound_policy_decides_before_the_thread_seed_post(self, allow):
+        """Opening the continuable thread posts a seed message: an enforcing outbound policy must refuse it
+        before it is sent, not only the body afterwards."""
+        adapter = self._slack_adapter(supports_inchannel=False)
+        calls = []
+
+        def hook(name, **kwargs):
+            calls.append(kwargs)
+            return [{"allow": allow, "reason": "not granted"}]
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={"outbound_policy": {"slack": "enforce"}}), \
+                patch("hermes_cli.plugins.invoke_hook", side_effect=hook):
+            open_thread_mock, _ = self._run_inchannel_delivery({}, adapter)
+        assert open_thread_mock.called is allow
+        assert adapter.send.called is allow
+        assert calls and all(c["path"] == "cron" and c["cron_job_id"] == "brief-job" for c in calls)
+        assert calls[0]["thread_id"] is None and calls[0]["text"] == "Hermes — Daily Brief"
+
     def test_in_channel_skips_thread_open(self):
         """G2: in_channel mode must NOT open a handoff thread."""
         adapter = self._slack_adapter(supports_inchannel=True)

@@ -1818,6 +1818,16 @@ def _deliver_standalone(
         enabled=t.mirror_this_target)
 
 
+def _cron_policy_denial(job: dict, target: dict, platform_name: str, chat_id, thread_id, text) -> Optional[str]:
+    """The outbound policy's refusal for a cron send, or None. The scheduler binds the job and its configured
+    target; a caller can't claim the cron path."""
+    from gateway.outbound_policy import authorize_outbound
+    return authorize_outbound(
+        platform_name, action="send", chat_id=chat_id, thread_id=thread_id, text=text, path="cron",
+        cron_job_id=str(job.get("id") or ""),
+        cron_target=f"{target.get('_resolved_from') or 'explicit'}:{platform_name}:{chat_id}")
+
+
 def _prepare_target_delivery(
     job: dict, target: dict, *, adapters, loop, config, notify_delivery: bool, mirror_enabled: bool,
     mirror_text: str, delivery_errors: list,
@@ -1909,6 +1919,8 @@ def _prepare_target_delivery(
         and runtime_adapter is not None
         and loop is not None
         and not thread_id  # never override an explicit origin thread/topic
+        # Opening the thread posts a seed message: the outbound policy decides it before anything is sent.
+        and not _cron_policy_denial(job, target, platform_name, chat_id, None, f"Hermes — {_cron_display_name(job)}")
     ):
         opened_thread_id = _open_continuable_cron_thread(
             job, runtime_adapter, chat_id, loop) or None
@@ -2080,13 +2092,9 @@ def _deliver_result(
             mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
         if t is None:
             continue
-        # Outbound policy before either lane. The scheduler binds the job and its configured target; a caller
-        # can't claim the cron path. A refusal is a delivery error for this target only.
-        from gateway.outbound_policy import authorize_outbound
-        policy_denial = authorize_outbound(
-            t.platform_name, action="send", chat_id=t.chat_id, thread_id=t.thread_id, text=cleaned_delivery_content,
-            path="cron", cron_job_id=str(job.get("id") or ""),
-            cron_target=f"{target.get('_resolved_from') or 'explicit'}:{t.where}")
+        # Outbound policy before either lane. A refusal is a delivery error for this target only.
+        policy_denial = _cron_policy_denial(job, target, t.platform_name, t.chat_id, t.thread_id,
+                                            cleaned_delivery_content)
         if policy_denial:
             _note_target_error(job, f"{t.where}: {policy_denial}", delivery_errors)
             continue

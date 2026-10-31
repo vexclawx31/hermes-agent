@@ -13,7 +13,9 @@ Config (profile ``config.yaml``)::
 - ``audit``: the plugin is asked; a refusal (or no answer) is logged with a text hash and the send proceeds.
   Observation only: it protects nothing;
 - ``enforce``: a refusal, a plugin that didn't load, a hook that raised or timed out, or no verdict at all refuses the
-  send. A policy that can't answer is a refusal, never an allow.
+  send. A policy that can't answer is a refusal, never an allow. Every answering plugin must allow; any refusal wins.
+  The hook is bounded by ``plugins.hook_callback_timeout`` (a timeout is no verdict); setting that to ``<= 0`` turns
+  the bound off, and a hung policy plugin then hangs the send instead of refusing it.
 
 Callers bind what they know, never what a caller claims: ``path`` is ``"core"`` for send_message_tool and
 ``"cron"`` only from the scheduler, which also passes the job id and the configured delivery target.
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,7 @@ MODES = ("audit", "enforce")
 
 def policy_mode(platform_name: str, config: Optional[dict] = None) -> Optional[str]:
     """The configured mode for ``platform_name``; None when unset. A malformed value fails closed to enforce."""
+    platform_name = str(platform_name or "").strip().lower()
     if config is None:
         try:
             from hermes_cli.config import load_config_readonly
@@ -73,6 +77,7 @@ def authorize_outbound(
     ``stage`` is ``"target"`` for a raw target before any resolution (a Slack user target must be refused before
     user->DM resolution opens a conversation) and ``"resolved"`` for the final destination.
     """
+    platform_name = str(platform_name or "").strip().lower()  # cron keeps the case the user typed
     mode = policy_mode(platform_name, config)
     if mode is None:
         return None
@@ -80,19 +85,21 @@ def authorize_outbound(
     try:
         from hermes_cli.plugins import invoke_hook
         verdicts = invoke_hook(
-            HOOK, platform=platform_name, action=action, chat_id=None if chat_id is None else str(chat_id),
+            # call_id: concurrent sends are different calls, never one hook gate key (a second would be skipped).
+            HOOK, call_id=uuid.uuid4().hex, platform=platform_name, action=action, chat_id=None if chat_id is None else str(chat_id),
             thread_id=None if thread_id is None else str(thread_id), text=str(text or ""), path=path, stage=stage,
             cron_job_id=cron_job_id, cron_target=cron_target,
         )
     except Exception:
         logger.exception("outbound policy hook failed for %s", platform_name)
         verdicts, problem = [], "the outbound policy check failed"
-    verdict = next((v for v in verdicts if isinstance(v, dict) and "allow" in v), None)
+    answers = [v for v in verdicts if isinstance(v, dict) and "allow" in v]
+    refusal = next((v for v in answers if v.get("allow") is not True), None)  # any refusal wins
     if problem is None:
-        if verdict is None:
+        if not answers:
             problem = "no outbound policy answered (the policy plugin is not loaded or failed)"
-        elif verdict.get("allow") is not True:
-            problem = str(verdict.get("reason") or "refused by the outbound policy")[:300]
+        elif refusal is not None:
+            problem = str(refusal.get("reason") or "refused by the outbound policy")[:300]
     if problem is None:
         return None
     logger.warning(
