@@ -206,10 +206,11 @@ def _should_redact_pii(platform: Platform, enabled: bool) -> bool:
 def _slack_tools_loaded() -> bool:
     """True iff the agent will actually have Slack tools this session.
 
-    Either the native `slack` toolset is enabled AND `SLACK_BOT_TOKEN` is set (the tool's
-    `check_fn` gates on it), or an MCP server whose name suggests Slack has ACTUALLY registered
-    tools (configured-but-unconnected does not count; MCP servers are process-wide, so this is
-    intentionally not per-session). False on any error so a bad config never promises tools.
+    Either `SLACK_BOT_TOKEN` is set AND a toolset enabled for Slack provides Slack tools (the native
+    `slack` toolset, or a plugin toolset with registered `slack_*` tools, e.g. slack-joined-history),
+    or an MCP server whose name suggests Slack has ACTUALLY registered tools (configured-but-unconnected
+    does not count; MCP servers are process-wide, so this is intentionally not per-session). False on
+    any error so a bad config never promises tools.
     """
     try:
         from tools.mcp_tool_discovery import get_registered_mcp_server_names
@@ -238,7 +239,18 @@ def _slack_tools_loaded() -> bool:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.tools_config import _get_platform_tools
         # include_default_mcp_servers defaults True so a default-enabled Slack MCP counts too.
-        return "slack" in _get_platform_tools(load_config_readonly(), "slack")
+        enabled = _get_platform_tools(load_config_readonly(), "slack")
+        if "slack" in enabled:
+            return True
+        # Plugin Slack toolsets: without this, agents whose Slack tools come from a plugin were told they
+        # had no Slack APIs and declined requests their tools could do (2026-10-31, slack-thread-post).
+        # One pass over this profile's registry snapshot; a toolset counts only if a slack_* tool in it would
+        # actually be exposed (its own check_fn passes), so the note never promises tools the agent won't get.
+        from tools.registry import registry
+        enabled = set(enabled)
+        slack_entries = [e for e in registry.get_all_entries() if e.name.startswith("slack_") and e.toolset in enabled]
+        return any(registry._toolset_has_exposable_tools(toolset, slack_entries)
+                   for toolset in {e.toolset for e in slack_entries})
     except Exception:
         return False
 
