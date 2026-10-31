@@ -125,35 +125,55 @@ class TestBuildSessionContextPrompt:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
 
-    def _plugin_slack_probe(self, monkeypatch, enabled, toolset_tools, token="xoxb-test"):
-        """_slack_tools_loaded with a token, Slack-enabled toolsets and a registry stand-in for plugin tools."""
+    def _plugin_slack_probe(self, monkeypatch, tmp_path, enabled, tools, token="xoxb-test", profile="a"):
+        """_slack_tools_loaded under profile home *profile*, with real tool registrations scoped to home "a"
+        (as a plugin's profile-local tools are) and the given Slack-enabled toolsets. *tools*: (name, toolset,
+        check_fn) triples."""
         from unittest.mock import patch
         from gateway.session import _slack_tools_loaded
+        from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
         from tools.registry import registry
 
+        homes = {name: tmp_path / name for name in ("a", "b")}
+        for home in homes.values():
+            home.mkdir(exist_ok=True)
         if token:
             monkeypatch.setenv("SLACK_BOT_TOKEN", token)
         else:
             monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-        with patch("tools.mcp_tool_discovery.get_registered_mcp_server_names", return_value=[]), \
-                patch("hermes_cli.config.load_config_readonly", return_value={}), \
-                patch("hermes_cli.tools_config._get_platform_tools", return_value=enabled), \
-                patch.object(registry, "get_tool_names_for_toolset", side_effect=lambda ts: toolset_tools.get(ts, [])):
-            return _slack_tools_loaded()
+        for name, toolset, check_fn in tools:
+            registry.register(name=name, toolset=toolset, handler=lambda args, **kw: "", check_fn=check_fn,
+                              schema={"name": name, "description": "x", "parameters": {"type": "object", "properties": {}}},
+                              scope=hermes_home_key(homes["a"]))
+        override = set_hermes_home_override(str(homes[profile]))
+        try:
+            with patch("tools.mcp_tool_discovery.get_registered_mcp_server_names", return_value=[]), \
+                    patch("hermes_cli.config.load_config_readonly", return_value={}), \
+                    patch("hermes_cli.tools_config._get_platform_tools", return_value=enabled):
+                return _slack_tools_loaded()
+        finally:
+            reset_hermes_home_override(override)
+            for name, _toolset, _check in tools:
+                registry.deregister(name, scope=hermes_home_key(homes["a"]))
 
-    def test_slack_tools_loaded_counts_plugin_slack_toolsets(self, monkeypatch):
+    def test_slack_tools_loaded_counts_plugin_slack_toolsets(self, monkeypatch, tmp_path):
         """Agents whose Slack tools come from a plugin (e.g. slack-joined-history) must get the "you have
         Slack tools" note, not the "no Slack APIs" disclaimer that made them decline posts their tools can do."""
-        tools = {"slack_joined_history": ["slack_post_joined_message", "slack_read_joined_channel_history"]}
-        assert self._plugin_slack_probe(monkeypatch, ["file", "slack_joined_history"], tools) is True
+        tools = [("slack_probe_post", "probe_slack_plugin", None), ("probe_other", "probe_slack_plugin", None)]
+        assert self._plugin_slack_probe(monkeypatch, tmp_path, ["file", "probe_slack_plugin"], tools) is True
 
-    def test_slack_tools_loaded_plugin_path_still_needs_the_token(self, monkeypatch):
-        tools = {"slack_joined_history": ["slack_post_joined_message"]}
-        assert self._plugin_slack_probe(monkeypatch, ["slack_joined_history"], tools, token="") is False
+    def test_slack_tools_loaded_plugin_tools_are_profile_scoped(self, monkeypatch, tmp_path):
+        tools = [("slack_probe_post", "probe_slack_plugin", None)]
+        assert self._plugin_slack_probe(monkeypatch, tmp_path, ["probe_slack_plugin"], tools, profile="b") is False
 
-    def test_slack_tools_loaded_ignores_non_slack_plugin_toolsets(self, monkeypatch):
-        tools = {"whatsapp_archive": ["whatsapp_archive_search"], "switchboard": ["switchboard_request"]}
-        assert self._plugin_slack_probe(monkeypatch, ["whatsapp_archive", "switchboard"], tools) is False
+    def test_slack_tools_loaded_plugin_path_still_needs_the_token(self, monkeypatch, tmp_path):
+        tools = [("slack_probe_post", "probe_slack_plugin", None)]
+        assert self._plugin_slack_probe(monkeypatch, tmp_path, ["probe_slack_plugin"], tools, token="") is False
+
+    def test_slack_tools_loaded_ignores_unavailable_and_non_slack_tools(self, monkeypatch, tmp_path):
+        tools = [("slack_probe_post", "probe_slack_plugin", lambda: False),  # its own check fails: not exposed
+                 ("probe_archive_search", "probe_archive", None)]
+        assert self._plugin_slack_probe(monkeypatch, tmp_path, ["probe_slack_plugin", "probe_archive"], tools) is False
 
     def test_slack_tools_loaded_detects_real_mcp_registration(self):
         """Regression (review of #63234): a connected MCP server whose tools

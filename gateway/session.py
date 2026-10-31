@@ -244,9 +244,13 @@ def _slack_tools_loaded() -> bool:
             return True
         # Plugin Slack toolsets: without this, agents whose Slack tools come from a plugin were told they
         # had no Slack APIs and declined requests their tools could do (2026-10-31, slack-thread-post).
+        # One pass over this profile's registry snapshot; a toolset counts only if a slack_* tool in it would
+        # actually be exposed (its own check_fn passes), so the note never promises tools the agent won't get.
         from tools.registry import registry
-        return any(name.startswith("slack_") for toolset in enabled
-                   for name in registry.get_tool_names_for_toolset(toolset))
+        enabled = set(enabled)
+        slack_entries = [e for e in registry.get_all_entries() if e.name.startswith("slack_") and e.toolset in enabled]
+        return any(registry._toolset_has_exposable_tools(toolset, slack_entries)
+                   for toolset in {e.toolset for e in slack_entries})
     except Exception:
         return False
 
