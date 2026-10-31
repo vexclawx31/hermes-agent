@@ -21,6 +21,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+from cron.scheduler_delivery_outbound import _open_continuable_cron_thread, authorize_cron_send
+
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -252,29 +254,6 @@ def _maybe_mirror_cron_delivery(
 # types every supergroup "group") keep the parent channel/room's "group" — a seed on the wrong slot
 # is a row no reply ever resolves to (#111896, #112918).
 _THREAD_REPLY_CHAT_TYPE = {"slack": "group", "matrix": "group", "telegram": "group"}
-
-
-def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Optional[str]:
-    """Open a thread for a continuable cron job via ``adapter.create_handoff_thread``. Returns the
-    thread_id, or ``None`` (no thread primitive / failed) = caller falls back to the DM mirror."""
-    create_thread = getattr(adapter, "create_handoff_thread", None)
-    if not callable(create_thread) or loop is None:
-        return None
-    thread_name = f"Hermes — {_cron_display_name(job)}"
-    try:
-        from agent.async_utils import safe_schedule_threadsafe
-        coro = create_thread(str(chat_id), thread_name)
-        future = safe_schedule_threadsafe(coro, loop)  # type: ignore[arg-type]
-        if future is None:
-            return None
-        new_thread_id = future.result(timeout=30)
-        return str(new_thread_id) if new_thread_id else None
-    except Exception as e:
-        logger.debug(
-            "Job '%s': create_handoff_thread failed on %s — falling back to "
-            "DM-session mirror: %s",
-            job.get("id", "?"), getattr(adapter, "name", "?"), e)
-        return None
 
 
 def _seed_cron_session(
@@ -1909,6 +1888,8 @@ def _prepare_target_delivery(
         and runtime_adapter is not None
         and loop is not None
         and not thread_id  # never override an explicit origin thread/topic
+        # Opening the thread posts a seed message: the outbound policy decides it before anything is sent.
+        and not authorize_cron_send(job, target, platform_name, chat_id, None, f"Hermes — {_cron_display_name(job)}")
     ):
         opened_thread_id = _open_continuable_cron_thread(
             job, runtime_adapter, chat_id, loop) or None
@@ -2079,6 +2060,10 @@ def _deliver_result(
             notify_delivery=notify_delivery,
             mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
         if t is None:
+            continue
+        # Outbound policy before either lane. A refusal is a delivery error for this target only.
+        if policy_denial := authorize_cron_send(job, target, t.platform_name, t.chat_id, t.thread_id, cleaned_delivery_content):
+            _note_target_error(job, f"{t.where}: {policy_denial}", delivery_errors)
             continue
         target_errors: list = []
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(

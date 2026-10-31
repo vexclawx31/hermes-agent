@@ -47,6 +47,8 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "post_gateway_admission",
     # Pre-gating archive observer on every inbound WhatsApp group message.
     "whatsapp_transport_event",
+    # Outbound send policy: a timed-out policy plugin gives no verdict, which an enforcing policy refuses.
+    "authorize_outbound_send",
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
@@ -168,7 +170,7 @@ def _hook_call_identity(kwargs: dict[str, Any]) -> Optional[str]:
     payload; nothing new is plumbed. Deliberately not ``api_request_id`` — one API request
     carries many tool calls, which would re-collapse the keys.
     """
-    for field in ("tool_call_id", "turn_id"):
+    for field in ("tool_call_id", "turn_id", "call_id"):
         value = kwargs.get(field)
         if isinstance(value, str) and value:
             return value
