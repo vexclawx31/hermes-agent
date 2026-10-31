@@ -2080,6 +2080,16 @@ def _deliver_result(
             mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
         if t is None:
             continue
+        # Outbound policy before either lane. The scheduler binds the job and its configured target; a caller
+        # can't claim the cron path. A refusal is a delivery error for this target only.
+        from gateway.outbound_policy import authorize_outbound
+        policy_denial = authorize_outbound(
+            t.platform_name, action="send", chat_id=t.chat_id, thread_id=t.thread_id, text=cleaned_delivery_content,
+            path="cron", cron_job_id=str(job.get("id") or ""),
+            cron_target=f"{target.get('_resolved_from') or 'explicit'}:{t.where}")
+        if policy_denial:
+            _note_target_error(job, f"{t.where}: {policy_denial}", delivery_errors)
+            continue
         target_errors: list = []
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,

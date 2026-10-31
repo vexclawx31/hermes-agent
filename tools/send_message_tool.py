@@ -185,6 +185,11 @@ def _handle_react(args, remove=False):
     _relay_denial = _authorize_relay_target(platform_name, chat_id, _thread_id)
     if _relay_denial:
         return tool_error(_relay_denial)
+    from gateway.outbound_policy import authorize_outbound
+    _policy_denial = authorize_outbound(platform_name, action="unreact" if remove else "react", chat_id=chat_id,
+                                        thread_id=_thread_id, text=emoji, path="core")
+    if _policy_denial:
+        return tool_error(_policy_denial)
 
     _, adapter = _live_adapter(platform)
     if adapter is None:
@@ -242,6 +247,13 @@ def _handle_send(args):
             return tool_error(err)
     if duplicate_skip := _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id):
         return json.dumps(duplicate_skip)
+    # Outbound policy, stage 1: the RAW target, before Slack user->DM resolution, because resolving a user
+    # target opens a conversation (conversations.open) even if the send is then refused.
+    from gateway.outbound_policy import authorize_outbound
+    _policy_denial = authorize_outbound(platform_name, action="send", chat_id=chat_id, thread_id=thread_id,
+                                        text=cleaned_message, path="core", stage="target")
+    if _policy_denial:
+        return tool_error(_policy_denial)
     # Slack: resolve user targets to DM channel IDs before sending. _parse_target_ref emits internal
     # ``user:U...`` / ``user_name:@handle`` targets; a bare U... id can also arrive from session metadata or
     # the home-channel config. All are opened via conversations.open (fixes #19236).
@@ -263,6 +275,11 @@ def _handle_send(args):
                                             native_token=getattr(pconfig, "token", None))
     if _relay_denial:
         return tool_error(_relay_denial)
+    # Outbound policy, stage 2: the resolved destination.
+    _policy_denial = authorize_outbound(platform_name, action="send", chat_id=chat_id, thread_id=thread_id,
+                                        text=cleaned_message, path="core", stage="resolved")
+    if _policy_denial:
+        return tool_error(_policy_denial)
 
     try:
         from model_tools import _run_async
