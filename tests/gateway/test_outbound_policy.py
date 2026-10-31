@@ -66,6 +66,28 @@ def test_enforce_fails_closed_without_a_verdict(verdicts):
     assert out and out.startswith("Refusing to send to slack")
 
 
+def test_hung_policy_plugin_is_abandoned_and_refused(monkeypatch):
+    import threading
+    import time
+    from hermes_cli.plugins import PluginManager
+
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.15)
+    hold = threading.Event()
+
+    def hung(**_kwargs):
+        hold.wait(timeout=10.0)
+        return {"allow": True}
+
+    manager = PluginManager()
+    manager._hooks[op.HOOK] = [hung]
+    started = time.monotonic()
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=manager.invoke_hook):
+        out = op.authorize_outbound("slack", action="send", chat_id=SLACK_CHANNEL, path="core", config=_cfg("enforce"))
+    hold.set()
+    assert time.monotonic() - started < 5.0
+    assert out and "no outbound policy answered" in out
+
+
 def test_audit_logs_but_never_blocks(caplog):
     with patch("hermes_cli.plugins.invoke_hook", side_effect=_hook([{"allow": False, "reason": "dm"}])):
         with caplog.at_level("WARNING"):

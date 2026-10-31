@@ -47,6 +47,8 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "post_gateway_admission",
     # Pre-gating archive observer on every inbound WhatsApp group message.
     "whatsapp_transport_event",
+    # Outbound send policy: a timed-out policy plugin gives no verdict, which an enforcing policy refuses.
+    "authorize_outbound_send",
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).

@@ -96,9 +96,8 @@ def authorize_outbound(
     if problem is None:
         return None
     logger.warning(
-        "outbound policy %s: %s %s to %s:%s%s (path=%s stage=%s job=%s text_sha=%s): %s",
-        "WOULD REFUSE (audit)" if mode == "audit" else "refused", action, "send" if action == "send" else "",
-        platform_name, chat_id, f":{thread_id}" if thread_id else "", path, stage, cron_job_id or "-",
+        "outbound policy %s: %s to %s:%s%s (path=%s stage=%s job=%s text_sha=%s): %s",
+        "WOULD REFUSE (audit)" if mode == "audit" else "refused", action, platform_name, chat_id, f":{thread_id}" if thread_id else "", path, stage, cron_job_id or "-",
         _text_hash(text), problem)
     if mode == "audit":
         return None
