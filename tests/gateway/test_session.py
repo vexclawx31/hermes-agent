@@ -125,6 +125,36 @@ class TestBuildSessionContextPrompt:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
 
+    def _plugin_slack_probe(self, monkeypatch, enabled, toolset_tools, token="xoxb-test"):
+        """_slack_tools_loaded with a token, Slack-enabled toolsets and a registry stand-in for plugin tools."""
+        from unittest.mock import patch
+        from gateway.session import _slack_tools_loaded
+        from tools.registry import registry
+
+        if token:
+            monkeypatch.setenv("SLACK_BOT_TOKEN", token)
+        else:
+            monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        with patch("tools.mcp_tool_discovery.get_registered_mcp_server_names", return_value=[]), \
+                patch("hermes_cli.config.load_config_readonly", return_value={}), \
+                patch("hermes_cli.tools_config._get_platform_tools", return_value=enabled), \
+                patch.object(registry, "get_tool_names_for_toolset", side_effect=lambda ts: toolset_tools.get(ts, [])):
+            return _slack_tools_loaded()
+
+    def test_slack_tools_loaded_counts_plugin_slack_toolsets(self, monkeypatch):
+        """Agents whose Slack tools come from a plugin (e.g. slack-joined-history) must get the "you have
+        Slack tools" note, not the "no Slack APIs" disclaimer that made them decline posts their tools can do."""
+        tools = {"slack_joined_history": ["slack_post_joined_message", "slack_read_joined_channel_history"]}
+        assert self._plugin_slack_probe(monkeypatch, ["file", "slack_joined_history"], tools) is True
+
+    def test_slack_tools_loaded_plugin_path_still_needs_the_token(self, monkeypatch):
+        tools = {"slack_joined_history": ["slack_post_joined_message"]}
+        assert self._plugin_slack_probe(monkeypatch, ["slack_joined_history"], tools, token="") is False
+
+    def test_slack_tools_loaded_ignores_non_slack_plugin_toolsets(self, monkeypatch):
+        tools = {"whatsapp_archive": ["whatsapp_archive_search"], "switchboard": ["switchboard_request"]}
+        assert self._plugin_slack_probe(monkeypatch, ["whatsapp_archive", "switchboard"], tools) is False
+
     def test_slack_tools_loaded_detects_real_mcp_registration(self):
         """Regression (review of #63234): a connected MCP server whose tools
         are ACTUALLY registered in the live registry must be detected as
