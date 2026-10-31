@@ -149,6 +149,41 @@ def test_guest_gets_guest_toolsets_owner_keeps_platform():
     assert adapter.toolsets_for_source(_source(None)) is not None
 
 
+def _kit_extra(kit):
+    groups = {"*": {"allow_from": [OWNER]}, SQUAD_GROUP: {"allow_from": ["*"], "guest_toolsets": kit}}
+    return {**ALEX_EXTRA, "groups": groups}
+
+
+def test_group_guest_toolsets_override_only_that_group():
+    adapter = _make_adapter(_kit_extra(["web", "vision", "todo"]))
+    assert sorted(adapter.toolsets_for_source(_source(GUEST))) == ["todo", "vision", "web"]
+    other = adapter.toolsets_for_source(_source(GUEST, chat_id=ORDINARY_GROUP))
+    assert sorted(other) == ["vision", "web"]
+    assert adapter.toolsets_for_source(_source(OWNER)) is None
+    assert sorted(adapter.toolsets_for_source(_source(GUEST, chat_type="dm"))) == ["vision", "web"]
+
+
+def test_group_guest_toolsets_case_insensitive_key_and_empty_list_fail_closed():
+    adapter = _make_adapter(_kit_extra([]))
+    assert adapter.toolsets_for_source(_source(GUEST, chat_id=SQUAD_GROUP.upper())) == []
+    adapter = _make_adapter(_kit_extra(None))
+    assert adapter.toolsets_for_source(_source(GUEST)) == []
+
+
+def test_runner_group_kit_stays_exact(monkeypatch):
+    import hermes_cli.tools_config as tc
+
+    adapter = _make_adapter(_kit_extra(["web", "vision", "todo"]))
+    runner = _runner_with(adapter)
+    config = {"platform_toolsets": {"whatsapp": ["web", "vision", "terminal", "file", "todo"]}}
+    monkeypatch.setattr(tc, "_get_plugin_toolset_keys", lambda: {"whatsapp_archive_client"})
+    monkeypatch.setattr(tc, "enabled_mcp_server_names", lambda cfg: {"private-mcp"})
+    squad = runner._resolve_enabled_toolsets_for_source(config, _source(GUEST), "whatsapp")
+    assert set(squad) <= {"web", "vision", "todo"} and "todo" in squad
+    other = runner._resolve_enabled_toolsets_for_source(config, _source(GUEST, chat_id=ORDINARY_GROUP), "whatsapp")
+    assert set(other) <= {"web", "vision"} and "todo" not in other
+
+
 def test_wildcard_owner_never_counts_as_owner():
     adapter = _make_adapter({**ALEX_EXTRA, "owners": ["*"]})
     assert adapter.toolsets_for_source(_source(OWNER)) is not None

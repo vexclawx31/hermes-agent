@@ -297,8 +297,15 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
     toolsets_for_source_exact = True
 
     def toolsets_for_source(self, source) -> Optional[list[str]]:
-        """``extra.guest_toolsets`` for any caller that is not an owner; owners keep the platform toolsets."""
+        """Toolsets for any caller that is not an owner; owners keep the platform toolsets.
+
+        In a group, ``groups.<chat_id>.guest_toolsets`` (same lookup as ``allow_from``: exact, then
+        case-insensitive, then ``"*"``) replaces ``extra.guest_toolsets`` for that group only."""
         guest = self.config.extra.get("guest_toolsets")
+        if getattr(source, "chat_type", "") == "group":
+            group_cfg = self._resolve_group_cfg(str(getattr(source, "chat_id", "") or ""))
+            if "guest_toolsets" in group_cfg:
+                guest = group_cfg["guest_toolsets"]
         if guest is None and not getattr(self, "_owners", None):
             return None
         if self._is_whatsapp_owner(getattr(source, "user_id", None)):
