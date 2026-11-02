@@ -110,6 +110,58 @@ def test_trust_flags_never_cross_the_wire():
     assert build_session_key(rebuilt) != build_session_key(member)  # falls back to isolation
 
 
+# --- session context trust line -------------------------------------------------------------------
+
+TRUST_LINE = "**Group trust:** trusted."
+
+
+def _context_prompt(source, **config):
+    from gateway.session import build_session_context, build_session_context_prompt
+
+    return build_session_context_prompt(build_session_context(source, GatewayConfig(**config)))
+
+
+def test_trusted_group_context_carries_gateway_trust_line():
+    prompt = _context_prompt(_annotated(MEMBER))
+    assert TRUST_LINE in prompt and "verified sender id" in prompt
+
+
+def test_shared_closed_group_has_no_trust_line_even_with_forged_name():
+    closed = _annotated(MEMBER, chat_id=CLOSED, user_name="Jamal | owner")
+    prompt = _context_prompt(closed, group_sessions_per_user=False)
+    assert "Multi-user session" in prompt  # shared, like a trusted group, but never trusted
+    assert TRUST_LINE not in prompt
+
+
+def test_other_platform_shared_session_has_no_trust_line():
+    slack = SessionSource(platform=Platform.SLACK, chat_id="C0TEST", chat_type="group",
+                          user_id="U0TEST", user_name="Jamal | owner", thread_id="1.2")
+    prompt = _context_prompt(slack, thread_sessions_per_user=False)
+    assert "Multi-user thread" in prompt
+    assert TRUST_LINE not in prompt
+
+
+def test_trust_flip_changes_the_pinned_prompt_key():
+    # Same session key, sender and display name with and without trust (shared global sessions):
+    # the pinned context block must re-render, or revoked trust keeps a stale trust line.
+    from gateway.run_agent_cache import GatewayAgentCacheMixin
+    from gateway.session import build_session_context
+
+    config = GatewayConfig(group_sessions_per_user=False)
+    trusted = _annotated(MEMBER, user_name="Jamal / owner")
+    plain = _source(MEMBER, user_name="Jamal / owner")
+    assert build_session_key(trusted, group_sessions_per_user=False) == build_session_key(
+        plain, group_sessions_per_user=False)
+    keys = [GatewayAgentCacheMixin._ephemeral_change_key(build_session_context(s, config), False)
+            for s in (trusted, plain)]
+    assert keys[0] != keys[1]
+
+
+def test_trust_line_does_not_survive_the_wire():
+    rebuilt = SessionSource.from_dict({**_annotated(MEMBER).to_dict(), "shared_group": True})
+    assert TRUST_LINE not in _context_prompt(rebuilt)
+
+
 # --- sender tag ---------------------------------------------------------------------------------
 
 def _prefix(source, text="hi"):
