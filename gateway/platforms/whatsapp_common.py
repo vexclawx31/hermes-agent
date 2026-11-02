@@ -356,7 +356,7 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         sender = str(data.get("senderId") or "")
         if not self._is_group_allowed(chat_id, sender):
             return False
-        if self._guest_isolation_broken() and not self._is_whatsapp_owner(sender):
+        if self._guest_isolation_broken() and not self._is_whatsapp_owner(sender) and not self._group_is_trusted(chat_id):
             return False
         if data.get("upsertType") == "append":
             return False  # history/offline replay: archive-only, never a late conversation turn
