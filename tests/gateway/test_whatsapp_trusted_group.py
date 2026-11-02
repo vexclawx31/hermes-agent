@@ -141,6 +141,22 @@ def test_other_platform_shared_session_has_no_trust_line():
     assert TRUST_LINE not in prompt
 
 
+def test_trust_flip_changes_the_pinned_prompt_key():
+    # Same session key, sender and display name with and without trust (shared global sessions):
+    # the pinned context block must re-render, or revoked trust keeps a stale trust line.
+    from gateway.run_agent_cache import GatewayAgentCacheMixin
+    from gateway.session import build_session_context
+
+    config = GatewayConfig(group_sessions_per_user=False)
+    trusted = _annotated(MEMBER, user_name="Jamal / owner")
+    plain = _source(MEMBER, user_name="Jamal / owner")
+    assert build_session_key(trusted, group_sessions_per_user=False) == build_session_key(
+        plain, group_sessions_per_user=False)
+    keys = [GatewayAgentCacheMixin._ephemeral_change_key(build_session_context(s, config), False)
+            for s in (trusted, plain)]
+    assert keys[0] != keys[1]
+
+
 def test_trust_line_does_not_survive_the_wire():
     rebuilt = SessionSource.from_dict({**_annotated(MEMBER).to_dict(), "shared_group": True})
     assert TRUST_LINE not in _context_prompt(rebuilt)
