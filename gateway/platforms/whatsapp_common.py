@@ -296,8 +296,32 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
     # default-on plugin toolsets or MCP servers).
     toolsets_for_source_exact = True
 
+    def _group_is_trusted(self, chat_id: str) -> bool:
+        """``groups.<chat_id>.trust: trusted`` (exact or case-insensitive key; never the ``"*"``
+        default: trust is granted group by group)."""
+        groups = getattr(self, "_groups", None)
+        if not isinstance(groups, dict) or not chat_id:
+            return False
+        lowered = chat_id.lower()
+        cfg = groups.get(chat_id)
+        if not isinstance(cfg, dict):
+            cfg = next((v for k, v in groups.items()
+                        if isinstance(k, str) and k != "*" and k.lower() == lowered and isinstance(v, dict)), None)
+        return isinstance(cfg, dict) and str(cfg.get("trust", "")).strip().lower() == "trusted"
+
+    def annotate_group_trust(self, source) -> None:
+        """Mark a trusted group's source: one shared session and a verified sender role. The role
+        comes from the sender id (``extra.owners``), never the display name."""
+        if getattr(source, "chat_type", "") != "group" or not self._group_is_trusted(str(source.chat_id or "")):
+            return
+        source.shared_group = True
+        source.sender_role = "owner" if self._is_whatsapp_owner(getattr(source, "user_id", None)) else "member"
+
     def toolsets_for_source(self, source) -> Optional[list[str]]:
-        """``extra.guest_toolsets`` for any caller that is not an owner; owners keep the platform toolsets."""
+        """``extra.guest_toolsets`` for any caller that is not an owner; owners keep the platform toolsets.
+        In a trusted group every member gets the owner's toolsets."""
+        if getattr(source, "chat_type", "") == "group" and self._group_is_trusted(str(getattr(source, "chat_id", "") or "")):
+            return None
         guest = self.config.extra.get("guest_toolsets")
         if guest is None and not getattr(self, "_owners", None):
             return None
