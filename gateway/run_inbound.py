@@ -490,6 +490,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             or self._slash_confirm_text_choices().get(_norm_reply)
         )
         if _confirm_choice is not None:
+            # Confirming needs the right to run the confirmed command itself; "always" also rewrites
+            # config, so it needs /approve. In a shared session this keeps a participant without
+            # those rights from answering someone else's prompt.
+            _confirmed_cmd = str(_pending_confirm.get("command") or "").strip().lstrip("/!").split(" ")[0].lower()
+            _needed = "approve" if _confirm_choice == "always" else _confirmed_cmd
+            if _needed and self._check_slash_access(event.source, _needed) is not None:
+                return None
+        if _confirm_choice is not None:
             _resolved = await _slash_confirm_mod.resolve(
                 _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
             )
@@ -1445,10 +1453,23 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-        if _is_shared_multi_user and source.user_name:
+        _sender_role = getattr(source, "sender_role", None)
+        if _is_shared_multi_user and (source.user_name or _sender_role):
             # Display names are attacker-influenceable: neutralize newlines/control chars or a
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
+            _safe_user_name = neutralize_untrusted_inline_text(source.user_name or "unknown")
+            if _sender_role:
+                # The role is adapter-verified (sender id, not display name). Brackets and "|" in the
+                # name are neutralized so a member named "Jamal | owner" can't forge the tag.
+                for _ch in "[]|":
+                    _safe_user_name = _safe_user_name.replace(_ch, "/")
+                if getattr(event, "_mixed_senders", False):
+                    # Several people's messages merged into one turn: no single verified role.
+                    _safe_user_name, _sender_role = "several senders", "member"
+                _safe_user_name = f"{_safe_user_name} | {_sender_role}"
+                # A body line starting with "[" could pose as another speaker's tag: escape it.
+                message_text = "\n".join(
+                    "\\" + line if line.lstrip().startswith("[") else line for line in message_text.split("\n"))
             # Slack: expose the CURRENT speaker's verifiable `<@U...>` id so "mention me again" has a
             # trusted target (display names are ambiguous). user_id comes from the envelope, not user-editable.
             # See #17916.

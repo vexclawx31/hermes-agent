@@ -556,6 +556,10 @@ class GatewayBusySessionMixin:
             if event.allow_gateway_control and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
                 _match = self._plaintext_approval_words().get(_raw_text)
+                # Same admin gate as the slash forms: in a shared group session any participant's
+                # "yes" reaches this queue, and only someone allowed to run /approve may answer it.
+                if _match is not None and self._check_slash_access(event.source, _match[0]) is not None:
+                    _match = None
                 if _match is not None:
                     _verb, _normalized_args = _match
                     _approval_handler = (

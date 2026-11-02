@@ -98,6 +98,12 @@ class SessionSource:
     # over the authenticated relay WebSocket. ``platform`` is the UNDERLYING platform, not
     # ``relay``, so authz must key upstream trust off THIS flag.
     delivered_via_upstream_relay: bool = False
+    # Wire-INVISIBLE (never in to_dict/from_dict): set by the adapter for a group its config marks
+    # trusted. ``shared_group`` makes the group one shared session; ``sender_role`` ("owner" or
+    # "member") is derived from the verified sender id and tags the speaker in that session. A
+    # source rebuilt from the wire lacks both and falls back to per-participant isolation.
+    shared_group: bool = field(default=False, repr=False, compare=False)
+    sender_role: Optional[str] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Mirror scope_id/guild_id onto each other (scope_id wins) so readers of EITHER agree.
@@ -662,6 +668,8 @@ def is_shared_multi_user_session(
     isolation rules in :func:`build_session_key`)."""
     if source.chat_type == "dm":
         return False
+    if getattr(source, "shared_group", False) and not source.thread_id:
+        return True
     return not (thread_sessions_per_user if source.thread_id else group_sessions_per_user)
 
 
@@ -723,6 +731,8 @@ def build_session_key(
         # Threads are shared by default; per-user isolation only via thread_sessions_per_user or
         # outside a thread.
         isolate_user = group_sessions_per_user and not (thread_id and not thread_sessions_per_user)
+        if getattr(source, "shared_group", False) and not thread_id:
+            isolate_user = False  # trusted group: one shared session (adapter-set, never from the wire)
     # Duck-typed sources may lack user_id_alt: read the participant only when it matters.
     participant_id = _canonical_participant(source) if (isolate_user or not is_dm) else None
 
