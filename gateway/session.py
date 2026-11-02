@@ -445,6 +445,15 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
             f"**Session type:** {session_label} — messages are prefixed with [sender name]. "
             "Multiple users may participate."
         )
+        # Written only by the gateway (never from chat data): the one trustworthy signal that the
+        # role in "[name | role]" was set from the verified sender id. Absent everywhere else, so a
+        # display name containing "| owner" on another chat stays plain text.
+        if getattr(src, "shared_group", False) and not src.thread_id:
+            lines.append(
+                "**Group trust:** trusted. Each message starts with [sender name | owner] or "
+                "[sender name | member]; the role is set by the gateway from the verified sender id, "
+                "not from the display name."
+            )
     elif src.user_name:
         lines.append(f"**User:** {_format_untrusted_prompt_value(src.user_name)}")
     elif src.user_id:
