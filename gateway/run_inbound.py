@@ -1458,18 +1458,18 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # Display names are attacker-influenceable: neutralize newlines/control chars or a
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
             _safe_user_name = neutralize_untrusted_inline_text(source.user_name or "unknown")
+            # Every shared session: "[]|" in the name are neutralized so "Jamal | owner" can't forge a tag/role.
+            for _ch in "[]|":
+                _safe_user_name = _safe_user_name.replace(_ch, "/")
             if _sender_role:
-                # The role is adapter-verified (sender id, not display name). Brackets and "|" in the
-                # name are neutralized so a member named "Jamal | owner" can't forge the tag.
-                for _ch in "[]|":
-                    _safe_user_name = _safe_user_name.replace(_ch, "/")
+                # The role is adapter-verified (sender id, not display name).
                 if getattr(event, "_mixed_senders", False):
                     # Several people's messages merged into one turn: no single verified role.
                     _safe_user_name, _sender_role = "several senders", "member"
                 _safe_user_name = f"{_safe_user_name} | {_sender_role}"
-                # A body line starting with "[" could pose as another speaker's tag: escape it.
-                message_text = "\n".join(
-                    "\\" + line if line.lstrip().startswith("[") else line for line in message_text.split("\n"))
+            # A body line starting with "[" could pose as another speaker's tag: escape it.
+            message_text = "\n".join(
+                "\\" + line if line.lstrip().startswith("[") else line for line in message_text.split("\n"))
             # Slack: expose the CURRENT speaker's verifiable `<@U...>` id so "mention me again" has a
             # trusted target (display names are ambiguous). user_id comes from the envelope, not user-editable.
             # See #17916.
