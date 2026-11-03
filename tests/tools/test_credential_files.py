@@ -168,6 +168,19 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
         assert missing == ["absent.json"], "an existing token isn't 'missing' on the local backend"
         assert mounts == []
 
+    def test_local_backend_keeps_mains_refusals_without_registering(self, tmp_path):
+        """Local readiness is unchanged: master stores and escaping symlinks still show setup-needed,
+        in the skill's own spelling, and nothing is registered for a later sandbox to mount."""
+        home = self._home(tmp_path)
+        (home / ".env").write_text("secret")
+        (tmp_path / "outside.json").write_text("{}")
+        (home / "escape.json").symlink_to(tmp_path / "outside.json")
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "local"}):
+            missing = register_credential_files([".env", "escape.json", "./absent.json", "./service_token.json"])
+            mounts = get_credential_file_mounts()
+        assert missing == [".env", "escape.json", "./absent.json"]
+        assert mounts == []
+
     def test_symlink_swap_after_authorization_is_not_mounted(self, tmp_path):
         home = self._home(tmp_path)
         _authorize(home, ["service_token.json"])
@@ -211,7 +224,6 @@ class TestSkillDeclaredMountsNeedConfigAuthorization:
         def guard(path):
             if path.endswith("other.json"):
                 raise RuntimeError("guard failure")
-            return None
         with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}), \
                 patch.object(cred_mod, "get_read_block_error", guard):
             mounts = get_credential_file_mounts()

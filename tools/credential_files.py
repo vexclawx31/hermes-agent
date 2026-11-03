@@ -71,15 +71,26 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
     which are refused via the canonical read deny-list so the mount surface cannot hand a
     skill what the read surface denies. Fails CLOSED (logged) if the guard is unavailable or raises.
     """
+    resolved = _checked_skill_file(relative_path)
+    if resolved is None:
+        return False
+    container_path = f"{container_base.rstrip('/')}/{relative_path}"
+    _get_registered()[container_path] = str(resolved)
+    logger.debug("credential_files: registered %s -> %s", resolved, container_path)
+    return True
+
+
+def _checked_skill_file(relative_path: str) -> Optional[Path]:
+    """The contained, existing, non-master-store host file for *relative_path*, or None (see above)."""
     resolved = _contained_host_path(
         relative_path, get_hermes_home(),
         "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
         "credential_files: rejected path traversal %r (%s)")
     if resolved is None:
-        return False
+        return None
     if not resolved.is_file():
         logger.debug("credential_files: skipping %s (not found)", resolved)
-        return False
+        return None
     # Master credential stores are never mountable, even though they sit inside HERMES_HOME and therefore
     # pass the containment check above. Fails CLOSED: if the canonical guard can't be consulted we refuse
     # the mount rather than risk bind-mounting auth.json into a sandbox. The import lives at module top (no
@@ -88,22 +99,18 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
     if get_read_block_error is None:
         logger.error("credential_files: refusing %r — agent.file_safety could not be "
                      "imported, so the master-store deny-list cannot be consulted", relative_path)
-        return False
+        return None
     try:
         denied = get_read_block_error(str(resolved))
     except Exception:
         logger.exception("credential_files: refusing %r — read guard raised", relative_path)
-        return False
+        return None
     if denied:
         logger.warning("credential_files: refused %r — it is a credential store the agent "
                        "is denied from reading; a skill may mount its own service token, "
                        "not the master key files", relative_path)
-        return False
-
-    container_path = f"{container_base.rstrip('/')}/{relative_path}"
-    _get_registered()[container_path] = str(resolved)
-    logger.debug("credential_files: registered %s -> %s", resolved, container_path)
-    return True
+        return None
+    return resolved
 
 
 def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> list[str]:
@@ -114,8 +121,8 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
     ``config.yaml``, a CLI's token cache) would otherwise be bind-mounted into the sandbox the skill's
     code runs in. On a sandboxed backend only paths the operator lists in ``terminal.credential_files``
     are available; they're checked again whenever mounts are built (see ``get_credential_file_mounts``).
-    Anything else is reported back so the skill shows setup-needed. The local backend mounts nothing:
-    only absent (or non-relative) files are reported.
+    Anything else is reported back so the skill shows setup-needed. The local backend registers nothing
+    and reports what it always did: absent, absolute, escaping and master-store paths.
     """
     local = _terminal_backend() in ("local", "")
     home = get_hermes_home()
@@ -128,11 +135,12 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
             continue
         if not entry.strip():
             continue
+        if local:  # main's checks and spelling, without registering: nothing is mounted locally
+            if _checked_skill_file(entry.strip()) is None:
+                missing.append(entry.strip())
+            continue
         rel_path = posixpath.normpath(entry.strip())  # one spelling, matching the config side
-        if local:
-            if not _is_relative_inside(rel_path) or not (home / rel_path).is_file():
-                missing.append(rel_path)
-        elif rel_path not in authorized:
+        if rel_path not in authorized:
             logger.warning("credential_files: %r is not available in the sandbox — list it in "
                            "terminal.credential_files", rel_path)
             missing.append(rel_path)
