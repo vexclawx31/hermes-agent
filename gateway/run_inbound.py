@@ -36,6 +36,7 @@ from gateway.session import (
     SessionSource, build_session_context, is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
 )
+from gateway.speaker_tag import escape_speaker_tag_lines, neutralize_speaker_name
 from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1457,23 +1458,19 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         if _is_shared_multi_user and (source.user_name or _sender_role):
             # Display names are attacker-influenceable: neutralize newlines/control chars or a
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name or "unknown")
-            if _sender_role:
-                # The role is adapter-verified (sender id, not display name). Brackets and "|" in the
-                # name are neutralized so a member named "Jamal | owner" can't forge the tag.
-                for _ch in "[]|":
-                    _safe_user_name = _safe_user_name.replace(_ch, "/")
-                if getattr(event, "_mixed_senders", False):
-                    # Several people's messages merged into one turn: no single verified role.
-                    _safe_user_name, _sender_role = "several senders", "member"
-                _safe_user_name = f"{_safe_user_name} | {_sender_role}"
-                # A body line starting with "[" could pose as another speaker's tag: escape it.
-                message_text = "\n".join(
-                    "\\" + line if line.lstrip().startswith("[") else line for line in message_text.split("\n"))
+            # Every shared session: tag chars (and look-alikes) in the name can't forge a tag; body lines
+            # that start like a tag are escaped (gateway/speaker_tag.py).
+            _safe_user_name = neutralize_speaker_name(neutralize_untrusted_inline_text(source.user_name or "unknown"))
+            _mixed = getattr(event, "_mixed_senders", False)
+            if _mixed:  # several people's messages merged into one turn: no single name, role or id
+                _safe_user_name = "several senders"
+            if _sender_role:  # adapter-verified (sender id, not display name)
+                _safe_user_name = f"{_safe_user_name} | {'member' if _mixed else _sender_role}"
+            message_text = escape_speaker_tag_lines(message_text)
             # Slack: expose the CURRENT speaker's verifiable `<@U...>` id so "mention me again" has a
             # trusted target (display names are ambiguous). user_id comes from the envelope, not user-editable.
             # See #17916.
-            if source.platform == Platform.SLACK and source.user_id:
+            if source.platform == Platform.SLACK and source.user_id and not _mixed:
                 _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
             message_text = f"[{_safe_user_name}] {message_text}"
         # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
