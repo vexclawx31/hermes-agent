@@ -9,6 +9,7 @@
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo?, mentions? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
+ *   POST /delete         - Delete an own group message for everyone { chatId, messageId }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName?, mentions? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
  *   POST /typing         - Send typing indicator { chatId }
@@ -57,6 +58,9 @@ import {
   receiptStatus,
   GROUP_JID_RE,
   isArchivableHistoryMessage,
+  BRIDGE_CAPABILITIES,
+  createDeleteHandler,
+  queueOwnGroupMutation,
   writeJsonLine,
 } from './bridge_helpers.js';
 
@@ -165,7 +169,7 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
+      () => reject(Object.assign(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`), { code: 'SEND_TIMEOUT' })),
       timeoutMs,
     );
   });
@@ -611,6 +615,12 @@ async function startSocket() {
       let fromOwner = false;
       if (msg.key.fromMe) {
         if (isGroup || chatId.includes('status')) {
+          // Own edits/revokes in groups reach observers only, so a plugin can confirm its own mutations.
+          const mutation = isGroup ? queueOwnGroupMutation(msg, messageQueue, MAX_QUEUE_SIZE) : null;
+          if (mutation) {
+            emitDebugEvent({ stage: 'queued_own_mutation', kind: mutation.ownMutation, chatId: redactWhatsAppId(chatId) });
+            continue;
+          }
           emitDebugEvent({
             stage: 'ignored',
             reason: isGroup ? 'from_me_group' : 'from_me_status',
@@ -998,6 +1008,12 @@ app.post('/edit', async (req, res) => {
   }
 });
 
+// Delete an own group message for everyone (handler and status contract in bridge_helpers.js).
+app.post('/delete', createDeleteHandler({
+  isConnected: () => !!sock && connectionState === 'connected',
+  send: (chatId, payload) => sendWithTimeout(chatId, payload),
+}));
+
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
@@ -1240,7 +1256,7 @@ app.get('/health', (req, res) => {
     sendReadReceipts: SEND_READ_RECEIPTS,
     // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
     session: path.resolve(SESSION_DIR),
-    capabilities: { outboundMentions: true, groupDirectory: true, deliveryStatus: true, historyRequest: true },
+    capabilities: BRIDGE_CAPABILITIES,
     historyQueueLength: historyQueue.size,
     historyDropped: historyQueue.dropped,
   });
