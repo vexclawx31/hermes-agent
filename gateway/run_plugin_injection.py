@@ -20,6 +20,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 logger = logging.getLogger("gateway.run")
+# Bounded wait for agent-origin admission (Slack conversations.info + replies) when a plugin injects off-loop.
+AGENT_ORIGIN_ADMIT_TIMEOUT = 20.0
 
 
 class GatewayPluginInjectionMixin:
@@ -77,6 +79,9 @@ class GatewayPluginInjectionMixin:
                 # Early, synchronous answer for the plugin; dispatch checks the grant again with the rest.
                 logger.warning("Plugin message injection refused: plugin=%s %s has no gateway.agent_origin grant",
                                plugin_id, target)
+                return False
+            if agent_origin and not self._agent_origin_admitted_sync(source, plugin_id=plugin_id,
+                                                                     plugin_home=plugin_home, target=target):
                 return False
             coro = self._dispatch_plugin_origin_injection(
                 source=source, content=content, plugin_id=plugin_id, plugin_home=plugin_home, **author_kwargs,
@@ -264,14 +269,21 @@ class GatewayPluginInjectionMixin:
             return _refuse("origin names profile %r; plugins may only start sessions in their own profile (%s)",
                            requested, profile)
         if agent_origin:
-            if any(fields.get(k) for k in ("user_id", "user_id_alt", "user_name")):
-                return _refuse("an agent-origin turn names no user")
+            allowed = {"platform", "chat_id", "chat_type", "thread_id", "scope_id"}
+            if set(fields) - allowed:
+                return _refuse("an agent-origin origin takes only platform, chat_id, chat_type, thread_id and "
+                               "scope_id (no user, message or parent ids)")
+            if fields.get("chat_type", "group") != "group":
+                return _refuse("an agent-origin turn goes to a channel or thread (chat_type group)")
+            fields["chat_type"] = "group"
             if fields.get("chat_id") == "@home":
                 home = self._agent_origin_home(profile, fields.get("platform"))
                 if home is None:
                     return _refuse("no home channel configured for %s in profile %s", fields.get("platform"), profile)
+                if fields.get("scope_id") not in (None, "", home.scope_id):
+                    return _refuse("@home is the profile's own home; another workspace can't be named")
                 fields["chat_id"] = home.chat_id
-                fields.setdefault("scope_id", home.scope_id)
+                fields["scope_id"] = home.scope_id
                 if home.thread_id and not fields.get("thread_id"):
                     fields["thread_id"] = home.thread_id
         try:
@@ -321,7 +333,10 @@ class GatewayPluginInjectionMixin:
         except Exception:
             return []
         block = ((cfg.get("gateway") or {}) if isinstance(cfg.get("gateway"), dict) else {}).get("agent_origin")
-        if not isinstance(block, dict) or plugin_id not in (block.get("plugins") or []):
+        plugins = block.get("plugins") if isinstance(block, dict) else None
+        if not isinstance(plugins, list) or not all(type(p) is str for p in plugins) or plugin_id not in plugins:
+            return []  # anything malformed grants nothing (a string would match by substring)
+        if not isinstance(block.get("destinations"), list):
             return []
         grants = []
         for d in block.get("destinations") or []:
@@ -331,6 +346,29 @@ class GatewayPluginInjectionMixin:
             if all(type(v) is str and v and v.strip() == v for v in values):
                 grants.append(values)
         return grants
+
+    def _agent_origin_admitted_sync(self, source: SessionSource, *, plugin_id: str, plugin_home: Optional[Path],
+                                    target: str) -> bool:
+        """The full admission (grant, channel policy, membership, thread root) as the plugin's synchronous
+        answer, so a refused destination is reported undeliverable, not dispatched. Off the gateway loop it
+        waits (bounded) for the check on the loop; on the loop thread it can't block, so it answers True and
+        dispatch refuses (logged). Dispatch re-checks either way."""
+        loop = getattr(self, "_gateway_loop", None)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop:
+            return True
+        future = asyncio.run_coroutine_threadsafe(
+            self._agent_origin_admitted(source, plugin_id=plugin_id, plugin_home=plugin_home, target=target), loop)
+        try:
+            return future.result(timeout=AGENT_ORIGIN_ADMIT_TIMEOUT) is True
+        except Exception:
+            future.cancel()
+            logger.warning("Plugin message injection refused: plugin=%s %s: admission check timed out or failed",
+                           plugin_id, target)
+            return False
 
     async def _agent_origin_admitted(
         self, source: SessionSource, *, plugin_id: str, plugin_home: Optional[Path], target: str,

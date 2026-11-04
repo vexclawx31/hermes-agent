@@ -248,6 +248,67 @@ async def test_context_is_gone_after_the_turn_for_children_and_the_next_human_tu
     assert get_injected_turn() is None
 
 
+async def _inject_off_loop(gw, origin, turn=None):
+    """As switchboard-line does: from its own thread, not the gateway loop."""
+    with patch("hermes_cli.plugins._known_plugin_managers", return_value=[gw.ctx._manager]):
+        await _publish(gw.runner)
+        ok = await asyncio.to_thread(gw.ctx.inject_message, "Switchboard message from Vex", origin=origin,
+                                     author=AUTHOR, turn=turn)
+        await _settle(gw.runner, gw.adapter)
+    return ok
+
+
+@pytest.mark.asyncio
+async def test_off_loop_the_full_admission_is_the_synchronous_answer(make_gateway):
+    gw = make_gateway(_config(grants=[_grant("C0CHAN0001")]), admits=(False, "the bot is not a member"))
+    assert await _inject_off_loop(gw, _dest(), _turn()) is False  # so the line reports undeliverable
+    assert gw.turns == []
+    gw = make_gateway(_config(grants=[_grant("C0CHAN0001")]))
+    assert await _inject_off_loop(gw, _dest(), _turn()) is True
+    assert len(gw.turns) == 1 and len(gw.adapter.admit_calls) == 2  # admitted, then re-checked at dispatch
+
+
+@pytest.mark.asyncio
+async def test_into_a_busy_session_it_is_queued_never_dropped(make_gateway):
+    gw = make_gateway(_config(grants=[_grant("C0CHAN0001")]))
+    src = gw.runner._plugin_origin_source(_dest(), plugin_home=gw.home, plugin_id=PLUGIN, agent_origin=True)
+    key = gw.runner._session_key_for_source(src)
+    gw.adapter.set_busy_session_handler(gw.runner._handle_active_session_busy_message)
+    gw.adapter._active_sessions[key] = asyncio.Event()  # a turn is already running in that thread
+    with patch("hermes_cli.plugins._known_plugin_managers", return_value=[gw.ctx._manager]):
+        await _publish(gw.runner)
+        assert gw.ctx.inject_message("Switchboard message from Vex", origin=_dest(), author=AUTHOR,
+                                     turn=_turn()) is True
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+    pending = gw.adapter._pending_messages.get(key)
+    assert pending is not None and "Switchboard message from Vex" in pending.text  # queued behind the turn
+    from gateway.injected_turn import spec_of_event
+    assert spec_of_event(pending).agent_origin is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin, home", [
+    (_dest(chat_type="dm"), None),                         # a channel dressed as a DM
+    (_dest(message_id="1792000000.000900"), None),         # nothing grants a message id
+    (_dest(parent_chat_id="C0OTHER001"), None),
+    (_dest(chat_id="@home", thread_id=None, scope_id="T0OTHER01"), "C0HOME0001"),  # @home is only the own home
+])
+async def test_agent_origin_fields_are_pinned(make_gateway, origin, home):
+    hc = HomeChannel(platform=Platform.TELEGRAM, chat_id=home, name="home", scope_id=TEAM) if home else None
+    gw = make_gateway(_config(grants=[_grant("C0CHAN0001"), _grant("C0HOME0001")]), home_channel=hc)
+    assert await _inject(gw, origin, _turn()) is False
+    assert gw.turns == []
+
+
+@pytest.mark.asyncio
+async def test_a_plugins_value_that_is_not_a_list_grants_nothing(make_gateway):
+    cfg = _config(grants=[_grant("C0CHAN0001")])
+    cfg["gateway"]["agent_origin"]["plugins"] = "x-switchboard-line-y"  # would match by substring
+    gw = make_gateway(cfg)
+    assert await _inject(gw, _dest(), _turn()) is False and gw.turns == []
+
+
 @pytest.mark.asyncio
 async def test_a_platform_without_the_hook_refuses(make_gateway):
     gw = make_gateway(_config(grants=[_grant("C0CHAN0001")]))

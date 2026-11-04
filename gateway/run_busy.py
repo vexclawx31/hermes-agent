@@ -814,7 +814,15 @@ class GatewayBusySessionMixin:
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
-        if event.internal and event.allow_gateway_control:
+        # A host-built agent-origin plugin turn (gateway.injected_turn) has no user either; it was admitted by
+        # its gateway.agent_origin grant at dispatch, so it queues behind the active turn like a gateway wake
+        # instead of failing the human check and being dropped.
+        from gateway.injected_turn import spec_of_event
+        from agent.plugin_author import event_plugin_author
+        _spec = spec_of_event(event)
+        _agent_origin = (event.internal and _spec is not None and _spec.agent_origin
+                         and event_plugin_author(event) is not None)
+        if (event.internal and event.allow_gateway_control) or _agent_origin:
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
