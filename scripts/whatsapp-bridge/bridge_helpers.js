@@ -288,6 +288,57 @@ export function createHistoryQueue(limit = 5000) {
 // Group JIDs only (creator-timestamp form or numeric), as accepted by POST /history-request.
 export const GROUP_JID_RE = /^[0-9]{6,}(-[0-9]+)?@g\.us$/;
 
+// POST /delete body: a group JID and a non-empty message id of at most 128 chars; null when invalid.
+export function parseDeleteRequest(body) {
+  const { chatId, messageId } = body || {};
+  if (typeof chatId !== 'string' || !GROUP_JID_RE.test(chatId)) return null;
+  if (typeof messageId !== 'string' || !messageId || messageId.length > 128) return null;
+  return { chatId, messageId };
+}
+
+// proto.Message.ProtocolMessage.Type values (REVOKE is the proto default, so a decoded message may omit it).
+const PROTOCOL_REVOKE = 0;
+const PROTOCOL_MESSAGE_EDIT = 14;
+
+function editedText(edited) {
+  const m = edited || {};
+  return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption
+    || m.videoMessage?.caption || m.documentMessage?.caption || '';
+}
+
+function messageTimestampSeconds(ts) {
+  if (typeof ts === 'number' && Number.isFinite(ts)) return ts;
+  if (ts && typeof ts.toNumber === 'function') return ts.toNumber();
+  return Math.floor(Date.now() / 1000);
+}
+
+// The account's own edit/revoke of a group message, as an observer-only event (never a conversation
+// turn); null for anything else. Edits from another linked device arrive wrapped in editedMessage.
+export function ownGroupMutationEvent(msg) {
+  const chatId = msg?.key?.remoteJid || '';
+  if (!msg?.key?.fromMe || !msg.key.id || !GROUP_JID_RE.test(chatId)) return null;
+  const raw = msg.message || {};
+  const content = raw.editedMessage?.message || raw;
+  const pm = content.protocolMessage;
+  const targetMessageId = pm?.key?.id;
+  if (!pm || typeof targetMessageId !== 'string' || !targetMessageId) return null;
+  let ownMutation = null;
+  if (pm.editedMessage || pm.type === PROTOCOL_MESSAGE_EDIT || pm.type === 'MESSAGE_EDIT') ownMutation = 'edit';
+  else if (pm.type == null || pm.type === PROTOCOL_REVOKE || pm.type === 'REVOKE') ownMutation = 'revoke';
+  if (!ownMutation) return null;
+  return {
+    observerOnly: true,
+    ownMutation,
+    chatId,
+    isGroup: true,
+    fromMe: true,
+    messageId: msg.key.id,
+    targetMessageId,
+    body: ownMutation === 'edit' ? editedText(pm.editedMessage) : '',
+    timestamp: messageTimestampSeconds(msg.messageTimestamp),
+  };
+}
+
 // History messages worth archiving: skip poll-vote and protocol traffic (encrypted payloads, no text).
 export function isArchivableHistoryMessage(msg) {
   const keys = Object.keys(msg?.message || {});

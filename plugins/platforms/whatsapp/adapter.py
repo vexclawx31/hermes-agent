@@ -10,6 +10,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 from contextlib import suppress
 from functools import wraps
 from pathlib import Path
@@ -31,6 +32,8 @@ def _wenv(name: str, default: str = "") -> str:
 logger = logging.getLogger(__name__)
 
 _MAX_PENDING_OBSERVER_EVENTS = 256
+_OUTBOUND_OBSERVED_KINDS = {"send": "text", "send-media": "media", "send-poll": "poll"}
+_OUTBOUND_BODY_KEYS = {"send": "message", "send-media": "caption", "send-poll": "question"}
 _MAX_PENDING_HISTORY_EVENTS = 1000  # bridge sends at most 200 per poll, so the archiver backlog stays < 1200
 # Owner-typed inbound text is prefixed at MessageEvent construction so transcripts stay disambiguated before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
@@ -776,12 +779,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """POST to the bridge; 200 → SendResult(messageId, raw_response), else the error text."""
         try:
             async with self._bridge_req("post", path, timeout, json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return SendResult(success=True, message_id=data.get("messageId"), raw_response=data)
-                return SendResult(success=False, error=await resp.text())
+                if resp.status != 200:
+                    return SendResult(success=False, error=await resp.text())
+                data = await resp.json()
         except Exception as e:
             return SendResult(success=False, error=str(e))
+        if path in _OUTBOUND_OBSERVED_KINDS:
+            ids = data.get("messageIds") if isinstance(data.get("messageIds"), list) else [data.get("messageId")]
+            self._fire_outbound_observers(payload.get("chatId"), _OUTBOUND_OBSERVED_KINDS[path], ids,
+                                          payload.get(_OUTBOUND_BODY_KEYS[path]))
+        return SendResult(success=True, message_id=data.get("messageId"), raw_response=data)
 
     @_needs_bridge
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -812,11 +819,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     @_needs_bridge
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+        jid = to_whatsapp_jid(chat_id)
         try:
-            async with self._bridge_req("post", "edit", 15, json={"chatId": to_whatsapp_jid(chat_id), "messageId": message_id, "message": content}) as resp:
-                return SendResult(success=True, message_id=message_id) if resp.status == 200 else SendResult(success=False, error=await resp.text())
+            async with self._bridge_req("post", "edit", 15, json={"chatId": jid, "messageId": message_id, "message": content}) as resp:
+                if resp.status != 200:
+                    return SendResult(success=False, error=await resp.text())
+                data = await resp.json()
         except Exception as e:
             return SendResult(success=False, error=str(e))
+        # messageIds: spill chunks the bridge sent as new messages; the edited one is targetMessageId.
+        spill = data.get("messageIds") if isinstance(data, dict) and isinstance(data.get("messageIds"), list) else []
+        self._fire_outbound_observers(jid, "edit", spill, content, target_message_id=message_id)
+        return SendResult(success=True, message_id=message_id)
 
     @_needs_bridge
     async def _send_media_to_bridge(self, chat_id: str, file_path: str, media_type: str, caption: Optional[str] = None, file_name: Optional[str] = None) -> SendResult:
@@ -1045,15 +1059,34 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if data.get("upsertType") == "history":
             self._history_queue().put_nowait(copy.deepcopy(data))  # bounded by _messages_path's opt-in
             return
+        self._spawn_transport_observers(copy.deepcopy(data))
+
+    def _spawn_transport_observers(self, raw: dict[str, Any], **hook_kwargs: Any) -> None:
         pending = self.__dict__.setdefault("_observer_tasks", set())
         if len(pending) >= _MAX_PENDING_OBSERVER_EVENTS:
             logger.warning("[%s] whatsapp_transport_event backlog full; event not observed", self.name)
             return
         # Off the poll loop: a slow archive must never delay intake. invoke_hook bounds each callback
         # with plugins.hook_callback_timeout; plugins dedupe by messageId (ordering is not guaranteed).
-        task = asyncio.create_task(self._run_transport_observers(copy.deepcopy(data)))
+        task = asyncio.create_task(self._run_transport_observers(raw, **hook_kwargs))
         pending.add(task)
         task.add_done_callback(pending.discard)
+
+    def _fire_outbound_observers(self, chat_id: Any, kind: str, message_ids: list, body: Any, *,
+                                 target_message_id: Optional[str] = None) -> None:
+        """Observer-only ``whatsapp_transport_event`` for this account's own successful group send or edit.
+        ``direction="outbound"`` is a hook keyword, so bridge JSON can never forge one; never routed."""
+        chat_id = str(chat_id or "")
+        if not chat_id.endswith("@g.us") or not self._transport_observers_subscribed():
+            return
+        raw: dict[str, Any] = {
+            "chatId": chat_id, "isGroup": True, "fromMe": True, "kind": kind,
+            "messageIds": [str(i) for i in message_ids or () if i], "body": str(body or ""),
+            "timestamp": int(time.time() * 1000),
+        }
+        if target_message_id:
+            raw["targetMessageId"] = str(target_message_id)
+        self._spawn_transport_observers(raw, direction="outbound")
 
     def _history_queue(self) -> asyncio.Queue:
         """History events for one ordered background archiver, so a large sync never stalls live polling."""
@@ -1079,10 +1112,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         queue = self.__dict__.get("_history_events")
         return "messages?history=1" if queue is None or queue.qsize() < _MAX_PENDING_HISTORY_EVENTS else "messages"
 
-    async def _run_transport_observers(self, raw: dict[str, Any]) -> None:
+    async def _run_transport_observers(self, raw: dict[str, Any], **hook_kwargs: Any) -> None:
         try:
             from hermes_cli.plugins import invoke_hook
-            await asyncio.to_thread(invoke_hook, "whatsapp_transport_event", raw_message=raw, platform="whatsapp")
+            await asyncio.to_thread(invoke_hook, "whatsapp_transport_event", raw_message=raw, platform="whatsapp", **hook_kwargs)
         except Exception:  # health: allow BLE001 -- observer-only hook: errors never escape into intake
             logger.debug("[%s] whatsapp_transport_event dispatch error", self.name, exc_info=True)
 

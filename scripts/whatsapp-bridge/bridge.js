@@ -9,6 +9,7 @@
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo?, mentions? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
+ *   POST /delete         - Delete an own group message for everyone { chatId, messageId }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName?, mentions? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
  *   POST /typing         - Send typing indicator { chatId }
@@ -57,6 +58,8 @@ import {
   receiptStatus,
   GROUP_JID_RE,
   isArchivableHistoryMessage,
+  ownGroupMutationEvent,
+  parseDeleteRequest,
   writeJsonLine,
 } from './bridge_helpers.js';
 
@@ -165,7 +168,7 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
+      () => reject(Object.assign(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`), { code: 'SEND_TIMEOUT' })),
       timeoutMs,
     );
   });
@@ -611,6 +614,14 @@ async function startSocket() {
       let fromOwner = false;
       if (msg.key.fromMe) {
         if (isGroup || chatId.includes('status')) {
+          // Own edits/revokes in groups reach observers only, so a plugin can confirm its own mutations.
+          const mutation = isGroup ? ownGroupMutationEvent(msg) : null;
+          if (mutation) {
+            messageQueue.push(mutation);
+            if (messageQueue.length > MAX_QUEUE_SIZE) messageQueue.shift();
+            emitDebugEvent({ stage: 'queued_own_mutation', kind: mutation.ownMutation, chatId: redactWhatsAppId(chatId) });
+            continue;
+          }
           emitDebugEvent({
             stage: 'ignored',
             reason: isGroup ? 'from_me_group' : 'from_me_status',
@@ -998,6 +1009,28 @@ app.post('/edit', async (req, res) => {
   }
 });
 
+// Delete an own group message for everyone (Baileys revoke). A timeout is 504 outcome "unknown":
+// the revoke may still have been sent, so callers must not treat it as a refusal.
+app.post('/delete', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const target = parseDeleteRequest(req.body);
+  if (!target) {
+    return res.status(400).json({ error: 'group chatId and messageId (<=128) are required' });
+  }
+  const { chatId, messageId } = target;
+  try {
+    await sendWithTimeout(chatId, { delete: { remoteJid: chatId, id: messageId, fromMe: true } });
+    return res.json({ success: true, messageId });
+  } catch (err) {
+    if (err?.code === 'SEND_TIMEOUT') {
+      return res.status(504).json({ error: err.message, outcome: 'unknown' });
+    }
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
@@ -1240,7 +1273,11 @@ app.get('/health', (req, res) => {
     sendReadReceipts: SEND_READ_RECEIPTS,
     // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
     session: path.resolve(SESSION_DIR),
-    capabilities: { outboundMentions: true, groupDirectory: true, deliveryStatus: true, historyRequest: true },
+    // An object (the adapter reads capabilities.outboundMentions); one boolean per feature.
+    capabilities: {
+      outboundMentions: true, groupDirectory: true, deliveryStatus: true, historyRequest: true,
+      send: true, edit: true, sendMedia: true, sendPoll: true, delete: true, ownMutationEvents: true,
+    },
     historyQueueLength: historyQueue.size,
     historyDropped: historyQueue.dropped,
   });

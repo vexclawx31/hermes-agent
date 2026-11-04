@@ -344,6 +344,8 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         return bool(getattr(self, "_owners", None)) and self.config.extra.get("group_sessions_per_user", True) is False
 
     def _should_process_message(self, data: dict[str, Any]) -> bool:
+        if data.get("observerOnly"):
+            return False  # bridge-marked observer events (own edits/revokes): transport observers only, never a turn
         chat_id = str(data.get("chatId") or "")
         # Broadcast pseudo-chats are filtered even in self-chat mode (fromMe events).
         if self._is_broadcast_chat(chat_id):
