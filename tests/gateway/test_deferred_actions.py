@@ -75,11 +75,19 @@ def _marker(receipt, event_ref=M, blocker=B, target=TARGET, marker="a1b2c3d4e5f6
     return m
 
 
+def _release_owner_locks():
+    import os
+    for fd in deferred._OWNER_LOCKS.values():
+        os.close(fd)
+    deferred._OWNER_LOCKS.clear()
+
+
 @pytest.fixture(autouse=True)
 def _fresh_stores():
     deferred._STORES.clear()
     yield
     deferred._STORES.clear()
+    _release_owner_locks()
     clear_injected_turn()
 
 
@@ -367,6 +375,87 @@ async def test_peek_reads_without_claiming(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ttl_must_be_finite_and_positive(tmp_path):
+    home = _home(tmp_path)
+    api = _ctx(home).deferred
+    api.register("t", ["s"])
+    for ttl in (float("nan"), float("inf"), 0, -5, "60", True):
+        with patch.object(ingress, "get_trusted_ingress", return_value=_ti()), \
+                pytest.raises(deferred.DeferredError, match="ttl"):
+            await api.mint("t", {"x": 1}, "s", "summary", ttl=ttl)
+
+
+@pytest.mark.asyncio
+async def test_the_mac_covers_expiry(tmp_path):
+    import sqlite3
+    home = _home(tmp_path)
+    _api, out = await _minted(home)
+    db = sqlite3.connect(deferred.store_for(home).path)
+    db.execute("UPDATE receipts SET expires_at = expires_at + 864000")
+    db.commit()
+    db.close()
+    with pytest.raises(deferred.DeferredError, match="integrity"):
+        deferred.store_for(home).get(out["id"])
+
+
+@pytest.mark.asyncio
+async def test_only_the_store_owner_recovers(tmp_path):
+    home = _home(tmp_path)
+    api, out = await _minted(home)
+    _activate(home, out["id"])  # active in "this" gateway, which holds the owner lock
+    deferred._STORES.clear()  # another loader in the same host opens the store: the lock is still held
+    assert deferred.store_for(home).get(out["id"])["state"] == "active"  # not flipped by a non-owner
+
+
+@pytest.mark.asyncio
+async def test_freeze_makes_open_receipts_unrunnable_and_keeps_outcomes(tmp_path):
+    home = _home(tmp_path)
+    api, a = await _minted(home)
+    _api, b = await _minted(home, _ti(message="1792000000.000200"))
+    _activate(home, a["id"])
+    event = _bind_resume(a["id"])
+    api.redeem(a["id"], "slack_post_joined_message")  # claimed
+    assert deferred.store_for(home).freeze() == {"cancelled": 1, "kept": 1}
+    assert deferred.store_for(home).get(b["id"])["state"] == "cancelled"
+    assert deferred.store_for(home).get(a["id"])["state"] == "claimed"
+    with pytest.raises(deferred.DeferredError):
+        _activate(home, b["id"], marker="0000000000000009")
+    assert deferred.main(["freeze", "--home", str(home)]) == 0
+    del event
+
+
+@pytest.mark.asyncio
+async def test_a_child_task_never_sees_the_resume_after_the_turn(tmp_path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    home = _home(tmp_path)
+    api, out = await _minted(home)
+    rid = out["id"]
+    _activate(home, rid)
+    event = _Event()
+    attach_to_event(event, TurnSpec(LINE, "message", M, False, {}), (rid, lambda: deferred.release_unredeemed(home, rid)))
+    tokens = set_session_vars(platform="telegram")
+    bind_for_event(event)
+    seen, gate = [], asyncio.Event()
+
+    async def child():
+        seen.append(api.in_turn(rid))
+        await gate.wait()
+        seen.append(api.in_turn(rid))
+        try:
+            api.redeem(rid, "slack_post_joined_message")
+            seen.append("redeemed")
+        except deferred.DeferredError:
+            seen.append("refused")
+    task = asyncio.ensure_future(child())
+    await asyncio.sleep(0)
+    clear_session_vars(tokens)  # the turn ends while the child still runs
+    gate.set()
+    await task
+    assert seen == [True, False, "refused"]
+    del event
+
+
+@pytest.mark.asyncio
 async def test_only_the_requester_cancels(tmp_path):
     home = _home(tmp_path)
     api, out = await _minted(home)
@@ -403,6 +492,7 @@ async def test_restart_recovery_never_reruns_a_claim(tmp_path):
     _activate(home, b["id"], marker="0000000000000002")
     event = _bind_resume(a["id"])
     api.redeem(a["id"], "slack_post_joined_message")  # claimed, then the gateway "crashes"
+    _release_owner_locks()  # the dead process's flock goes with it
     deferred._STORES.clear()
     st = deferred.store_for(home)  # a new process: recovery runs once
     assert st.get(a["id"])["state"] == "unknown"

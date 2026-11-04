@@ -155,14 +155,16 @@ class Store:
             finally:
                 db.close()
 
-    def _mac(self, rid: str, state: str, doc: str) -> str:
-        return hmac.new(self._key, f"{rid}\x1f{state}\x1f{doc}".encode(), hashlib.sha256).hexdigest()
+    def _mac(self, rid: str, state: str, doc: str, created_at: float, expires_at: float) -> str:
+        msg = f"{rid}\x1f{state}\x1f{doc}\x1f{created_at!r}\x1f{expires_at!r}"
+        return hmac.new(self._key, msg.encode(), hashlib.sha256).hexdigest()
 
     def _row(self, db, rid: str) -> Optional[dict]:
         row = db.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
         if row is None:
             return None
-        if not hmac.compare_digest(row["mac"], self._mac(rid, row["state"], row["doc"])):
+        if not hmac.compare_digest(row["mac"], self._mac(rid, row["state"], row["doc"], row["created_at"],
+                                                         row["expires_at"])):
             raise DeferredError("receipt failed its integrity check")
         doc = json.loads(row["doc"])
         return {"id": rid, "state": row["state"], "expires_at": row["expires_at"], **doc}
@@ -171,8 +173,10 @@ class Store:
         doc = {k: v for k, v in rec.items() if k not in ("id", "state", "expires_at")}
         doc.update(changes)
         raw = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+        row = db.execute("SELECT created_at, expires_at FROM receipts WHERE id = ?", (rec["id"],)).fetchone()
         db.execute("UPDATE receipts SET state = ?, doc = ?, mac = ?, updated_at = ? WHERE id = ?",
-                   (state, raw, self._mac(rec["id"], state, raw), self.clock(), rec["id"]))
+                   (state, raw, self._mac(rec["id"], state, raw, row["created_at"], row["expires_at"]), self.clock(),
+                    rec["id"]))
         db.execute("INSERT INTO log (receipt, at, from_state, to_state, note) VALUES (?, ?, ?, ?, ?)",
                    (rec["id"], self.clock(), rec["state"], state, note))
         return {**rec, **changes, "state": state}
@@ -183,7 +187,7 @@ class Store:
         raw = json.dumps(doc, sort_keys=True, separators=(",", ":"))
         with self.tx() as db:
             db.execute("INSERT INTO receipts VALUES (?, 'pending', ?, ?, ?, ?, ?)",
-                       (rid, raw, self._mac(rid, "pending", raw), now, now + ttl, now))
+                       (rid, raw, self._mac(rid, "pending", raw, now, now + ttl), now, now + ttl, now))
             db.execute("INSERT INTO log (receipt, at, from_state, to_state, note) VALUES (?, ?, NULL, 'pending', '')",
                        (rid, now))
         return {"id": rid, "state": "pending", "expires_at": now + ttl, **doc}
@@ -234,6 +238,19 @@ class Store:
             except sqlite3.IntegrityError:
                 raise DeferredError("resume marker already used") from None
 
+    def freeze(self, note: str = "rollback") -> dict:
+        """Rollback step: every pending, noticed or active receipt becomes cancelled (never runnable again, by this
+        or any later code); claimed and unknown outcomes are kept for reconciliation. Returns the counts."""
+        out = {"cancelled": 0, "kept": 0}
+        with self.tx() as db:
+            for row in db.execute("SELECT id, state FROM receipts").fetchall():
+                if row["state"] in ("pending", "noticed", "active"):
+                    self._set(db, self._row(db, row["id"]), "cancelled", note)
+                    out["cancelled"] += 1
+                elif row["state"] in ("claimed", "unknown"):
+                    out["kept"] += 1
+        return out
+
     def recover(self) -> None:
         """At start: active -> noticed; claimed without a settle -> unknown (never runnable again)."""
         with self.tx() as db:
@@ -244,6 +261,22 @@ class Store:
 
 _STORES: dict[str, Store] = {}
 _STORES_LOCK = threading.Lock()
+_OWNER_LOCKS: dict[str, int] = {}
+
+
+def _own(st: Store) -> bool:
+    """Hold this profile's deferred-store owner lock for the life of the process (flock, non-blocking). Only its
+    holder recovers at start: another process (a CLI, a second loader) opening the same store must never flip a
+    live gateway turn's active or claimed receipt."""
+    import fcntl
+    fd = os.open(st.dir / "owner.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _OWNER_LOCKS[str(st.dir)] = fd  # kept open: released when the process exits
+    return True
 
 
 def store_for(home: Path) -> Store:
@@ -252,7 +285,8 @@ def store_for(home: Path) -> Store:
         st = _STORES.get(key)
         if st is None:
             st = _STORES[key] = Store(Path(home))
-            st.recover()
+            if _own(st):
+                st.recover()
         return st
 
 
@@ -362,11 +396,15 @@ class DeferredAPI:
         same = st.find_open(self._plugin, tool, ti.message_id, ti.chat_id, dict(action))
         if same is not None:  # the same refused call again in this turn: the same receipt, no second notice
             return {"id": same["id"], "state": same["state"]}
+        summary = " ".join(summary.split())[:500]  # one line, so the notice quotes all of it
         doc = {"plugin": self._plugin, "tool": tool, "blocked_by": blocked_by,
                "action": json.loads(json.dumps(dict(action), sort_keys=True)),
-               "summary": summary[:500], "profile": ti.profile, "platform": ti.platform, "workspace": ti.scope_id,
+               "summary": summary, "profile": ti.profile, "platform": ti.platform, "workspace": ti.scope_id,
                "requester": ti.user_id, "message_id": ti.message_id, "origin_chat": ti.chat_id,
                "origin_thread": _thread_of(ti), "blocker": None, "plugin_link": None}
+        import math
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not math.isfinite(ttl) or ttl <= 0:
+            raise DeferredError("ttl must be a positive number of seconds")
         rec = st.create(doc, min(float(ttl), MAX_TTL))
         notice_hook = getattr(ti.adapter, "deferred_notice", None)
         if notice_hook is None:
@@ -457,3 +495,22 @@ def _thread_of(ti) -> str:
     Switchboard binding captures, so the resume event's origin compares equal."""
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_THREAD_ID", "") or ""
+
+
+def main(argv=None) -> int:
+    """``python -m gateway.deferred freeze --home <profile home>``: the rollback step (prints counts only)."""
+    import sys
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 3 or argv[0] != "freeze" or argv[1] != "--home" or not argv[2].startswith("/"):
+        print("usage: python -m gateway.deferred freeze --home <absolute profile home>")
+        return 2
+    if not (Path(argv[2]) / "state" / "deferred" / "deferred.db").exists():
+        print(json.dumps({"ok": True, "cancelled": 0, "kept": 0, "note": "no deferred store"}))
+        return 0
+    print(json.dumps({"ok": True, **Store(Path(argv[2])).freeze()}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
