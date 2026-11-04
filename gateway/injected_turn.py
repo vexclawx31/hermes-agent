@@ -76,10 +76,12 @@ class InjectedTurn:
         with self._lock:
             return self._live and self._event() is not None
 
-    def revoke(self) -> None:
+    def revoke(self, release: bool = True) -> None:
+        """End this context. *release* (turn end) also runs the on-revoke hook (an activated deferred receipt
+        goes back to noticed unless claimed); a re-bind at the start of a session scope doesn't."""
         with self._lock:
             was, self._live = self._live, False
-            hook, self._on_revoke = self._on_revoke, None
+            hook, self._on_revoke = (self._on_revoke, None) if release else (None, self._on_revoke)
         if was and hook is not None:
             try:
                 hook()
@@ -110,7 +112,7 @@ def attach_to_event(event: Any, spec: TurnSpec, resume: Optional[tuple] = None) 
     setattr(event, _EVENT_ATTR, spec)
     if resume is not None:
         receipt, release = resume
-        setattr(event, _RESUME_ATTR, receipt)
+        setattr(event, _RESUME_ATTR, (receipt, release))
         # Only a live InjectedTurn of THIS event can redeem (revoked when its turn ends), so no other turn ever
         # can. When the event itself is gone, an unclaimed receipt goes back to noticed (needs a new marker);
         # gateway start recovers the same way.
@@ -124,18 +126,22 @@ def spec_of_event(event: Any) -> Optional[TurnSpec]:
 
 def bind_for_event(event: Any) -> None:
     """Bind the context for the turn handling *event* (or nothing). Always replaces what was bound."""
-    clear_injected_turn()
+    clear_injected_turn(release=False)
     spec = spec_of_event(event)
     if spec is not None:
-        receipt = getattr(event, _RESUME_ATTR, None)
-        _INJECTED_TURN.set(InjectedTurn(spec, event, resume=receipt if isinstance(receipt, str) else None))
+        resume = getattr(event, _RESUME_ATTR, None)
+        if isinstance(resume, tuple) and len(resume) == 2:
+            _INJECTED_TURN.set(InjectedTurn(spec, event, resume=resume[0], on_revoke=resume[1]))
+        else:
+            _INJECTED_TURN.set(InjectedTurn(spec, event))
 
 
-def clear_injected_turn() -> None:
-    """Revoke and unbind whatever this context holds (copies in child tasks see it revoked)."""
+def clear_injected_turn(release: bool = True) -> None:
+    """Revoke and unbind whatever this context holds (copies in child tasks see it revoked). *release*: this is
+    the turn's end (False when a new session scope is about to bind)."""
     current = _INJECTED_TURN.get()
     if current is not None:
-        current.revoke()
+        current.revoke(release=release)
     _INJECTED_TURN.set(None)
 
 

@@ -56,7 +56,7 @@ def _home(tmp_path, enabled=True, signer=PUB, extra_entries=None):
     cfg = {"plugins": {"entries": {LINE: {"allow_gateway_injection": True, "allow_injection_author": True,
                                           "allow_injected_turn_context": True}, **(extra_entries or {})}}}
     if enabled:
-        cfg["gateway"] = {"deferred": {"enabled": True, "resume_signer": signer}}
+        cfg["gateway"] = {"deferred": {"enabled": True, "resume_signer": signer, "target": TARGET}}
     (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     return home
 
@@ -65,7 +65,10 @@ def _ctx(home, plugin=PLUGIN):
     return PluginContext(PluginManifest(name=plugin, key=plugin, source="user"), PluginManager(scope_key=str(home)))
 
 
-def _marker(receipt, event_ref=M, blocker=B, target="default", marker="a1b2c3d4e5f60718", key=KEY, expires=None):
+TARGET = "tenant:aligned:default"  # this profile's exact Switchboard identity (gateway.deferred.target)
+
+
+def _marker(receipt, event_ref=M, blocker=B, target=TARGET, marker="a1b2c3d4e5f60718", key=KEY, expires=None):
     m = {"v": 1, "event_ref": event_ref, "blocker": blocker, "receipt": receipt, "target": target, "marker": marker,
          "expires_at": time.time() + 3600 if expires is None else expires}
     m["sig"] = base64.b64encode(key.sign(deferred.marker_payload(m))).decode()
@@ -193,6 +196,8 @@ async def test_a_valid_marker_activates_once(tmp_path):
     ({"event_ref": "hd-9999999999999999"}, "another Switchboard event"),
     ({"blocker": "hd-9999999999999999"}, "another blocker"),
     ({"target": "tenant:upwind:lynx"}, "another profile"),
+    ({"target": "tenant:upwind:default"}, "another profile"),  # same profile name, another tenant
+    ({"target": "asker:default"}, "another profile"),
     ({"profile": "lynx"}, "another profile"),
     ({"chat": "C0OTHER001"}, "origin"),
     ({"thread": "1792000000.000555"}, "origin"),
@@ -282,6 +287,86 @@ async def test_cancel_and_claim_race_with_exactly_one_winner(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_two_concurrent_redeems_have_one_winner(tmp_path):
+    import contextvars
+    home = _home(tmp_path)
+    api, out = await _minted(home)
+    rid = out["id"]
+    _activate(home, rid)
+    event = _bind_resume(rid)
+    results = []
+
+    def redeem():
+        try:
+            api.redeem(rid, "slack_post_joined_message")
+            results.append("claimed")
+        except deferred.DeferredError:
+            results.append("lost")
+    threads = [threading.Thread(target=contextvars.copy_context().run, args=(redeem,)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == ["claimed", "lost", "lost", "lost"]
+    del event
+
+
+@pytest.mark.asyncio
+async def test_the_turns_end_releases_an_unclaimed_receipt_but_a_new_scope_does_not(tmp_path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    home = _home(tmp_path)
+    _api, out = await _minted(home)
+    rid = out["id"]
+    _activate(home, rid)
+    event = _Event()
+    attach_to_event(event, TurnSpec(LINE, "message", M, False, {}), (rid, lambda: deferred.release_unredeemed(home, rid)))
+    tokens = set_session_vars(platform="telegram")
+    bind_for_event(event)
+    set_session_vars(platform="telegram")  # a nested scope starting: not the turn's end
+    bind_for_event(event)
+    assert deferred.store_for(home).get(rid)["state"] == "active"
+    clear_session_vars(tokens)  # the turn ends
+    assert deferred.store_for(home).get(rid)["state"] == "noticed"
+    del event
+
+
+@pytest.mark.asyncio
+async def test_the_same_refused_call_in_one_turn_reuses_its_receipt(tmp_path):
+    home = _home(tmp_path)
+    adapter = _NoticeAdapter()
+    _api, a = await _minted(home, _ti(adapter), linked=False)
+    _api, b = await _minted(home, _ti(adapter), linked=False)
+    assert a["id"] == b["id"] and len(adapter.notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_link_checks_chat_requester_and_workspace(tmp_path):
+    home = _home(tmp_path)
+    _api, out = await _minted(home, linked=False)
+    line = _ctx(home, LINE).deferred
+    other_chat = ingress.TrustedIngress("slack", "default", "1792000000.000100", "C0OTHER001", "group", "T0TEAM0001",
+                                        "U0OWNER001", _NoticeAdapter())
+    for ti in (other_chat, _ti(user="U0SOMEONE1")):
+        with patch.object(ingress, "get_trusted_ingress", return_value=ti), pytest.raises(deferred.DeferredError):
+            line.link(out["id"], B)
+
+
+@pytest.mark.asyncio
+async def test_peek_reads_without_claiming(tmp_path):
+    home = _home(tmp_path)
+    api, out = await _minted(home)
+    rid = out["id"]
+    _activate(home, rid)
+    with pytest.raises(deferred.DeferredError):
+        api.peek(rid, "slack_post_joined_message")  # not in its turn
+    event = _bind_resume(rid)
+    assert api.peek(rid, "slack_post_joined_message")["action"]["text"] == "Launch!"
+    assert api.in_turn(rid) is True
+    assert deferred.store_for(home).get(rid)["state"] == "active"
+    del event
+
+
+@pytest.mark.asyncio
 async def test_only_the_requester_cancels(tmp_path):
     home = _home(tmp_path)
     api, out = await _minted(home)
@@ -313,7 +398,7 @@ async def test_expiry_is_checked_at_claim(tmp_path):
 async def test_restart_recovery_never_reruns_a_claim(tmp_path):
     home = _home(tmp_path)
     api, a = await _minted(home)
-    _api2, b = await _minted(home)
+    _api2, b = await _minted(home, _ti(message="1792000000.000200"))  # another turn (one turn reuses one receipt)
     _activate(home, a["id"])
     _activate(home, b["id"], marker="0000000000000002")
     event = _bind_resume(a["id"])

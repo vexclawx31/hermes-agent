@@ -75,13 +75,16 @@ def settings(home: Path) -> Optional[dict]:
     block = gw.get("deferred") if isinstance(gw.get("deferred"), dict) else None
     if not block or block.get("enabled") is not True or not isinstance(block.get("resume_signer"), str):
         return None
+    target = block.get("target")  # this profile's exact Switchboard identity, e.g. "asker:alex", "tenant:aligned:apex"
+    if not isinstance(target, str) or not re.fullmatch(r"(asker:[a-z][a-z0-9-]{0,30}|tenant:[a-z]+:[a-z][a-z0-9-]{0,30})", target):
+        return None
     try:
         raw = base64.b64decode(block["resume_signer"], validate=True)
     except (ValueError, TypeError):
         return None
     if len(raw) != 32:
         return None
-    return {"signer": raw}
+    return {"signer": raw, "target": target}
 
 
 # ---- the store ----
@@ -210,6 +213,19 @@ class Store:
                 check(rec)
             return self._set(db, rec, rec["state"] if to is None else to, note, **changes)
 
+    def find_open(self, plugin: str, tool: str, message_id: str, chat: str, action: dict) -> Optional[dict]:
+        """A pending or noticed receipt for exactly this call from this native turn, if any."""
+        want = json.loads(json.dumps(action, sort_keys=True))
+        with self.tx() as db:
+            rows = db.execute("SELECT id FROM receipts WHERE state IN ('pending', 'noticed') AND created_at > ?",
+                              (self.clock() - MAX_TTL,)).fetchall()
+            for row in rows:
+                rec = self._row(db, row["id"])
+                if (rec["plugin"], rec["tool"], rec["message_id"], rec["origin_chat"], rec["action"]) == \
+                        (plugin, tool, message_id, chat, want):
+                    return rec
+        return None
+
     def spend_marker(self, marker: str, rid: str) -> None:
         """Record a resume marker; refused if it was used before (single use)."""
         with self.tx() as db:
@@ -287,8 +303,8 @@ def activate(home: Path, *, plugin_id: str, profile: str, event_ref: str, origin
     def check(rec):
         if rec.get("plugin_link") is None or rec.get("blocker") != m["blocker"]:
             raise DeferredError("resume marker names another blocker request")
-        if rec["profile"] != profile or m["target"].rsplit(":", 1)[-1] != profile:
-            raise DeferredError("resume marker names another profile")
+        if rec["profile"] != profile or m["target"] != cfg["target"]:
+            raise DeferredError("resume marker names another profile or tenant")
         if (rec["origin_chat"], rec["origin_thread"]) != (origin_chat, origin_thread):
             raise DeferredError("the event's origin is not the receipt's origin")
         if rec.get("plugin_link") != plugin_id:
@@ -343,6 +359,9 @@ class DeferredAPI:
         if not isinstance(action, Mapping) or not isinstance(summary, str) or not summary.strip():
             raise DeferredError("a deferred action needs its exact action and a summary")
         st = self._store()
+        same = st.find_open(self._plugin, tool, ti.message_id, ti.chat_id, dict(action))
+        if same is not None:  # the same refused call again in this turn: the same receipt, no second notice
+            return {"id": same["id"], "state": same["state"]}
         doc = {"plugin": self._plugin, "tool": tool, "blocked_by": blocked_by,
                "action": json.loads(json.dumps(dict(action), sort_keys=True)),
                "summary": summary[:500], "profile": ti.profile, "platform": ti.platform, "workspace": ti.scope_id,
@@ -372,7 +391,8 @@ class DeferredAPI:
             raise DeferredError("link needs a native turn and a Switchboard ref")
 
         def check(rec):
-            if rec["message_id"] != ti.message_id or rec["profile"] != ti.profile or rec["blocker"] is not None:
+            if (rec["message_id"], rec["profile"], rec["origin_chat"], rec["requester"], rec["workspace"]) != \
+                    (ti.message_id, ti.profile, ti.chat_id, ti.user_id, ti.scope_id) or rec["blocker"] is not None:
                 raise DeferredError("that deferred action wasn't recorded in this turn, or is linked already")
         self._store().transition(rid, ("pending", "noticed"), None, f"linked to {blocker}", check,
                                  blocker=blocker, plugin_link=self._plugin)
@@ -390,6 +410,23 @@ class DeferredAPI:
         rec = self._store().transition(rid, ("active",), "claimed", "claimed", check, claim=secrets.token_hex(8))
         return {"id": rid, "claim": rec["claim"], "action": rec["action"], "requester": rec["requester"],
                 "workspace": rec["workspace"], "origin_chat": rec["origin_chat"], "origin_thread": rec["origin_thread"]}
+
+    def in_turn(self, rid: str) -> bool:
+        """True while the current turn is the live turn that activated *rid* (checked at the moment of use)."""
+        from gateway.injected_turn import get_injected_turn
+        turn = get_injected_turn()
+        return turn is not None and turn.resume == rid
+
+    def peek(self, rid: str, tool: str) -> dict:
+        """Read (no claim) the action this turn activated, so the tool can pre-check current policy and leave the
+        receipt untouched when it still refuses (e.g. the setting isn't on yet)."""
+        if not self.in_turn(rid):
+            raise DeferredError("this turn doesn't resume that deferred action")
+        rec = self._store().get(rid)
+        if rec is None or rec["state"] != "active" or rec["plugin"] != self._plugin or rec["tool"] != tool:
+            raise DeferredError("that deferred action isn't active for this tool")
+        return {"id": rid, "action": rec["action"], "requester": rec["requester"], "workspace": rec["workspace"],
+                "origin_chat": rec["origin_chat"], "origin_thread": rec["origin_thread"]}
 
     def settle(self, rid: str, claim: str, outcome: str, evidence: Optional[Mapping[str, Any]] = None) -> None:
         if outcome not in ("done", "failed", "unknown"):
