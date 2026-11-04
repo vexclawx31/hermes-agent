@@ -163,7 +163,7 @@ async def test_granted_destination_runs_a_turn_with_no_human_and_the_context(mak
 ])
 async def test_without_a_matching_grant_nothing_runs(make_gateway, grants):
     gw = make_gateway(_config(grants=grants))
-    await _inject(gw, _dest(), _turn())
+    assert await _inject(gw, _dest(), _turn()) is False  # refused synchronously, so the plugin can report it
     assert gw.turns == [] and gw.adapter.sent == []
     assert gw.adapter.admit_calls == []  # the grant is checked first
 

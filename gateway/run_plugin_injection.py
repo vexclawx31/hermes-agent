@@ -72,6 +72,12 @@ class GatewayPluginInjectionMixin:
             if source is None:
                 return False
             target = f"origin={source.platform.value}/{source.chat_id}"
+            if agent_origin and (source.platform.value, str(getattr(source, "scope_id", "") or ""),
+                                 str(source.chat_id)) not in self._agent_origin_grants(plugin_home, plugin_id):
+                # Early, synchronous answer for the plugin; dispatch checks the grant again with the rest.
+                logger.warning("Plugin message injection refused: plugin=%s %s has no gateway.agent_origin grant",
+                               plugin_id, target)
+                return False
             coro = self._dispatch_plugin_origin_injection(
                 source=source, content=content, plugin_id=plugin_id, plugin_home=plugin_home, **author_kwargs,
             )
