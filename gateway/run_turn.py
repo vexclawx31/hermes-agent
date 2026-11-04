@@ -2162,10 +2162,16 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
-        prepared, _session_env_tokens = await self._hmwa_prepare_turn(
-            event, source, session_entry, session_key, _quick_key, run_generation,
-        )
+        from gateway.injected_turn import clear_injected_turn
+        try:
+            prepared, _session_env_tokens = await self._hmwa_prepare_turn(
+                event, source, session_entry, session_key, _quick_key, run_generation,
+            )
+        except BaseException:
+            clear_injected_turn()  # revocation never depends on the prepare path's own cleanup
+            raise
         if not isinstance(prepared, self._PreparedTurn):
+            clear_injected_turn()
             return prepared
         history, message_text = prepared.history, prepared.message_text
 

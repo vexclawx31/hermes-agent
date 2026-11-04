@@ -6171,6 +6171,45 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] Thread-root image recovery failed: %s", exc)
         return media_urls, media_types
 
+    async def agent_origin_admits(self, source: Any) -> Tuple[bool, str]:
+        """Admission for a plugin turn with no human (``gateway.agent_origin``; the grant is checked by the
+        runner first): the message path's channel gates, this adapter serving the workspace, and a live check
+        that the bot is a member of the channel and, for a thread, that its root exists there. Runs before the
+        turn, so a refused destination never executes a tool. DMs are refused."""
+        channel = str(getattr(source, "chat_id", "") or "")
+        team_id = str(getattr(source, "scope_id", "") or "")
+        thread_ts = str(getattr(source, "thread_id", "") or "")
+        if not re.fullmatch(r"[CG][A-Z0-9]{6,}", channel):
+            return False, "not a Slack channel (DMs and malformed ids are refused)"
+        if self._slash_channel_gated(channel):
+            return False, "the channel is ignored or outside allowed_channels"
+        clients = getattr(self, "_team_clients", None) or {}
+        if not team_id or team_id not in clients:
+            return False, "this adapter does not serve that workspace"
+        client = clients[team_id]
+        try:
+            info = _slack_response_payload(await client.conversations_info(channel=channel))
+        except Exception as exc:
+            return False, f"conversations.info failed ({type(exc).__name__})"
+        ch = info.get("channel") or {}
+        if not info.get("ok") or ch.get("is_im") or ch.get("is_mpim"):
+            return False, "channel not found, or not a channel"
+        if ch.get("is_archived") or ch.get("is_member") is not True:
+            return False, "the bot is not a member of the channel (or it is archived)"
+        if thread_ts:
+            if not re.fullmatch(r"[0-9]{10}\.[0-9]{6}", thread_ts):
+                return False, "malformed thread ts"
+            try:
+                replies = _slack_response_payload(await client.conversations_replies(
+                    channel=channel, ts=thread_ts, limit=1, inclusive=True))
+            except Exception as exc:
+                return False, f"conversations.replies failed ({type(exc).__name__})"
+            messages = replies.get("messages") or []
+            root = messages[0] if replies.get("ok") and messages else {}
+            if root.get("ts") != thread_ts or root.get("thread_ts", thread_ts) != thread_ts:
+                return False, "the thread root was not found in that channel"
+        return True, ""
+
     def _slash_channel_gated(self, channel_id: str) -> bool:
         """The message path's channel gates (_prefilter_inbound, _channel_gate_allows) for a slash
         command: ignored channels are never touched, and outside allowed_channels only a 1:1 DM is

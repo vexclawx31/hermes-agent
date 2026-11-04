@@ -34,9 +34,32 @@ def _plugin_author_or_none(ctx: Any, author: Any, role: str):
     return plugin_author
 
 
+def _turn_spec_or_none(ctx: Any, turn: Any, plugin_author: Any, origin: Any):
+    """The validated host ``TurnSpec`` for this call, or None (logged): authored origin turns only, with
+    ``allow_injected_turn_context``; an agent-origin turn's origin must name no user."""
+    from gateway.injected_turn import build_turn_spec
+    if plugin_author is None or not isinstance(origin, Mapping):
+        logger.warning("inject_message: turn needs author and origin (plugin %s)", ctx.plugin_id)
+        return None
+    try:
+        spec = build_turn_spec(ctx.plugin_id, turn)
+    except ValueError as exc:
+        logger.warning("inject_message: invalid turn for plugin %s: %s", ctx.plugin_id, exc)
+        return None
+    if spec.agent_origin and any(origin.get(k) for k in ("user_id", "user_id_alt", "user_name")):
+        logger.warning("inject_message: an agent-origin turn names no user (plugin %s)", ctx.plugin_id)
+        return None
+    if not ctx._injected_turn_context_allowed():
+        logger.warning("inject_message: injected-turn context denied for plugin %s; set "
+                       "plugins.entries.%s.allow_injected_turn_context: true (with the author switches)",
+                       ctx.plugin_id, ctx.plugin_id)
+        return None
+    return spec
+
+
 def inject_plugin_message(
     ctx: Any, content: str, role: str, *, session_key: Optional[str],
-    origin: Optional[Mapping[str, Any]], author: Any = _NO_AUTHOR,
+    origin: Optional[Mapping[str, Any]], author: Any = _NO_AUTHOR, turn: Any = None,
 ) -> bool:
     manager = ctx._manager
     msg = content if role == "user" else f"[{role}] {content}"
@@ -45,6 +68,11 @@ def inject_plugin_message(
     if author is not _NO_AUTHOR:
         plugin_author = _plugin_author_or_none(ctx, author, role)
         if plugin_author is None:
+            return False
+    turn_spec = None
+    if turn is not None:
+        turn_spec = _turn_spec_or_none(ctx, turn, plugin_author, origin)
+        if turn_spec is None:
             return False
     # An origin names a messaging chat; the local REPL is never that chat.
     if cli is not None and origin is None:
@@ -92,6 +120,8 @@ def inject_plugin_message(
         target = {"origin": dict(origin), "plugin_home": manager.home_path}
     if plugin_author is not None:
         target["author"] = plugin_author
+    if turn_spec is not None:
+        target["turn"] = turn_spec
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:

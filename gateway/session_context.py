@@ -131,7 +131,9 @@ def set_session_vars(
     declared"), which ``session_history_delivery_supported()`` treats as NOT capable — an omitted declaration
     cannot grant wake authority."""
     from gateway.ingress_identity import clear_trusted_ingress
+    from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
+    clear_injected_turn()
     global _session_context_engaged
     _session_context_engaged = True
     values = (
@@ -153,7 +155,9 @@ def clear_session_vars(tokens: list) -> None:
     capability goes back to ``_UNSET`` too — but for the opposite reason: a cleared context has
     declared nothing, and an undeclared capability FAILS CLOSED (#98619)."""
     from gateway.ingress_identity import clear_trusted_ingress
+    from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
+    clear_injected_turn()
     for var in _SESSION_VARS:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
@@ -168,7 +172,9 @@ def reset_session_vars() -> None:
     identity.  ``_SESSION_ASYNC_DELIVERY`` and ``_SESSION_HISTORY_DELIVERY`` (outside ``_VAR_MAP``)
     are reset explicitly too."""
     from gateway.ingress_identity import clear_trusted_ingress
+    from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
+    clear_injected_turn()
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)

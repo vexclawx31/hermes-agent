@@ -20,6 +20,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 logger = logging.getLogger("gateway.run")
+# Bounded wait for agent-origin admission (Slack conversations.info + replies) when a plugin injects off-loop.
+AGENT_ORIGIN_ADMIT_TIMEOUT = 20.0
 
 
 class GatewayPluginInjectionMixin:
@@ -38,7 +40,7 @@ class GatewayPluginInjectionMixin:
     def _schedule_plugin_message_injection(
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
-        author: Any = None,
+        author: Any = None, turn: Any = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
@@ -57,14 +59,32 @@ class GatewayPluginInjectionMixin:
                                "for this plugin", plugin_id)
                 return False
             author_kwargs["author"] = author
+        if turn is not None:
+            from gateway.injected_turn import TurnSpec
+            if type(turn) is not TurnSpec or turn.plugin_id != plugin_id or author is None or origin is None:
+                logger.warning("Plugin message injection refused: plugin=%s turn is not a host TurnSpec for an "
+                               "authored origin turn of this plugin", plugin_id)
+                return False
+            author_kwargs["turn"] = turn
 
         if origin is not None:
-            source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
+            agent_origin = turn is not None and turn.agent_origin
+            source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id,
+                                                agent_origin=agent_origin)
             if source is None:
                 return False
             target = f"origin={source.platform.value}/{source.chat_id}"
+            if agent_origin and (source.platform.value, str(getattr(source, "scope_id", "") or ""),
+                                 str(source.chat_id)) not in self._agent_origin_grants(plugin_home, plugin_id):
+                # Early, synchronous answer for the plugin; dispatch checks the grant again with the rest.
+                logger.warning("Plugin message injection refused: plugin=%s %s has no gateway.agent_origin grant",
+                               plugin_id, target)
+                return False
+            if agent_origin and not self._agent_origin_admitted_sync(source, plugin_id=plugin_id,
+                                                                     plugin_home=plugin_home, target=target):
+                return False
             coro = self._dispatch_plugin_origin_injection(
-                source=source, content=content, plugin_id=plugin_id, **author_kwargs,
+                source=source, content=content, plugin_id=plugin_id, plugin_home=plugin_home, **author_kwargs,
             )
         else:
             target = f"session={session_key}"
@@ -152,7 +172,8 @@ class GatewayPluginInjectionMixin:
         return admitted
 
     @staticmethod
-    def _plugin_injection_event(*, content: str, source: SessionSource, metadata: dict, author: Any = None) -> MessageEvent:
+    def _plugin_injection_event(*, content: str, source: SessionSource, metadata: dict, author: Any = None,
+                                turn: Any = None) -> MessageEvent:
         """The injected event. Never a control event (P3): it cannot run slash or gateway commands
         or answer approval, clarify, slash-confirm or update prompts. With an author, the host
         object rides the event (``_plugin_author``) and the loop-guard charge is marked spent."""
@@ -165,6 +186,11 @@ class GatewayPluginInjectionMixin:
                 raise RuntimeError("a plugin-authored event must never carry gateway control")
             event._plugin_author = author
             event._bot_loop_admitted = True
+        if turn is not None:
+            if author is None:
+                raise RuntimeError("an injected-turn context needs a host plugin author")
+            from gateway.injected_turn import attach_to_event
+            attach_to_event(event, turn)
         return event
 
     async def _dispatch_plugin_message_injection(
@@ -225,6 +251,7 @@ class GatewayPluginInjectionMixin:
 
     def _plugin_origin_source(
         self, origin: Mapping[str, Any], *, plugin_home: Optional[Path], plugin_id: str,
+        agent_origin: bool = False,
     ) -> Optional[SessionSource]:
         """The canonicalized source for a plugin-supplied *origin*, or ``None`` (logged) when the
         plugin may not start a turn there: its profile is not served, the origin is malformed or
@@ -241,6 +268,24 @@ class GatewayPluginInjectionMixin:
         if requested and requested != profile:
             return _refuse("origin names profile %r; plugins may only start sessions in their own profile (%s)",
                            requested, profile)
+        if agent_origin:
+            allowed = {"platform", "chat_id", "chat_type", "thread_id", "scope_id"}
+            if set(fields) - allowed:
+                return _refuse("an agent-origin origin takes only platform, chat_id, chat_type, thread_id and "
+                               "scope_id (no user, message or parent ids)")
+            if fields.get("chat_type", "group") != "group":
+                return _refuse("an agent-origin turn goes to a channel or thread (chat_type group)")
+            fields["chat_type"] = "group"
+            if fields.get("chat_id") == "@home":
+                home = self._agent_origin_home(profile, fields.get("platform"))
+                if home is None:
+                    return _refuse("no home channel configured for %s in profile %s", fields.get("platform"), profile)
+                if fields.get("scope_id") not in (None, "", home.scope_id):
+                    return _refuse("@home is the profile's own home; another workspace can't be named")
+                fields["chat_id"] = home.chat_id
+                fields["scope_id"] = home.scope_id
+                if home.thread_id and not fields.get("thread_id"):
+                    fields["thread_id"] = home.thread_id
         try:
             source = SessionSource.from_dict(fields)
         except (KeyError, TypeError, ValueError) as exc:
@@ -261,8 +306,98 @@ class GatewayPluginInjectionMixin:
                            where, identity.runtime_profile, profile)
         return source
 
+    def _agent_origin_home(self, profile: str, platform: Any):
+        """The served profile's configured home channel for *platform* (primary: the runner's config;
+        multiplexed: that profile's cached config), or None. Fails closed."""
+        from gateway.config import Platform
+        try:
+            plat = platform if isinstance(platform, Platform) else Platform(str(platform))
+        except ValueError:
+            return None
+        primary = getattr(self, "_primary_profile_name", None) or self._active_profile_name()
+        config = self.config if profile == primary else (getattr(self, "_profile_configs", None) or {}).get(profile)
+        try:
+            return config.get_home_channel(plat) if config is not None else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _agent_origin_grants(plugin_home: Optional[Path], plugin_id: str) -> list[tuple[str, str, str]]:
+        """``gateway.agent_origin`` from the plugin's own profile config: (platform, workspace, channel)
+        triples granted to *plugin_id*. Anything malformed grants nothing."""
+        try:
+            from hermes_cli.config import load_config_readonly
+            from hermes_cli.plugins import _plugin_home_scope
+            with _plugin_home_scope(plugin_home):
+                cfg = load_config_readonly() or {}
+        except Exception:
+            return []
+        block = ((cfg.get("gateway") or {}) if isinstance(cfg.get("gateway"), dict) else {}).get("agent_origin")
+        plugins = block.get("plugins") if isinstance(block, dict) else None
+        if not isinstance(plugins, list) or not all(type(p) is str for p in plugins) or plugin_id not in plugins:
+            return []  # anything malformed grants nothing (a string would match by substring)
+        if not isinstance(block.get("destinations"), list):
+            return []
+        grants = []
+        for d in block.get("destinations") or []:
+            if not isinstance(d, dict) or set(d) != {"platform", "workspace", "channel"}:
+                continue
+            values = (d["platform"], d["workspace"], d["channel"])
+            if all(type(v) is str and v and v.strip() == v for v in values):
+                grants.append(values)
+        return grants
+
+    def _agent_origin_admitted_sync(self, source: SessionSource, *, plugin_id: str, plugin_home: Optional[Path],
+                                    target: str) -> bool:
+        """The full admission (grant, channel policy, membership, thread root) as the plugin's synchronous
+        answer, so a refused destination is reported undeliverable, not dispatched. Off the gateway loop it
+        waits (bounded) for the check on the loop; on the loop thread it can't block, so it answers True and
+        dispatch refuses (logged). Dispatch re-checks either way."""
+        loop = getattr(self, "_gateway_loop", None)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop:
+            return True
+        future = asyncio.run_coroutine_threadsafe(
+            self._agent_origin_admitted(source, plugin_id=plugin_id, plugin_home=plugin_home, target=target), loop)
+        try:
+            return future.result(timeout=AGENT_ORIGIN_ADMIT_TIMEOUT) is True
+        except Exception:
+            future.cancel()
+            logger.warning("Plugin message injection refused: plugin=%s %s: admission check timed out or failed",
+                           plugin_id, target)
+            return False
+
+    async def _agent_origin_admitted(
+        self, source: SessionSource, *, plugin_id: str, plugin_home: Optional[Path], target: str,
+    ) -> bool:
+        """Admission for a turn with no human, replacing only the human-user check (the r15 origin checks
+        already ran): an explicit grant naming this platform, workspace and channel; then the adapter's own
+        current channel policy and a live membership check, before any turn runs."""
+        def _deny(reason: str) -> bool:
+            logger.warning("Plugin message injection denied (agent origin): plugin=%s %s: %s", plugin_id, target, reason)
+            return False
+        if any(getattr(source, k, None) for k in ("user_id", "user_id_alt", "user_name")):
+            return _deny("names a user")
+        workspace = str(getattr(source, "scope_id", "") or "")
+        want = (source.platform.value, workspace, str(source.chat_id))
+        if not workspace or want not in self._agent_origin_grants(plugin_home, plugin_id):
+            return _deny("no gateway.agent_origin grant for this platform, workspace and channel")
+        adapter = self._delivery_adapter_for(source)
+        check = getattr(adapter, "agent_origin_admits", None)
+        if adapter is None or check is None:
+            return _deny("this platform does not support agent-origin turns")
+        try:
+            ok, reason = await check(source)
+        except Exception as exc:  # fail closed
+            return _deny(f"admission check failed ({type(exc).__name__})")
+        return True if ok is True else _deny(str(reason or "refused by the adapter"))
+
     async def _dispatch_plugin_origin_injection(
         self, *, source: SessionSource, content: str, plugin_id: str, author: Any = None,
+        plugin_home: Optional[Path] = None, turn: Any = None,
     ) -> bool:
         """Start (or continue) the session at a plugin-supplied origin through the adapter's normal
         message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
@@ -273,14 +408,18 @@ class GatewayPluginInjectionMixin:
         if adapter is None:
             logger.warning("Plugin message injection: adapter for %s went away before dispatch", target)
             return False
-        if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=target):
+        if turn is not None and turn.agent_origin:
+            if not await self._agent_origin_admitted(source, plugin_id=plugin_id, plugin_home=plugin_home,
+                                                     target=target):
+                return False
+        elif not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=target):
             return False
         if author is not None and not self._admit_plugin_author_turn(source, author, plugin_id=plugin_id, target=target):
             return False
         session_key = self._session_key_for_source(source)
         async with self._plugin_injection_scope(source):
             await adapter.handle_message(self._plugin_injection_event(
-                content=content, source=source, author=author,
+                content=content, source=source, author=author, turn=turn,
                 # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
