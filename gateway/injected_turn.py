@@ -25,7 +25,7 @@ from typing import Any, Optional
 INJECTED_TURN_API_VERSION = 1
 KINDS = frozenset({"result", "message"})
 _REF = re.compile(r"hd-[0-9a-f]{16}\Z")
-_FIELDS = frozenset({"kind", "ref", "agent_origin"})
+_FIELDS = frozenset({"kind", "ref", "agent_origin", "resume"})
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class TurnSpec:
     kind: str
     ref: str
     agent_origin: bool
+    resume: Any = None  # a signed resume marker (gateway.deferred); verified by the host at dispatch, never trusted
 
 
 def build_turn_spec(plugin_id: str, turn: Any) -> TurnSpec:
@@ -49,27 +50,48 @@ def build_turn_spec(plugin_id: str, turn: Any) -> TurnSpec:
         raise ValueError("turn.ref must be a Switchboard ref (hd-<16 hex>)")
     if type(agent_origin) is not bool:
         raise ValueError("turn.agent_origin must be a bool")
-    return TurnSpec(plugin_id, kind, ref, agent_origin)
+    resume = turn.get("resume")
+    if resume is not None:
+        if not isinstance(resume, Mapping) or agent_origin:
+            raise ValueError("turn.resume is a resume marker, on a turn with a human origin")
+        import json
+        resume = json.loads(json.dumps(dict(resume)))  # a plain, frozen-by-copy value
+    return TurnSpec(plugin_id, kind, ref, agent_origin, resume)
 
 
 class InjectedTurn:
     """What a tool may read about the turn it runs in. Read-only; ``live`` only between bind and revoke."""
-    __slots__ = ("_spec", "_event", "_live", "_lock", "__weakref__")
+    __slots__ = ("_spec", "_event", "_live", "_lock", "_resume", "_on_revoke", "__weakref__")
 
-    def __init__(self, spec: TurnSpec, event: Any):
+    def __init__(self, spec: TurnSpec, event: Any, resume: Optional[str] = None, on_revoke=None):
         self._spec = spec
         self._event = weakref.ref(event)
         self._live = True
         self._lock = threading.Lock()
+        self._resume = resume
+        self._on_revoke = on_revoke
 
     @property
     def live(self) -> bool:
         with self._lock:
             return self._live and self._event() is not None
 
-    def revoke(self) -> None:
+    def revoke(self, release: bool = True) -> None:
+        """End this context. *release* (turn end) also runs the on-revoke hook (an activated deferred receipt
+        goes back to noticed unless claimed); a re-bind at the start of a session scope doesn't."""
         with self._lock:
-            self._live = False
+            was, self._live = self._live, False
+            hook, self._on_revoke = (self._on_revoke, None) if release else (None, self._on_revoke)
+        if was and hook is not None:
+            try:
+                hook()
+            except Exception:
+                pass
+
+    @property
+    def resume(self) -> Optional[str]:
+        """The deferred-action receipt this turn activated (host-verified marker), or None."""
+        return self._resume
 
     plugin_id = property(lambda self: self._spec.plugin_id)
     kind = property(lambda self: self._spec.kind)
@@ -81,9 +103,20 @@ _INJECTED_TURN: ContextVar[Optional[InjectedTurn]] = ContextVar("plugin_injected
 _EVENT_ATTR = "_hermes_injected_turn_spec"
 
 
-def attach_to_event(event: Any, spec: TurnSpec) -> None:
-    """Host only: mark the event the host built for this injection (never a copy, never a restored event)."""
+_RESUME_ATTR = "_hermes_injected_turn_resume"
+
+
+def attach_to_event(event: Any, spec: TurnSpec, resume: Optional[tuple] = None) -> None:
+    """Host only: mark the event the host built for this injection (never a copy, never a restored event).
+    *resume* is (receipt id, release callback) after the host activated a receipt for this event."""
     setattr(event, _EVENT_ATTR, spec)
+    if resume is not None:
+        receipt, release = resume
+        setattr(event, _RESUME_ATTR, (receipt, release))
+        # Only a live InjectedTurn of THIS event can redeem (revoked when its turn ends), so no other turn ever
+        # can. When the event itself is gone, an unclaimed receipt goes back to noticed (needs a new marker);
+        # gateway start recovers the same way.
+        weakref.finalize(event, release)
 
 
 def spec_of_event(event: Any) -> Optional[TurnSpec]:
@@ -93,17 +126,22 @@ def spec_of_event(event: Any) -> Optional[TurnSpec]:
 
 def bind_for_event(event: Any) -> None:
     """Bind the context for the turn handling *event* (or nothing). Always replaces what was bound."""
-    clear_injected_turn()
+    clear_injected_turn(release=False)
     spec = spec_of_event(event)
     if spec is not None:
-        _INJECTED_TURN.set(InjectedTurn(spec, event))
+        resume = getattr(event, _RESUME_ATTR, None)
+        if isinstance(resume, tuple) and len(resume) == 2:
+            _INJECTED_TURN.set(InjectedTurn(spec, event, resume=resume[0], on_revoke=resume[1]))
+        else:
+            _INJECTED_TURN.set(InjectedTurn(spec, event))
 
 
-def clear_injected_turn() -> None:
-    """Revoke and unbind whatever this context holds (copies in child tasks see it revoked)."""
+def clear_injected_turn(release: bool = True) -> None:
+    """Revoke and unbind whatever this context holds (copies in child tasks see it revoked). *release*: this is
+    the turn's end (False when a new session scope is about to bind)."""
     current = _INJECTED_TURN.get()
     if current is not None:
-        current.revoke()
+        current.revoke(release=release)
     _INJECTED_TURN.set(None)
 
 

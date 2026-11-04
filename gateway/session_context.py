@@ -133,7 +133,7 @@ def set_session_vars(
     from gateway.ingress_identity import clear_trusted_ingress
     from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
-    clear_injected_turn()
+    clear_injected_turn(release=False)  # a scope starts; the previous turn's release is clear_session_vars
     global _session_context_engaged
     _session_context_engaged = True
     values = (
@@ -157,7 +157,7 @@ def clear_session_vars(tokens: list) -> None:
     from gateway.ingress_identity import clear_trusted_ingress
     from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
-    clear_injected_turn()
+    clear_injected_turn()  # the turn's end: an unclaimed activated receipt goes back to noticed
     for var in _SESSION_VARS:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
@@ -174,7 +174,7 @@ def reset_session_vars() -> None:
     from gateway.ingress_identity import clear_trusted_ingress
     from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
-    clear_injected_turn()
+    clear_injected_turn(release=False)
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)

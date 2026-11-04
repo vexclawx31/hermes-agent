@@ -6210,6 +6210,40 @@ class SlackAdapter(BasePlatformAdapter):
                 return False, "the thread root was not found in that channel"
         return True, ""
 
+    async def deferred_notice(self, ingress: Any, text: str) -> Dict[str, Any]:
+        """Post a deferred-action notice in the native turn's chat/thread and read that exact message back
+        (gateway.deferred). Same output safeguards as posting: unfurls off, broadcast mentions refused. Returns
+        {"verified": True, "ts"} only when the read-back shows this bot's message with exactly this text in that
+        channel/thread; anything uncertain is {"verified": False} and is never resent."""
+        from gateway.session_context import get_session_env
+        if re.search(r"<!(?:channel|here|everyone|subteam\^)|(?<![\w@])@(?:channel|here|everyone)\b", text, re.I):
+            return {"verified": False, "why": "broadcast mention"}
+        team_id = str(getattr(ingress, "scope_id", "") or "")
+        channel = str(getattr(ingress, "chat_id", "") or "")
+        client = (getattr(self, "_team_clients", None) or {}).get(team_id)
+        bot_user = (getattr(self, "_team_bot_user_ids", None) or {}).get(team_id)
+        if client is None or not bot_user or not channel:
+            return {"verified": False, "why": "workspace not served"}
+        thread_ts = get_session_env("HERMES_SESSION_THREAD_ID", "") or str(getattr(ingress, "message_id", "") or "")
+        try:
+            posted = _slack_response_payload(await client.chat_postMessage(
+                channel=channel, text=text, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False))
+        except Exception:
+            return {"verified": False, "why": "post outcome unknown"}
+        ts = posted.get("ts")
+        if not posted.get("ok") or not isinstance(ts, str) or not re.fullmatch(r"[0-9]{10}\.[0-9]{6}", ts):
+            return {"verified": False, "why": "post refused"}
+        try:
+            back = _slack_response_payload(await client.conversations_replies(
+                channel=channel, ts=thread_ts, latest=ts, oldest=ts, inclusive=True, limit=10))
+        except Exception:
+            return {"verified": False, "why": "read-back failed", "ts": ts}
+        msg = next((m for m in back.get("messages") or [] if m.get("ts") == ts), None)
+        stored = str((msg or {}).get("text") or "").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        ok = (back.get("ok") and msg is not None and msg.get("user") == bot_user and stored == text
+              and (msg.get("thread_ts") or ts) == thread_ts)
+        return {"verified": True, "ts": ts} if ok else {"verified": False, "why": "read-back mismatch", "ts": ts}
+
     def _slash_channel_gated(self, channel_id: str) -> bool:
         """The message path's channel gates (_prefilter_inbound, _channel_gate_allows) for a slash
         command: ignored channels are never touched, and outside allowed_channels only a 1:1 DM is

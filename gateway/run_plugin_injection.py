@@ -173,7 +173,7 @@ class GatewayPluginInjectionMixin:
 
     @staticmethod
     def _plugin_injection_event(*, content: str, source: SessionSource, metadata: dict, author: Any = None,
-                                turn: Any = None) -> MessageEvent:
+                                turn: Any = None, resume: Any = None) -> MessageEvent:
         """The injected event. Never a control event (P3): it cannot run slash or gateway commands
         or answer approval, clarify, slash-confirm or update prompts. With an author, the host
         object rides the event (``_plugin_author``) and the loop-guard charge is marked spent."""
@@ -190,7 +190,7 @@ class GatewayPluginInjectionMixin:
             if author is None:
                 raise RuntimeError("an injected-turn context needs a host plugin author")
             from gateway.injected_turn import attach_to_event
-            attach_to_event(event, turn)
+            attach_to_event(event, turn, resume)
         return event
 
     async def _dispatch_plugin_message_injection(
@@ -395,6 +395,28 @@ class GatewayPluginInjectionMixin:
             return _deny(f"admission check failed ({type(exc).__name__})")
         return True if ok is True else _deny(str(reason or "refused by the adapter"))
 
+    def _activate_deferred(self, turn: Any, source: SessionSource, *, plugin_id: str, plugin_home: Optional[Path],
+                           target: str):
+        """(receipt id, release) when this event's signed resume marker activates a deferred action, else None.
+        A refused marker never blocks the message itself: the turn runs without a resume."""
+        if turn is None or turn.resume is None or plugin_home is None:
+            return None
+        from gateway import deferred
+        profile = self._served_profile_for_home(plugin_home)
+        try:
+            rid = deferred.activate(plugin_home, plugin_id=plugin_id, profile=profile or "", event_ref=turn.ref,
+                                    origin_chat=str(source.chat_id), origin_thread=str(source.thread_id or ""),
+                                    marker=turn.resume)
+        except deferred.DeferredError as exc:
+            logger.warning("Deferred action not activated: plugin=%s %s: %s", plugin_id, target, exc)
+            return None
+        except Exception:
+            logger.warning("Deferred action activation failed: plugin=%s %s", plugin_id, target, exc_info=True)
+            return None
+        logger.info("Deferred action %s activated for one turn: plugin=%s %s", rid, plugin_id, target)
+        home = plugin_home
+        return rid, lambda: deferred.release_unredeemed(home, rid)
+
     async def _dispatch_plugin_origin_injection(
         self, *, source: SessionSource, content: str, plugin_id: str, author: Any = None,
         plugin_home: Optional[Path] = None, turn: Any = None,
@@ -416,10 +438,11 @@ class GatewayPluginInjectionMixin:
             return False
         if author is not None and not self._admit_plugin_author_turn(source, author, plugin_id=plugin_id, target=target):
             return False
+        resume = self._activate_deferred(turn, source, plugin_id=plugin_id, plugin_home=plugin_home, target=target)
         session_key = self._session_key_for_source(source)
         async with self._plugin_injection_scope(source):
             await adapter.handle_message(self._plugin_injection_event(
-                content=content, source=source, author=author, turn=turn,
+                content=content, source=source, author=author, turn=turn, resume=resume,
                 # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
