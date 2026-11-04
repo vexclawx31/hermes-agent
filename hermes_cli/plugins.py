@@ -603,6 +603,7 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None, author: Mapping[str, Any] | None = None,
+        turn: Mapping[str, Any] | None = None,
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -620,12 +621,22 @@ class PluginContext:
         authorization stay on the origin. Messaging gateway only (CLI and TUI return ``False``),
         ``role="user"`` only, and it needs ``plugins.entries.<plugin_id>.allow_injection_author``
         on top of ``allow_gateway_injection``. Invalid values are refused, never cleaned up.
+        ``turn`` (``{"kind": "result"|"message", "ref": "hd-...", "agent_origin": bool}``, authored origin
+        turns only) asks the host to bind a read-only ``gateway.injected_turn`` context for that one turn; with
+        ``agent_origin: true`` the turn has no human (the origin carries no user) and is admitted only by the
+        profile's ``gateway.agent_origin`` grant. Needs ``plugins.entries.<plugin_id>.allow_injected_turn_context``.
         ``True`` means a host accepted the request, not that the turn completed.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
         if author is None:
+            if turn is not None:
+                logger.warning("inject_message: turn requires author (plugin %s)", self.plugin_id)
+                return False
             return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin, author=author)
+        if turn is None:
+            return inject_plugin_message(self, content, role, session_key=session_key, origin=origin, author=author)
+        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin, author=author,
+                                     turn=turn)
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns (read from the plugin's
@@ -648,6 +659,18 @@ class PluginContext:
             return False
         entry = _plugin_settings_entry(cfg, self.plugin_id) or {}
         return entry.get("allow_gateway_injection") is True and entry.get("allow_injection_author") is True
+
+    def _injected_turn_context_allowed(self) -> bool:
+        """``allow_injected_turn_context: true`` on top of the author switches, in the plugin's own profile
+        config. Fail closed on any read error."""
+        try:
+            with _plugin_home_scope(self._manager.home_path):
+                cfg = load_config_readonly() or {}
+        except Exception:
+            return False
+        entry = _plugin_settings_entry(cfg, self.plugin_id) or {}
+        return (entry.get("allow_gateway_injection") is True and entry.get("allow_injection_author") is True
+                and entry.get("allow_injected_turn_context") is True)
 
     @_serialized_replacement
     def register_cli_command(

@@ -4229,6 +4229,8 @@ class GatewayRunner(
         if context.source.platform == Platform.SLACK:
             from gateway.ingress_identity import _bind_trusted_ingress
             _bind_trusted_ingress(self, context.source, event if event is not None else getattr(context, "_ingress_event", None))
+        from gateway.injected_turn import bind_for_event
+        bind_for_event(event if event is not None else getattr(context, "_ingress_event", None))
         return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
