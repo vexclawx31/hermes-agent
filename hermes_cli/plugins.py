@@ -660,6 +660,15 @@ class PluginContext:
         entry = _plugin_settings_entry(cfg, self.plugin_id) or {}
         return entry.get("allow_gateway_injection") is True and entry.get("allow_injection_author") is True
 
+    @property
+    def deferred(self):
+        """Deferred-action receipts for this plugin (``gateway.deferred``; off unless the profile enables it)."""
+        api = getattr(self, "_deferred_api", None)
+        if api is None:
+            from gateway.deferred import DeferredAPI
+            api = self._deferred_api = DeferredAPI(self.plugin_id, self._manager.home_path)
+        return api
+
     def _injected_turn_context_allowed(self) -> bool:
         """``allow_injected_turn_context: true`` on top of the author switches, in the plugin's own profile
         config. Fail closed on any read error."""
