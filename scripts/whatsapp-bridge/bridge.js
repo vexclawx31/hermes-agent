@@ -58,8 +58,9 @@ import {
   receiptStatus,
   GROUP_JID_RE,
   isArchivableHistoryMessage,
-  ownGroupMutationEvent,
-  parseDeleteRequest,
+  BRIDGE_CAPABILITIES,
+  createDeleteHandler,
+  queueOwnGroupMutation,
   writeJsonLine,
 } from './bridge_helpers.js';
 
@@ -615,10 +616,8 @@ async function startSocket() {
       if (msg.key.fromMe) {
         if (isGroup || chatId.includes('status')) {
           // Own edits/revokes in groups reach observers only, so a plugin can confirm its own mutations.
-          const mutation = isGroup ? ownGroupMutationEvent(msg) : null;
+          const mutation = isGroup ? queueOwnGroupMutation(msg, messageQueue, MAX_QUEUE_SIZE) : null;
           if (mutation) {
-            messageQueue.push(mutation);
-            if (messageQueue.length > MAX_QUEUE_SIZE) messageQueue.shift();
             emitDebugEvent({ stage: 'queued_own_mutation', kind: mutation.ownMutation, chatId: redactWhatsAppId(chatId) });
             continue;
           }
@@ -1009,27 +1008,11 @@ app.post('/edit', async (req, res) => {
   }
 });
 
-// Delete an own group message for everyone (Baileys revoke). A timeout is 504 outcome "unknown":
-// the revoke may still have been sent, so callers must not treat it as a refusal.
-app.post('/delete', async (req, res) => {
-  if (!sock || connectionState !== 'connected') {
-    return res.status(503).json({ error: 'Not connected to WhatsApp' });
-  }
-  const target = parseDeleteRequest(req.body);
-  if (!target) {
-    return res.status(400).json({ error: 'group chatId and messageId (<=128) are required' });
-  }
-  const { chatId, messageId } = target;
-  try {
-    await sendWithTimeout(chatId, { delete: { remoteJid: chatId, id: messageId, fromMe: true } });
-    return res.json({ success: true, messageId });
-  } catch (err) {
-    if (err?.code === 'SEND_TIMEOUT') {
-      return res.status(504).json({ error: err.message, outcome: 'unknown' });
-    }
-    return res.status(500).json({ error: err.message });
-  }
-});
+// Delete an own group message for everyone (handler and status contract in bridge_helpers.js).
+app.post('/delete', createDeleteHandler({
+  isConnected: () => !!sock && connectionState === 'connected',
+  send: (chatId, payload) => sendWithTimeout(chatId, payload),
+}));
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
@@ -1273,11 +1256,7 @@ app.get('/health', (req, res) => {
     sendReadReceipts: SEND_READ_RECEIPTS,
     // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
     session: path.resolve(SESSION_DIR),
-    // An object (the adapter reads capabilities.outboundMentions); one boolean per feature.
-    capabilities: {
-      outboundMentions: true, groupDirectory: true, deliveryStatus: true, historyRequest: true,
-      send: true, edit: true, sendMedia: true, sendPoll: true, delete: true, ownMutationEvents: true,
-    },
+    capabilities: BRIDGE_CAPABILITIES,
     historyQueueLength: historyQueue.size,
     historyDropped: historyQueue.dropped,
   });

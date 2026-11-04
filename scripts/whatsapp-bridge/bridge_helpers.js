@@ -296,6 +296,36 @@ export function parseDeleteRequest(body) {
   return { chatId, messageId };
 }
 
+// GET /health capabilities: an object, because the adapter reads capabilities.outboundMentions.
+export const BRIDGE_CAPABILITIES = Object.freeze({
+  outboundMentions: true, groupDirectory: true, deliveryStatus: true, historyRequest: true,
+  send: true, edit: true, sendMedia: true, sendPoll: true, delete: true, ownMutationEvents: true,
+});
+
+// POST /delete: Baileys revoke of an own group message. A send timeout is 504 outcome "unknown": the
+// revoke may still have gone out, so callers must not treat it as a refusal.
+export function createDeleteHandler({ isConnected, send }) {
+  return async (req, res) => {
+    if (!isConnected()) {
+      return res.status(503).json({ error: 'Not connected to WhatsApp' });
+    }
+    const target = parseDeleteRequest(req.body);
+    if (!target) {
+      return res.status(400).json({ error: 'group chatId and messageId (<=128) are required' });
+    }
+    const { chatId, messageId } = target;
+    try {
+      await send(chatId, { delete: { remoteJid: chatId, id: messageId, fromMe: true } });
+      return res.json({ success: true, messageId });
+    } catch (err) {
+      if (err?.code === 'SEND_TIMEOUT') {
+        return res.status(504).json({ error: err.message, outcome: 'unknown' });
+      }
+      return res.status(500).json({ error: err?.message || String(err) });
+    }
+  };
+}
+
 // proto.Message.ProtocolMessage.Type values (REVOKE is the proto default, so a decoded message may omit it).
 const PROTOCOL_REVOKE = 0;
 const PROTOCOL_MESSAGE_EDIT = 14;
@@ -312,16 +342,19 @@ function messageTimestampSeconds(ts) {
   return Math.floor(Date.now() / 1000);
 }
 
-// The account's own edit/revoke of a group message, as an observer-only event (never a conversation
-// turn); null for anything else. Edits from another linked device arrive wrapped in editedMessage.
+// The account's own edit/revoke of its OWN group message, as an observer-only event (never a conversation
+// turn); null for anything else. The target key must be fromMe too: an admin revoking another member's
+// message is fromMe outside but not inside. Edits from another linked device arrive wrapped in
+// editedMessage; disappearing-message groups wrap everything in ephemeralMessage. No messageId on
+// purpose: observers that key rows by messageId must not archive a mutation as a new message.
 export function ownGroupMutationEvent(msg) {
   const chatId = msg?.key?.remoteJid || '';
-  if (!msg?.key?.fromMe || !msg.key.id || !GROUP_JID_RE.test(chatId)) return null;
-  const raw = msg.message || {};
-  const content = raw.editedMessage?.message || raw;
+  if (!msg?.key?.fromMe || !GROUP_JID_RE.test(chatId)) return null;
+  let content = unwrapMessageEnvelopes(msg.message || {});
+  if (content.editedMessage?.message) content = unwrapMessageEnvelopes(content.editedMessage.message);
   const pm = content.protocolMessage;
   const targetMessageId = pm?.key?.id;
-  if (!pm || typeof targetMessageId !== 'string' || !targetMessageId) return null;
+  if (!pm || pm.key?.fromMe !== true || typeof targetMessageId !== 'string' || !targetMessageId) return null;
   let ownMutation = null;
   if (pm.editedMessage || pm.type === PROTOCOL_MESSAGE_EDIT || pm.type === 'MESSAGE_EDIT') ownMutation = 'edit';
   else if (pm.type == null || pm.type === PROTOCOL_REVOKE || pm.type === 'REVOKE') ownMutation = 'revoke';
@@ -332,11 +365,19 @@ export function ownGroupMutationEvent(msg) {
     chatId,
     isGroup: true,
     fromMe: true,
-    messageId: msg.key.id,
     targetMessageId,
     body: ownMutation === 'edit' ? editedText(pm.editedMessage) : '',
     timestamp: messageTimestampSeconds(msg.messageTimestamp),
   };
+}
+
+// fromMe group upsert branch: queue an own mutation (bounded like messageQueue); null when msg is not one.
+export function queueOwnGroupMutation(msg, queue, maxSize) {
+  const event = ownGroupMutationEvent(msg);
+  if (!event) return null;
+  queue.push(event);
+  if (queue.length > maxSize) queue.shift();
+  return event;
 }
 
 // History messages worth archiving: skip poll-vote and protocol traffic (encrypted payloads, no text).

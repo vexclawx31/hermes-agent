@@ -32,6 +32,7 @@ def _wenv(name: str, default: str = "") -> str:
 logger = logging.getLogger(__name__)
 
 _MAX_PENDING_OBSERVER_EVENTS = 256
+_MAX_PENDING_OWN_EVENTS = 32  # outbound sends/edits and own mutations: separate, so they never crowd out inbound
 _OUTBOUND_OBSERVED_KINDS = {"send": "text", "send-media": "media", "send-poll": "poll"}
 _OUTBOUND_BODY_KEYS = {"send": "message", "send-media": "caption", "send-poll": "question"}
 _MAX_PENDING_HISTORY_EVENTS = 1000  # bridge sends at most 200 per poll, so the archiver backlog stays < 1200
@@ -784,10 +785,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 data = await resp.json()
         except Exception as e:
             return SendResult(success=False, error=str(e))
+        if not isinstance(data, dict):
+            data = {}
         if path in _OUTBOUND_OBSERVED_KINDS:
             ids = data.get("messageIds") if isinstance(data.get("messageIds"), list) else [data.get("messageId")]
-            self._fire_outbound_observers(payload.get("chatId"), _OUTBOUND_OBSERVED_KINDS[path], ids,
-                                          payload.get(_OUTBOUND_BODY_KEYS[path]))
+            with suppress(Exception):  # observing a send never changes its result
+                self._fire_outbound_observers(payload.get("chatId"), _OUTBOUND_OBSERVED_KINDS[path], ids,
+                                              payload.get(_OUTBOUND_BODY_KEYS[path]))
         return SendResult(success=True, message_id=data.get("messageId"), raw_response=data)
 
     @_needs_bridge
@@ -827,9 +831,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 data = await resp.json()
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        # messageIds: spill chunks the bridge sent as new messages; the edited one is targetMessageId.
-        spill = data.get("messageIds") if isinstance(data, dict) and isinstance(data.get("messageIds"), list) else []
-        self._fire_outbound_observers(jid, "edit", spill, content, target_message_id=message_id)
+        if finalize:  # streaming edits are observed once, at their final text
+            # messageIds: spill chunks the bridge sent as new messages; the edited one is targetMessageId.
+            spill = data.get("messageIds") if isinstance(data, dict) and isinstance(data.get("messageIds"), list) else []
+            with suppress(Exception):
+                self._fire_outbound_observers(jid, "edit", spill, content, target_message_id=message_id)
         return SendResult(success=True, message_id=message_id)
 
     @_needs_bridge
@@ -1056,16 +1062,34 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         if not self._transport_observers_subscribed():
             return
+        if data.get("observerOnly"):
+            # Own edit/revoke: only under event_kind, and without messageId, so an observer that reads every
+            # event as a group message (whatsapp-archive 0.2.0 keys rows by messageId) records nothing.
+            raw = {k: v for k, v in copy.deepcopy(data).items() if k != "messageId"}
+            self._spawn_own_observers(raw, event_kind="own_mutation")
+            return
         if data.get("upsertType") == "history":
             self._history_queue().put_nowait(copy.deepcopy(data))  # bounded by _messages_path's opt-in
             return
         self._spawn_transport_observers(copy.deepcopy(data))
 
-    def _spawn_transport_observers(self, raw: dict[str, Any], **hook_kwargs: Any) -> None:
+    def _spawn_own_observers(self, raw: dict[str, Any], **hook_kwargs: Any) -> None:
+        """Own-message events (outbound sends/edits, own mutations) use their own small backlog, so a burst
+        of them can never crowd inbound group messages out of the observer cap."""
+        pending = self.__dict__.setdefault("_own_observer_tasks", set())
+        if len(pending) >= _MAX_PENDING_OWN_EVENTS:
+            logger.debug("[%s] own-message observer backlog full; event not observed", self.name)
+            return
+        self._start_observer_task(pending, raw, hook_kwargs)
+
+    def _spawn_transport_observers(self, raw: dict[str, Any]) -> None:
         pending = self.__dict__.setdefault("_observer_tasks", set())
         if len(pending) >= _MAX_PENDING_OBSERVER_EVENTS:
             logger.warning("[%s] whatsapp_transport_event backlog full; event not observed", self.name)
             return
+        self._start_observer_task(pending, raw, {})
+
+    def _start_observer_task(self, pending: set, raw: dict[str, Any], hook_kwargs: dict[str, Any]) -> None:
         # Off the poll loop: a slow archive must never delay intake. invoke_hook bounds each callback
         # with plugins.hook_callback_timeout; plugins dedupe by messageId (ordering is not guaranteed).
         task = asyncio.create_task(self._run_transport_observers(raw, **hook_kwargs))
@@ -1082,11 +1106,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         raw: dict[str, Any] = {
             "chatId": chat_id, "isGroup": True, "fromMe": True, "kind": kind,
             "messageIds": [str(i) for i in message_ids or () if i], "body": str(body or ""),
-            "timestamp": int(time.time() * 1000),
+            "timestamp": int(time.time()),  # seconds, like bridge events
         }
         if target_message_id:
             raw["targetMessageId"] = str(target_message_id)
-        self._spawn_transport_observers(raw, direction="outbound")
+        self._spawn_own_observers(raw, direction="outbound")
 
     def _history_queue(self) -> asyncio.Queue:
         """History events for one ordered background archiver, so a large sync never stalls live polling."""
