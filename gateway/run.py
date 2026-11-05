@@ -1677,10 +1677,17 @@ def _cron_tick_profile_homes(config: object) -> list[tuple[str, Path]]:
     <name>`` gateway's own profile may sit outside ``profiles/`` (custom HERMES_HOME). One host
     process ticks all of them regardless of ``gateway.multiplex_profiles``. Adapter startup
     already skips ``active``."""
-    from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+    from hermes_cli.profiles import get_active_profile_name, get_profile_dir, profile_is_standalone
 
-    homes = _multiplex_profile_homes(config)
     active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
+    launch_home = get_process_hermes_home()  # the launch home, never a per-turn override
+    if profile_is_standalone(launch_home):
+        # A standalone gateway serves only its own home, so its ticker visits only that home: the
+        # launch HERMES_HOME itself (default root, a named profile or a custom path alike). Visiting
+        # default + every member profile made it race their own gateways for cron at a cold boot,
+        # before _cron_profile_gate could see their PIDs.
+        return [(active, Path(launch_home))]
+    homes = _multiplex_profile_homes(config)
     if any(name == active for name, _home in homes):
         return homes
     try:
@@ -5379,7 +5386,7 @@ def _claim_host_gateway_role(force: bool = False) -> None:
                        hr.describe(owner) if owner else "another process")
         return
     from gateway.host_attach import (
-        ATTACH_CHANNEL_WAIT_S, START, host_gateway, launched_by_other_tenant, standalone_attach_decision,
+        START, host_gateway, launched_by_other_tenant, standalone_attach_decision,
     )
     from hermes_cli.profiles import profile_is_standalone
     if owner is not None and launched_by_other_tenant(owner.home, get_hermes_home()):
@@ -5390,12 +5397,12 @@ def _claim_host_gateway_role(force: bool = False) -> None:
             hr.describe(owner))
         return
     if profile_is_standalone(get_hermes_home()):
-        # Recheck after losing the atomic lock: the pre-lock served set may be stale.
-        live_owner = host_gateway(wait_for_channel=ATTACH_CHANNEL_WAIT_S)
-        # The rendezvous record proves lock ownership, but the owner's control channel may
-        # still be unavailable. Standalone discovery also checks each profile's liveness
-        # channel, so it can prove that this profile is unserved even when the host probe
-        # cannot construct a HostGateway yet.
+        # Recheck after losing the atomic lock, WITHOUT waiting for the owner's socket: at a cold
+        # boot the owner is usually another standalone profile still starting up, and only a peer
+        # that has positively answered "I multiplex and serve you" may stop us (see
+        # ``standalone_attach_decision``). Losing the lock is expected for every standalone
+        # profile but one under an OS user.
+        live_owner = host_gateway()
         decision = standalone_attach_decision(get_hermes_home(), live_owner)
         if decision is not None:
             if decision.outcome == START:
@@ -5436,6 +5443,8 @@ def _owner_is_standalone() -> bool:
         owner = host_gateway()
         if owner is None or owner.pid == os.getpid():
             return False
+        if owner.standalone:
+            return True  # its live record or identify already said multiplex:false; no rescan needed
         answered = request_serve_profile(profile_name_for_home(get_hermes_home()), owner=owner)
         return bool(answered is not None and answered.standalone)
     except Exception:

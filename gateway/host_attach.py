@@ -184,6 +184,15 @@ def _identity_matches(identity, record, home: Path) -> bool:
         return str(reported) == str(home)
 
 
+def _same_home(a: Path | str, b: Path | str) -> bool:
+    try:
+        from gateway.status import _same_hermes_home
+
+        return bool(_same_hermes_home(Path(a), Path(b)))
+    except Exception:
+        return str(a) == str(b)
+
+
 #: A CLI invocation asks this question once per profile (``gateway status`` across N profiles,
 #: doctor, the lifecycle guards); a gateway PROCESS asks it for the life of the process, so the
 #: memo is time-bounded rather than permanent. Writes invalidate it eagerly.
@@ -208,16 +217,21 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
     if not hr.liveness_is_proven(record):
         return None
     home = record_home(record)
+    # A live record that says ``multiplex: false`` is a standalone owner: it can never serve another
+    # profile, so nobody needs to wait for its socket to know that. It still says nothing about WHO
+    # it serves, so the served set stays unknown until identify answers.
+    recorded_standalone = getattr(record, "multiplex", None) is False
     deadline = time.monotonic() + max(0.0, wait_for_channel)
     while True:
         identity = _identify(home)
         if _identity_matches(identity, record, home):
-            return HostGateway(record.pid, home, _served_from_identity(identity))
-        if time.monotonic() >= deadline:
+            return HostGateway(record.pid, home, _served_from_identity(identity),
+                               standalone=recorded_standalone or identity.get("multiplex") is False)
+        if recorded_standalone or time.monotonic() >= deadline:
             break
         time.sleep(_CHANNEL_POLL_S)
     # An owner exists and has not answered: the served set is UNKNOWN, never the record's word.
-    return HostGateway(record.pid, home, (), served_known=False)
+    return HostGateway(record.pid, home, (), served_known=False, standalone=recorded_standalone)
 
 
 def host_gateway(*, wait_for_channel: float = 0.0) -> Optional[HostGateway]:
@@ -344,9 +358,17 @@ def _coexisting_gateways(owner: Optional[HostGateway]):
 
 
 def standalone_attach_decision(our_home: Path, owner: Optional[HostGateway]) -> Optional[HostAttachDecision]:
-    """An opt-out permits coexistence only after every live gateway confirms we are unserved.
+    """A standalone profile starts unless a live MULTIPLEXER has positively said it serves us.
 
-    Shared by the initial attach check and the lock-losing race check.
+    ``None`` for a profile that is not standalone. Shared by ``decide()`` and both host-lock checks.
+
+    Only positive evidence refuses: a peer that answered ``identify`` (PID, start time and home
+    verified), multiplexes, and lists this profile — the "standalone configured, old host not
+    rescanned yet" window (transient 75; the host rescans within 30s). A peer whose served set is
+    UNKNOWN never refuses and is never waited for: at a cold boot every unit starts at once, each
+    finds the others' PID files before their sockets answer, and refusing on "unknown" made every
+    standalone gateway under one OS user exit 75 in lockstep, forever. A standalone peer serves only
+    its own home, and two instances of one home are the per-home PID lock's job, not this one's.
     """
     from hermes_cli.profiles import profile_is_standalone
 
@@ -354,11 +376,9 @@ def standalone_attach_decision(our_home: Path, owner: Optional[HostGateway]) -> 
         return None
     profile = profile_name_for_home(our_home)
     for peer in _coexisting_gateways(owner):
-        if not peer.served_known:
-            return HostAttachDecision(REFUSE, _unknown_served_message(peer, profile), peer, transient=True)
-        if peer.serves(profile):
+        if peer.served_known and not peer.standalone and peer.serves(profile):
             return HostAttachDecision(REFUSE, standalone_rescan_message(profile), peer, transient=True)
-    logger.info("Profile '%s' is standalone by config; starting beside the host multiplexer", profile)
+    logger.info("Profile '%s' is standalone by config; starting beside any other gateway", profile)
     return HostAttachDecision(START, "", owner)
 
 
@@ -375,16 +395,24 @@ def decide(our_home: Path, *, replace: bool = False) -> HostAttachDecision:
         return HostAttachDecision(START, "")
     if gateway is None or gateway.pid == os.getpid() or launched_by_other_tenant(gateway.home, our_home):
         return standalone_attach_decision(our_home, None) or HostAttachDecision(START, "")
+    # A standalone profile never attaches, rescans, waits or replaces the HOST owner (its own
+    # previous instance is replaced through its per-home PID, not here): decided before any of it.
+    standalone = standalone_attach_decision(our_home, gateway)
+    if standalone is not None:
+        return standalone
+    if gateway.standalone and not _same_home(gateway.home, our_home):
+        # The owner published (or answered) multiplex:false: another profile's standalone gateway.
+        # It can never serve us, so asking it to rescan, waiting for its socket, or --replace-ing it
+        # (refused for another profile's owner) would only delay or strand this start.
+        logger.info("The host lock is held by another profile's standalone gateway (%s); "
+                    "starting profile '%s' beside it.", gateway.describe(), profile)
+        return HostAttachDecision(START, "", gateway)
     if replace and (gateway.serves(profile) or not gateway.served_known):
         # An owner known not to serve us is another profile's gateway: replacing it is always refused
         # (_replace_target_belongs_to_other_profile fails closed) and the gateway exits, so on a
         # one-process-per-profile fleet, whose generated units all carry --replace, every unit but
         # the lock holder respawn-storms. Such an owner takes the non-replace path below instead.
         return HostAttachDecision(REPLACE_HOST, "", gateway)
-    if gateway.served_known:
-        standalone = standalone_attach_decision(our_home, gateway)
-        if standalone is not None:
-            return standalone
     if gateway.serves(profile):
         return HostAttachDecision(ATTACH, attach_message(gateway, profile), gateway, transient=True)
     if not gateway.served_known:
@@ -394,9 +422,8 @@ def decide(our_home: Path, *, replace: bool = False) -> HostAttachDecision:
         if waited is None:
             return HostAttachDecision(START, "")
         gateway = waited
-        standalone = standalone_attach_decision(our_home, gateway)
-        if standalone is not None:
-            return standalone
+        if gateway.standalone and not _same_home(gateway.home, our_home):
+            return HostAttachDecision(START, "", gateway)
         if gateway.serves(profile):
             return HostAttachDecision(ATTACH, attach_message(gateway, profile), gateway, transient=True)
     try:

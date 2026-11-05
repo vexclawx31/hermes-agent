@@ -109,6 +109,12 @@ class HostRecord:
     #: Absent on older records; added WITHOUT a protocol bump, because a bump would make every
     #: live owner's record read as stale and a second gateway would start.
     boot_epoch: str = ""
+    #: ``False`` when the owner is a ``gateway.standalone`` profile that cannot multiplex, so a
+    #: second profile can start beside it without waiting for its control socket (a cold boot
+    #: starts every unit at once). ``None`` (absent, null, non-boolean, or anything but a literal
+    #: ``false``) is UNKNOWN, never "multiplexes". Says nothing about who is served. Added WITHOUT a
+    #: protocol bump, for the same reason as ``home``.
+    multiplex: Optional[bool] = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -124,6 +130,7 @@ class HostRecord:
             "tokenFingerprint": self.token_fingerprint,
             "profiles": list(self.profiles),
             "updatedAt": self.updated_at,
+            "multiplex": self.multiplex,
         }
 
     @classmethod
@@ -156,6 +163,7 @@ class HostRecord:
             profiles=tuple(str(p) for p in profiles if isinstance(p, str)) if isinstance(profiles, list) else (),
             updated_at=str(payload.get("updatedAt") or ""),
             home=str(payload.get("home") or ""),
+            multiplex=False if payload.get("multiplex") is False else None,
         )
 
 
@@ -562,7 +570,8 @@ def publish_record(
 
     ``token`` (serve) is persisted 0600 next to the record and only its fingerprint is published.
     ``home`` is the launch HERMES_HOME — the key an attaching client needs to reach this owner's
-    control socket.
+    control socket. A gateway record also carries :func:`own_multiplex_flag` on EVERY write
+    (claim, settled refresh, rescan), so a standalone owner's ``multiplex: false`` never drops out.
     """
     role = _validated_role(role)
     from gateway.status import get_process_start_time
@@ -580,6 +589,7 @@ def publish_record(
         profiles=tuple(str(p) for p in profiles),
         updated_at=datetime.now(UTC).isoformat(),
         home=str(home or ""),
+        multiplex=own_multiplex_flag(home) if role == ROLE_GATEWAY else None,
     )
     try:
         ensure_host_state_dir()
@@ -593,6 +603,26 @@ def publish_record(
         return None
     _invalidate_attach_cache()
     return record
+
+
+def own_multiplex_flag(home: str = "") -> Optional[bool]:
+    """``False`` when this gateway's launch home is ``gateway.standalone`` by config, else ``None``.
+
+    Config is the only thing known at claim time, and a standalone profile never multiplexes
+    (``standalone_launcher_decision``), so ``False`` is safe to publish before the runner settles.
+    Anything else stays UNKNOWN until a live ``identify`` answers.
+    """
+    try:
+        from hermes_cli.profiles import profile_is_standalone
+
+        if not home:
+            from hermes_constants import get_hermes_home
+
+            home = str(get_hermes_home())
+        return False if profile_is_standalone(Path(home)) else None
+    except Exception:
+        logger.debug("standalone flag for the host record unavailable", exc_info=True)
+        return None
 
 
 def _invalidate_attach_cache() -> None:
