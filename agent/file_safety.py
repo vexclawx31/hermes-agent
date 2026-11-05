@@ -8,6 +8,7 @@ clear denial for models that respect tool errors plus a visible audit trail.
 from __future__ import annotations
 
 import os
+import unicodedata
 from pathlib import Path
 from contextlib import suppress
 from typing import Optional
@@ -291,17 +292,72 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
     ):
         return "credential"
 
+    protected = []
     for base in _hermes_dirs():
         for sub in _HERMES_PROTECTED_SUBPATHS:
             with suppress(Exception):
-                if _is_under(resolved, os.path.realpath(os.path.join(str(base), sub))):
+                protected.append(blocked := os.path.realpath(os.path.join(str(base), sub)))
+                if _is_under(resolved, blocked):
                     return "credential"
+
+    denied_dirs = {p.rstrip(os.sep) for home in homes for p in build_write_denied_prefixes(home)}
+    if _write_identity_denied(resolved, {p for home in homes for p in build_write_denied_paths(home)},
+                              denied_dirs | set(protected)):
+        return "credential"
 
     safe_roots = get_safe_write_roots()
     if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):
         return "safe_root"
 
     return None
+
+
+def _fold(name: str) -> str:
+    """One spelling per name on a case- and normalization-insensitive file system (APFS, NTFS)."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _write_identity_denied(resolved: str, denied_files: set[str], denied_dirs: set[str]) -> bool:
+    """The write deny-list matched by identity instead of spelling (see :func:`_identity_block_reason`).
+
+    The string checks miss ``~/.SSH/id_rsa`` or ``.ENV`` on case-insensitive file systems, and a
+    hardlink to a store under another name. An existing target is denied when it IS a denied file, or
+    it or an ancestor IS a denied directory. A target that doesn't exist yet is denied when its nearest
+    existing ancestor is (or is inside) a denied directory, or when that ancestor IS an ancestor of a
+    denied path and the rest of the target spells the rest of that path (compared case- and
+    normalization-folded). The fold also refuses e.g. a new ``.ENV`` beside ``.env`` on a case-sensitive
+    file system: fail-closed, the name only differs by case from a store."""
+    keys: dict[str, Optional[tuple[int, int]]] = {}
+
+    def key(p: Path) -> Optional[tuple[int, int]]:
+        s = str(p)
+        if s not in keys:
+            keys[s] = _file_key(p)
+        return keys[s]
+
+    existing, tail = Path(resolved), []
+    while key(existing) is None:
+        if existing.parent == existing:
+            return False
+        tail.insert(0, _fold(existing.name))
+        existing = existing.parent
+    found = key(existing)
+    if not tail and any(key(Path(f)) == found for f in denied_files):
+        return True
+    chain = {key(a) for a in (existing, *existing.parents)} - {None}
+    if any(key(Path(d)) in chain for d in denied_dirs):
+        return True
+    if not tail:
+        return False
+    for denied, is_dir in [(f, False) for f in denied_files] + [(d, True) for d in denied_dirs]:
+        dp = Path(denied)
+        for anc in dp.parents:
+            if key(anc) == found:
+                rest = [_fold(part) for part in dp.relative_to(anc).parts]
+                if tail == rest or (is_dir and tail[:len(rest)] == rest):
+                    return True
+                break
+    return False
 
 
 def is_write_denied(path: str) -> bool:
