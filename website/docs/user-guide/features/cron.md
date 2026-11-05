@@ -699,6 +699,15 @@ in `hermes cron list`:
 ⚠ Delivery UNVERIFIED: adapter acked slack:C0123456 without message_id/raw_response
 ```
 
+Each run also records the provider message IDs it put on screen, per target, as
+`last_delivery_message_ids` (for example
+`{"whatsapp:120363000000000000@g.us": ["3EB0..."]}`), from the live and the
+standalone lane alike, including the chunks of a send that failed partway. The
+`cronjob` tool shows it, so an agent can find and read back what its job posted.
+On WhatsApp, a standalone send to a group also fires the adapter's outbound
+`whatsapp_transport_event` (`direction="outbound"`), so an archive plugin keeps
+the agent's own cron posts as it keeps its live replies.
+
 and in `hermes cron doctor` as `last delivery unverified (...)`. The marker is
 cleared by the next run that delivers with evidence. An empty payload (no text
 and no media) is never handed to an adapter; it fails closed and is reported in

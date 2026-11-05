@@ -623,11 +623,28 @@ async def _send_chunks(chunks, send_one):
     # text-only sends arrived with a red padlock because they took the raw-HTTP standalone path). The
     # adapter reuses the live gateway's E2EE session when available (#46310) and falls back to an
     # encryption-aware ephemeral adapter for standalone/cron. ---
+    sent_ids: list[str] = []
     for i, chunk in enumerate(chunks):
         result = await send_one(chunk, i == len(chunks) - 1)
+        sent_ids.extend(result_message_ids(result))
         if isinstance(result, dict) and result.get("error"):
             break
+    # Every chunk's message IDs, not just the last one's: earlier chunks are on screen too, also after a failure.
+    # Only when the last result doesn't already name them all, so a single-chunk result keeps its shape.
+    sent_ids = list(dict.fromkeys(sent_ids))
+    if isinstance(result, dict) and sent_ids and result_message_ids(result) != sent_ids:
+        result = {**result, "message_ids": sent_ids}
     return result
+
+
+def result_message_ids(result) -> list[str]:
+    """The provider message IDs a send result names: ``message_ids`` if present, else ``message_id``."""
+    if not isinstance(result, dict):
+        return []
+    ids = result.get("message_ids")
+    if not isinstance(ids, list):
+        ids = [result.get("message_id")]
+    return [str(i) for i in ids if i]
 
 
 def _platform_max_length(platform):

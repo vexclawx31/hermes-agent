@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from cron.scheduler_delivery_outbound import _open_continuable_cron_thread, authorize_cron_send
+from cron.scheduler_delivery_receipts import _note_delivered_message_ids, _record_delivery_verification
 
 
 # Log-record parity with the origin module.
@@ -1234,27 +1235,6 @@ def _cron_delivery_notify_enabled(cfg: Optional[dict]) -> bool:
         return True
 
 
-def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
-    """Persist ``last_delivery_unverified``: list of ``platform:chat_id[:thread_id]`` targets acked with no
-    evidence, or None, alongside queued Bot Chat receipts. Never raises (bookkeeping must not fail a
-    delivery)."""
-    new_value = list(unverified_targets) or None
-    queued = {target: receipt for target, receipt in
-              job.get("_bot_chat_delivery_receipts", {}).items()
-              if receipt["status"] in ("queued", "claimed")} or None
-    values = {key: value for key, value in {
-        "last_delivery_unverified": new_value, "last_delivery_queued": queued,
-    }.items() if (job.get(key) or None) != value}
-    if not values:
-        return
-    job.update(values)
-    try:
-        from cron.jobs import update_job
-        update_job(job["id"], values)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Job '%s': could not record delivery verification: %s", job.get("id"), exc)
-
-
 @dataclass
 class _TargetDelivery:
     """Per-target delivery state shared by the live-adapter and standalone lanes."""
@@ -1655,6 +1635,7 @@ def _deliver_via_live_adapter(
                 route_thread_id if route_thread_id is not None else "-",
                 delivered_message_id if delivered_message_id is not None else "-")
             delivered = True
+            _note_delivered_message_ids(job, t.where, [delivered_message_id])
             _seed_live_delivery_sessions(t, delivered_message_id)
     except Exception as e:
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
@@ -1772,6 +1753,10 @@ def _deliver_standalone(
         delivery_errors.extend(target_errors)
         return
     result, err = _standalone_send(t, content, media_files)
+    from tools.send_message_tool import result_message_ids
+    # Also on a failed result: messages a partial send already put on screen stay on record.
+    sent_ids = result_message_ids(result)
+    _note_delivered_message_ids(job, t.where, sent_ids)
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
         err = f"delivery error: {result['error']} (target {t.where})"
@@ -1789,7 +1774,8 @@ def _deliver_standalone(
         msg = f"delivery warning: {_w} (target {t.where})"
         logger.error("Job '%s': %s", job["id"], msg)
         delivery_errors.append(msg)
-    logger.info("Job '%s': delivered to %s:%s", job["id"], t.platform_name, t.chat_id)
+    logger.info("Job '%s': delivered to %s:%s via standalone message_id=%s", job["id"], t.platform_name, t.chat_id,
+                ",".join(sent_ids) or "-")
     # Thread seeding only happens on the live lane, so no thread_seeded gate applies here.
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
@@ -1936,6 +1922,7 @@ def _deliver_result(
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
+    job.pop("_delivery_message_ids", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
