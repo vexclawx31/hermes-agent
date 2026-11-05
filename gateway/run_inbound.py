@@ -34,9 +34,8 @@ from gateway.run_inbound_unauthorized import (
 )
 from gateway.session import (
     SessionSource, build_session_context, is_shared_multi_user_session,
-    neutralize_untrusted_inline_text,
 )
-from gateway.speaker_tag import escape_speaker_tag_lines, neutralize_speaker_name
+from gateway.speaker_tag import escape_speaker_tag_lines, safe_speaker_name
 from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1460,7 +1459,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
             # Every shared session: tag chars (and look-alikes) in the name can't forge a tag; body lines
             # that start like a tag are escaped (gateway/speaker_tag.py).
-            _safe_user_name = neutralize_speaker_name(neutralize_untrusted_inline_text(source.user_name or "unknown"))
+            _safe_user_name = safe_speaker_name(source.user_name or "unknown")
             _mixed = getattr(event, "_mixed_senders", False)
             if _mixed:  # several people's messages merged into one turn: no single name, role or id
                 _safe_user_name = "several senders"
@@ -1632,7 +1631,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # it's disambiguation (*which* prior message), not deduplication.
             # Adapters resolve the original message (or the user's native partial quote).
             # A preview here silently loses later list items and code; keep that context intact.
-            reply_text = event.reply_to_text
+            # The quoted message is another speaker's text: its lines must not pose as a speaker tag.
+            reply_text = escape_speaker_tag_lines(event.reply_to_text)
             _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
             message_text = f'[Replying to{_who}: "{reply_text}"]\n\n{message_text}'
 

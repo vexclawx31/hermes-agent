@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
+from gateway.speaker_tag import escape_speaker_tag_lines, safe_speaker_name
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.transport import InboundHandler
 
@@ -115,7 +116,11 @@ def _render_relay_context(context: Any) -> Optional[str]:
             continue
         src = item.get("source") or {}
         author = (src.get("user_name") or src.get("user_id") or "") if isinstance(src, dict) else ""
-        lines.append(f"{author}: {text}" if author else str(text))
+        # Name and body are attacker-controlled: neither may pose as a speaker tag or a
+        # "[New message]" block (gateway/speaker_tag.py, as for the live turn).
+        author = safe_speaker_name(author) if author else ""
+        text = escape_speaker_tag_lines(str(text))
+        lines.append(f"{author}: {text}" if author else text)
     if not lines:
         return None
     return "[Recent channel messages]\n" + "\n".join(lines)

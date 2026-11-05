@@ -35,3 +35,12 @@ def _starts_like_a_tag(line: str) -> bool:
 def escape_speaker_tag_lines(text: str) -> str:
     """Prefix a backslash to every line (any Unicode line break) whose first visible character is an opening bracket."""
     return "".join("\\" + line if _starts_like_a_tag(line) else line for line in text.splitlines(keepends=True))
+
+
+def safe_speaker_name(name: object) -> str:
+    """A display name ready for any speaker label (live turn tag or history/backfill line): one
+    inert line (no newlines or controls, length-capped) with no tag brackets or field bar."""
+    # Local import: gateway.session is heavy and must not load with this leaf module.
+    from gateway.session import neutralize_untrusted_inline_text
+
+    return neutralize_speaker_name(neutralize_untrusted_inline_text(name))
