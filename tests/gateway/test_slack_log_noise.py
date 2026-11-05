@@ -339,6 +339,54 @@ class TestConnectNetworkFailureLogging:
         assert records[0].getMessage().startswith("[Slack] Connection failed: ")
         assert records[0].exc_info is not None
 
+    def test_aiohttp_dns_error_is_transient(self):
+        """aiohttp 3.14 raises ClientConnectorDNSError for getaddrinfo failures."""
+        import socket
+        from types import SimpleNamespace
+
+        import aiohttp
+
+        conn_key = SimpleNamespace(host="slack.com", port=443, ssl=True)
+        exc = aiohttp.ClientConnectorDNSError(conn_key, socket.gaierror(8, "nodename nor servname provided"))
+        assert _slack_mod._is_transient_connect_error(exc) is True
+
+    def test_network_error_as_explicit_cause_is_transient(self):
+        class WrappedTransportError(Exception):
+            pass
+
+        try:
+            try:
+                raise _dns_failure()
+            except Exception as inner:
+                raise WrappedTransportError("wrapped") from inner
+        except WrappedTransportError as exc:
+            assert _slack_mod._is_transient_connect_error(exc) is True
+
+    def test_auth_error_raised_while_handling_network_error_is_not_transient(self):
+        class SlackApiError(Exception):
+            """Stand-in for slack_sdk's error on ``invalid_auth``."""
+
+        try:
+            try:
+                raise _dns_failure()
+            except Exception:
+                raise SlackApiError("The request to the Slack API failed. invalid_auth")  # implicit __context__
+        except SlackApiError as exc:
+            assert isinstance(exc.__context__, Exception)
+            assert _slack_mod._is_transient_connect_error(exc) is False
+
+    def test_bug_raised_while_handling_server_disconnect_is_not_transient(self):
+        import aiohttp
+
+        try:
+            try:
+                raise aiohttp.ServerDisconnectedError()
+            except aiohttp.ServerDisconnectedError:
+                raise ValueError("bad payload")  # implicit __context__
+        except ValueError as exc:
+            assert isinstance(exc.__context__, aiohttp.ServerDisconnectedError)
+            assert _slack_mod._is_transient_connect_error(exc) is False
+
     def test_tls_failure_is_not_transient(self):
         import ssl
 

@@ -1092,10 +1092,21 @@ def _is_transient_transport_error(e: BaseException) -> bool:
 
 def _is_transient_connect_error(e: BaseException) -> bool:
     """Transient network failure during connect (DNS, refused, timeout), never an auth/API error.
-    Reuses the gateway's cause-chain classifier plus this adapter's aiohttp transport check."""
-    from gateway.run import _is_transient_network_error
 
-    return _is_transient_network_error(e) or _is_transient_transport_error(e)
+    Walks only the explicit ``__cause__`` chain (``raise X from net_err``). ``__context__`` is not
+    followed: an ``invalid_auth`` raised while a ``ClientConnectorError`` was being handled is an auth
+    failure, not a network blip. Each link is checked with the gateway's class-name classifier
+    (applied to that link alone) plus this adapter's aiohttp transport check."""
+    from gateway.run import _TRANSIENT_NETWORK_ERROR_CLASS_NAMES
+
+    seen: set[int] = set()
+    cur: Optional[BaseException] = e
+    while cur is not None and id(cur) not in seen and len(seen) < 12:
+        seen.add(id(cur))
+        if type(cur).__name__ in _TRANSIENT_NETWORK_ERROR_CLASS_NAMES or _is_transient_transport_error(cur):
+            return True
+        cur = cur.__cause__
+    return False
 
 
 def _extra_or_env_flag_getter(key: str, env_var: str, *, strip: bool = False) -> Callable[..., bool]:

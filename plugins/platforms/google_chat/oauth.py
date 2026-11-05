@@ -250,7 +250,12 @@ def install_deps() -> bool:
     print("Installing Google Chat dependencies...")
     try:
         import pm
-        pm.sync_venv(_DEPENDENCY_EXTRAS, explicit=True)
+        from pm import extras as pm_extras
+        # Same test as pm's feature policy: a gated-off extra (google-chat on win32-arm64) would make
+        # sync_venv refuse the whole request, so only the extras this platform supports are synced.
+        supported = [extra for extra in _DEPENDENCY_EXTRAS
+                     if pm_extras.extra_supported(extra, importable=lambda _: False)]
+        pm.sync_venv(supported, explicit=True)
         remaining = _missing_required_packages()
         if remaining:
             raise RuntimeError("dependencies remain stale after install: " + " ".join(remaining))

@@ -95,10 +95,25 @@ def test_required_packages_match_pyproject_pins_and_markers():
         for spec in extras[extra]:
             requirement = Requirement(spec)
             declared[requirement.name] = requirement
-    for spec in oauth._REQUIRED_PACKAGES:
-        probe = Requirement(spec)
-        assert probe.name in declared, spec
-        assert str(probe) == str(declared[probe.name]), spec
+    probes = {Requirement(spec).name: Requirement(spec) for spec in oauth._REQUIRED_PACKAGES}
+    # Both directions: nothing probed that the extras don't declare, nothing declared left unprobed.
+    assert set(probes) == set(declared)
+    for name, probe in probes.items():
+        assert str(probe) == str(declared[name]), name
+
+
+def test_installer_syncs_only_extras_supported_on_this_platform(monkeypatch):
+    """On win32-arm64 pm refuses the gated google-chat extra, so the repair requests only google."""
+    from pm import extras as pm_extras
+
+    states = iter([["google-auth==2.55.1"], []])
+    monkeypatch.setattr(oauth, "_missing_required_packages", lambda: next(states))
+    monkeypatch.setattr(pm_extras, "extra_supported", lambda extra, **kwargs: extra != "google-chat")
+    calls = []
+    monkeypatch.setattr(pm, "sync_venv", lambda extras, **kwargs: calls.append((extras, kwargs)))
+
+    assert oauth.install_deps() is True
+    assert calls == [(["google"], {"explicit": True})]
 
 
 def test_installer_repairs_stale_transitives_through_pm(monkeypatch, capsys):
