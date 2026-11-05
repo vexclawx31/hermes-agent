@@ -461,6 +461,31 @@ def _write_bridge_marker(bridge: Path, tree_hash: str, deps_hash: str) -> None:
     (bridge / _BRIDGE_MARKER).write_text(f"{tree_hash} {deps_hash}\n", encoding="utf-8")
 
 
+def _make_owner_writable(root: Path) -> None:
+    """Give the owner write access to a bridge mirror we own (dirs u+rwx, files u+rw), never following links.
+
+    ``copytree`` copies a sealed release's read-only modes into the mirror (dirs r-x, files r--). The
+    mirror is this home's own working copy, written by npm install, the marker and the refresh swap
+    (on macOS renaming a directory needs write access to it), so it must stay owner-writable. Entries
+    owned by another user are left alone; node_modules is npm's and is skipped."""
+    import stat
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    stack = [root]
+    while stack:
+        path = stack.pop()
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or (uid is not None and st.st_uid != uid):
+            continue
+        want = stat.S_IRWXU if stat.S_ISDIR(st.st_mode) else stat.S_IRUSR | stat.S_IWUSR
+        if st.st_mode & want != want:
+            os.chmod(path, stat.S_IMODE(st.st_mode) | want, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            stack.extend(child for child in path.iterdir() if child.name != "node_modules")
+
+
 def _same_bytes(a: Path, b: Path) -> bool:
     """Both missing, or both present with identical bytes."""
     try:
@@ -487,6 +512,7 @@ def _recover_interrupted_refresh(copy: Path) -> None:
         if donor is not None:
             os.replace(donor / "node_modules", copy / "node_modules")
     for stale in _bridge_leftovers(copy):
+        _make_owner_writable(stale)  # a read-only leftover can't be removed otherwise
         shutil.rmtree(stale, ignore_errors=True)
 
 
@@ -503,7 +529,10 @@ def _refresh_whatsapp_bridge_copy(install_bridge: Path, copy: Path, release_hash
     try:
         shutil.copytree(install_bridge, tmp, dirs_exist_ok=True, ignore=lambda _d, names: [
             n for n in names if n in _BRIDGE_SKIP_DIRS or n in _BRIDGE_SKIP_FILES])
+        _make_owner_writable(tmp)  # a sealed release's r-x modes came along with the copy
         _write_bridge_marker(tmp, release_hash, deps_hash)
+        if copy.exists():
+            _make_owner_writable(copy)  # the swap renames it aside, and rmtree removes it after
         if keep_modules and (copy / "node_modules").is_dir():
             os.replace(copy / "node_modules", tmp / "node_modules")
             moved_modules = True
@@ -518,6 +547,7 @@ def _refresh_whatsapp_bridge_copy(install_bridge: Path, copy: Path, release_hash
     except BaseException:
         if moved_modules and copy.exists() and not (copy / "node_modules").exists():
             os.replace(tmp / "node_modules", copy / "node_modules")
+        _make_owner_writable(tmp)
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     shutil.rmtree(old, ignore_errors=True)
@@ -557,6 +587,7 @@ def _sync_whatsapp_bridge_copy(install_bridge: Path, copy: Path, *, refresh: boo
                 return  # another process refreshed it while we waited
             old_hash = _bridge_tree_hash(copy) if copy.is_dir() else ""  # "" = no copy yet
             if old_hash == release_hash:
+                _make_owner_writable(copy)  # an identical copy made before this fix can still be read-only
                 _write_bridge_marker(copy, release_hash, deps_hash)
                 return
             keep = old_deps == deps_hash if old_deps else _same_bytes(install_bridge / "package.json", copy / "package.json")
