@@ -56,6 +56,26 @@ def _first_fire_within_thread_horizon(
     return timedelta(0) <= delta <= timedelta(minutes=_THREAD_HORIZON_MINUTES)
 
 
+def _changer_from_context() -> dict[str, str]:
+    """Who is changing or manually running a job now, for ``last_changed_by``: the bound session's platform and
+    user, ``cron`` inside a scheduled run, or ``local`` with no bound session (the operator's CLI). Only the
+    task-bound ContextVars count, never the ambient ``os.environ`` fallback, so a subprocess can't claim to be a
+    chat user. Plugins that trust a job because of who created it (``origin``) check this too, so a later edit
+    or a manual run by someone else can't inherit the creator's trust."""
+    from gateway.session_context import _UNSET, _VAR_MAP
+
+    def bound(name: str) -> str:
+        value = _VAR_MAP[name].get()
+        return value if isinstance(value, str) and value is not _UNSET else ""
+
+    if bound("HERMES_CRON_SESSION") == "1":
+        return {"platform": "cron", "user_id": ""}
+    platform = bound("HERMES_SESSION_PLATFORM")
+    if not platform:
+        return {"platform": "local", "user_id": ""}
+    return {"platform": platform, "user_id": bound("HERMES_SESSION_USER_ID")}
+
+
 def _origin_from_env(
     schedule: str | dict[str, Any] | None = None,
 ) -> Optional[dict[str, str]]:
@@ -104,6 +124,8 @@ def _origin_from_env(
         # Workspace/server scope (Slack team, Discord guild...): Slack session keys embed it,
         # so a continuable cron seed built without it would never resolve a scoped reply.
         "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
+        # dm/group/...: lets an owner-only notice (cron/scheduler_refusals.py) tell a direct chat from a group.
+        **({"chat_type": chat_type} if (chat_type := get_session_env("HERMES_SESSION_CHAT_TYPE")) else {}),
     }
 
 
@@ -460,10 +482,16 @@ def _validate_context_from_refs(refs: list[Any]) -> Optional[str]:
     for ref_id in refs:
         if isinstance(ref_id, str) and ref_id.strip().lower() == "self":
             continue
-        if not _get_job(ref_id):
+        source = _get_job(ref_id)
+        if not source:
             return (
                 f"context_from job '{ref_id}' not found. "
                 "Use cronjob(action='list') to see available jobs.")
+        from cron.job_trust import actor_may_reference
+        if not actor_may_reference(_changer_from_context(), source):
+            return (
+                f"context_from job '{ref_id}' belongs to someone else: a job can only read the output of "
+                "jobs made by the same person.")
     return None
 
 

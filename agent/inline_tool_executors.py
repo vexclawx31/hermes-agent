@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from importlib import import_module
+import logging
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from tools.arg_coercion import coerce_tool_args

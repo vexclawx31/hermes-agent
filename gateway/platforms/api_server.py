@@ -3918,13 +3918,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return await self._job_lookup_or_mutate(request, _cron_get, notify=False)
 
     async def _handle_update_job(self, request: web.Request) -> web.Response:
-        """PATCH /api/jobs/{job_id} — update a cron job."""
+        """PATCH /api/jobs/{job_id} — update a cron job: whitelisted fields only, stamped ``last_changed_by``."""
         job_id, err = self._cron_request_guard(request, need_job_id=True)
         if err:
             return err
         try:
             body = await request.json()
-            # Whitelist allowed fields to prevent arbitrary key injection
             sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
             if not sanitized:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
@@ -3936,7 +3935,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     return prompt_err
         except Exception as e:
             return self._cron_error_response(e)
-        return self._job_response(lambda jid: _cron_update(jid, sanitized), job_id, notify=True)
+        stamp = {"last_changed_by": {"platform": "api_server", "user_id": ""}}  # tools/cronjob_job_args.py
+        return self._job_response(lambda jid: _cron_update(jid, {**sanitized, **stamp}), job_id, notify=True)
 
     async def _handle_delete_job(self, request: web.Request) -> web.Response:
         """DELETE /api/jobs/{job_id} — delete a cron job."""

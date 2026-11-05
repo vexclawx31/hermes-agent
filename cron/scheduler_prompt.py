@@ -145,6 +145,21 @@ def _recorded_recall_scope(header: str):
     return None
 
 
+def _context_source_allowed(job: dict, source_job_id: str) -> bool:
+    """A job reads only the outputs of jobs made by the same person (cron/job_trust.py). A skipped source counts
+    as a refusal in this run, so a silent run tells the owner why."""
+    from cron.job_trust import may_read_output
+    from cron.jobs import get_job
+    from tools.tool_refusals import observe
+    source = get_job(source_job_id) or {"id": source_job_id}
+    if may_read_output(job, source):
+        return True
+    reason = f"context_from job {source_job_id} belongs to someone else, so its output was not included"
+    logger.warning("context_from: job_id=%r: %s", job.get("id"), reason)
+    observe("context_from", {"refused": True, "error": reason})
+    return False
+
+
 def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
     """Prepend the latest output of each ``context_from`` job; returns ``(prompt, injected)``.
 
@@ -170,6 +185,8 @@ def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
         if isinstance(source_job_id, str) and source_job_id.strip().lower() == "self":
             source_job_id = str(job.get("id") or "")
         is_self = source_job_id == job.get("id")
+        if not is_self and not _context_source_allowed(job, source_job_id):
+            continue
         # Traversal guard — valid job IDs are hex strings.
         if not source_job_id or not all(c in "0123456789abcdef" for c in source_job_id):
             logger.warning(

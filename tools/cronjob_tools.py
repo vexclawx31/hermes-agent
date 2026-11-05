@@ -50,6 +50,7 @@ from tools.cronjob_job_args import (
     _apply_continuity,
     _canonical_skills,
     _clean_str_list,
+    _changer_from_context,
     _format_job,
     _gateway_liveness_notice,
     _local_delivery_notice,
@@ -636,7 +637,8 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
     _notes = _mode_guidance_notes(job, deliver)
     if _notes:
         result["guidance"] = _notes
-    return result
+    from tools.cronjob_preflight import attach  # dry run: "this won't work because X", told at once
+    return attach(result, job)
 
 
 def _action_create(a: dict[str, Any]) -> str:
@@ -760,6 +762,8 @@ def _action_run(job: dict[str, Any], a: dict[str, Any]) -> str:
         scan_error = _scan_cron_prompt(extra_prompt)
         if scan_error:
             return tool_error(scan_error, success=False)
+    # A manual run's output comes back to whoever ran it: record them like an edit (cron/job_trust.py).
+    job = update_job(job_id, {"last_changed_by": _changer_from_context()}) or job
     # Primary-routed satellite delivery has no sender outside the gateway: hand the run to its ticker.
     handed_off = _hand_off_primary_routed_run(job, extra_prompt=extra_prompt)
     if handed_off is not None:
@@ -947,6 +951,7 @@ def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
             return tool_error(error, success=False)
     if not updates:
         return tool_error("No updates provided.", success=False)
+    updates["last_changed_by"] = _changer_from_context()
     updated = update_job(job["id"], updates)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.

@@ -671,6 +671,14 @@ def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Opti
     return "ok", None, None
 
 
+def _observe_refusal(function_name: str, result: Any, error_type: Optional[str]) -> None:
+    try:
+        from tools.tool_refusals import observe
+        observe(function_name, result, error_type=error_type)
+    except Exception:
+        logger.debug("tool refusal observer failed", exc_info=True)
+
+
 def _emit_post_tool_call_hook(
     *, function_name: str, function_args: dict[str, Any], result: Any,
     task_id: Optional[str] = None, session_id: Optional[str] = None, tool_call_id: Optional[str] = None,
@@ -679,7 +687,9 @@ def _emit_post_tool_call_hook(
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
-    fields are derived from the result only past that gate when status is None."""
+    fields are derived from the result only past that gate when status is None. Every tool result also
+    passes ``tools.tool_refusals.observe`` first (a no-op outside an unattended run), suppressed or not."""
+    _observe_refusal(function_name, result, error_type)
     if _post_tool_call_hook_suppressed.get():
         return
     try:

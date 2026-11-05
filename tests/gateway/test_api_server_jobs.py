@@ -514,7 +514,9 @@ class TestCronUnavailable:
                 data = await resp.json()
                 assert data["job"] == updated_job
                 assert captured["job_id"] == VALID_JOB_ID
-                assert captured["updates"] == {"name": "updated-name"}
+                # every API edit is stamped, so creator-trusting plugins see a non-chat change (cron/job_trust.py)
+                assert captured["updates"] == {"name": "updated-name",
+                                               "last_changed_by": {"platform": "api_server", "user_id": ""}}
 
 
 # ---------------------------------------------------------------------------
