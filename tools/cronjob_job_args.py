@@ -56,6 +56,19 @@ def _first_fire_within_thread_horizon(
     return timedelta(0) <= delta <= timedelta(minutes=_THREAD_HORIZON_MINUTES)
 
 
+def _editor_from_env() -> dict[str, str]:
+    """Who is changing a job now, for ``last_edited_by``: the live session's platform and user, ``cron``
+    inside a scheduled run, or ``local`` with no session at all (CLI/operator). Plugins that grant a job
+    access by its creator (``origin``) check this too, so a later edit can't inherit the creator's trust."""
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_CRON_SESSION") == "1":
+        return {"platform": "cron", "user_id": ""}
+    platform = get_session_env("HERMES_SESSION_PLATFORM")
+    if not platform:
+        return {"platform": "local", "user_id": ""}
+    return {"platform": platform, "user_id": get_session_env("HERMES_SESSION_USER_ID")}
+
+
 def _origin_from_env(
     schedule: str | dict[str, Any] | None = None,
 ) -> Optional[dict[str, str]]:

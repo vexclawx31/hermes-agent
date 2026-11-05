@@ -50,6 +50,7 @@ from tools.cronjob_job_args import (
     _apply_continuity,
     _canonical_skills,
     _clean_str_list,
+    _editor_from_env,
     _format_job,
     _gateway_liveness_notice,
     _local_delivery_notice,
@@ -636,7 +637,8 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
     _notes = _mode_guidance_notes(job, deliver)
     if _notes:
         result["guidance"] = _notes
-    return result
+    from tools.cronjob_preflight import attach  # dry run: "this won't work because X", told at once
+    return attach(result, job)
 
 
 def _action_create(a: dict[str, Any]) -> str:
@@ -947,6 +949,7 @@ def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
             return tool_error(error, success=False)
     if not updates:
         return tool_error("No updates provided.", success=False)
+    updates["last_edited_by"] = _editor_from_env()
     updated = update_job(job["id"], updates)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.

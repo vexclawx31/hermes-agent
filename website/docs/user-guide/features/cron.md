@@ -74,6 +74,17 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 
 Hermes will use the unified `cronjob_manage` tool internally.
 
+## Create/edit-time dry run ("this won't work because…")
+
+When the agent creates or updates a job with the `cronjob` tool, the tool dry-runs the checks the job will meet in a
+scheduled run, against the stored job: the skills and delivery checks below, toolsets the job asks for that scheduled
+runs never get (`messaging`, `clarify`, `cronjob` unless `cron.allow_agent_scheduling`, and `agent.disabled_toolsets`),
+and the plugins' own permission checks through the `cron_job_preflight` hook. Problems come back as `wont_work`
+(plain sentences) plus a `tell_requester` instruction, so the agent tells the person right away instead of the first
+run failing quietly. Each check fails open. Updates through the tool also record `last_edited_by` (the editing
+session's platform and user, `cron` from inside a scheduled run, `local` with no session), so a plugin that trusts a
+job because of who created it can tell when someone else changed it.
+
 ## Pre-dispatch configuration validation
 
 Before constructing any agent machinery for a scheduled run, the scheduler
@@ -832,6 +843,14 @@ Otherwise, report the issue.
 ```
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
+
+**Silent after a refusal: the owner is told.** When a tool was refused during the run (a permission, access or
+approval check said no) and the run then ends `[SILENT]` or empty, the scheduler sends one plain line to where the job
+was created (its `origin`, the owner's chat), never to the normal delivery target: which tool was refused, why, and
+that the job or its permissions need changing. A job without an origin (created from the CLI) uses `failure_deliver`
+when set, otherwise the scheduler logs a warning. A tool result counts as a refusal when its JSON says
+`"refused": true` (the contract for tools and plugins), `"status": "blocked"` (approval and guardrail blocks, such as a
+dangerous command under `approvals.cron_mode: deny`), or a `pre_tool_call` plugin veto (`tools/tool_refusals.py`).
 
 ### Declaring a failed run
 
