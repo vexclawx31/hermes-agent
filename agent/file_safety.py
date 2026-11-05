@@ -8,9 +8,11 @@ clear denial for models that respect tool errors plus a visible audit trail.
 from __future__ import annotations
 
 import os
+import unicodedata
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from pathlib import Path
-from contextlib import suppress
-from typing import Optional
+from typing import Callable, Iterator, Optional
 
 
 def _constants_path(getter_name: str) -> Path:
@@ -291,17 +293,67 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
     ):
         return "credential"
 
+    protected = []
     for base in _hermes_dirs():
         for sub in _HERMES_PROTECTED_SUBPATHS:
             with suppress(Exception):
-                if _is_under(resolved, os.path.realpath(os.path.join(str(base), sub))):
+                protected.append(blocked := os.path.realpath(os.path.join(str(base), sub)))
+                if _is_under(resolved, blocked):
                     return "credential"
+
+    denied_dirs = {p.rstrip(os.sep) for home in homes for p in build_write_denied_prefixes(home)}
+    if _write_identity_denied(resolved, {p for home in homes for p in build_write_denied_paths(home)},
+                              denied_dirs | set(protected)):
+        return "credential"
 
     safe_roots = get_safe_write_roots()
     if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):
         return "safe_root"
 
     return None
+
+
+def _fold(name: str) -> str:
+    """One spelling per name on a case- and normalization-insensitive file system (APFS, NTFS)."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _write_identity_denied(resolved: str, denied_files: set[str], denied_dirs: set[str]) -> bool:
+    """The write deny-list matched by identity instead of spelling (see :func:`_identity_block_reason`).
+
+    The string checks miss ``~/.SSH/id_rsa`` or ``.ENV`` on case-insensitive file systems, and a
+    hardlink to one of the exact denied FILES under another name. (A hardlink to a file inside a denied
+    directory isn't caught: its ancestors aren't that directory. Making one needs the terminal tool,
+    which these guards don't cover anyway.) An existing target is denied when it IS a denied file, or
+    it or an ancestor IS a denied directory. A target that doesn't exist yet is denied when its nearest
+    existing ancestor is (or is inside) a denied directory, or when that ancestor IS an ancestor of a
+    denied path and the rest of the target spells the rest of that path (compared case- and
+    normalization-folded). The fold also refuses e.g. a new ``.ENV`` beside ``.env`` on a case-sensitive
+    file system: fail-closed, the name only differs by case from a store."""
+    key = _keyer()
+    existing, tail = Path(resolved), []
+    while key(existing) is None:
+        if existing.parent == existing:
+            return False
+        tail.insert(0, _fold(existing.name))
+        existing = existing.parent
+    found = key(existing)
+    if not tail and found in {key(f) for f in denied_files}:
+        return True
+    chain = {key(a) for a in (existing, *existing.parents)} - {None}
+    if chain & {key(d) for d in denied_dirs}:
+        return True
+    if not tail:
+        return False
+    for denied, is_dir in [(f, False) for f in denied_files] + [(d, True) for d in denied_dirs]:
+        dp = Path(denied)
+        for anc in dp.parents:
+            if key(anc) == found:
+                rest = [_fold(part) for part in dp.relative_to(anc).parts]
+                if tail == rest or (is_dir and tail[:len(rest)] == rest):
+                    return True
+                break
+    return False
 
 
 def is_write_denied(path: str) -> bool:
@@ -411,7 +463,86 @@ def get_read_block_error(path: str) -> Optional[str]:
                 "is a secret-bearing environment file and cannot be read to prevent credential "
                 "leakage. If you need to check the file structure, read .env.example instead." + _DID_SUFFIX
             )
+    if reason is None:
+        reason = _identity_block_reason(resolved, hermes_dirs)
     return f"Access denied: {path} {reason}" if reason else None
+
+
+def _file_key(path: Path) -> Optional[tuple[int, int]]:
+    """On-disk identity ``(st_dev, st_ino)`` of *path* (symlinks followed), or None when it can't be
+    stat'ed or the file system reports no inode. Tests monkeypatch this to simulate a case-insensitive
+    file system on case-sensitive CI."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino) if st.st_ino else None
+
+
+# Stat results shared by every guard call inside one ``identity_batch()`` (e.g. one search result set).
+_KEY_MEMO: ContextVar[Optional[dict[str, Optional[tuple[int, int]]]]] = ContextVar("_file_key_memo", default=None)
+
+
+@contextmanager
+def identity_batch() -> Iterator[None]:
+    """Share identity lookups across many guard calls, e.g. filtering one search result set: the
+    denied stores and shared parent dirs are stat'ed once per batch instead of once per hit. The memo
+    lives only for the ``with`` block, so nothing outlives the batch and goes stale. Nests (an inner
+    batch joins the outer one)."""
+    if _KEY_MEMO.get() is not None:
+        yield
+        return
+    token = _KEY_MEMO.set({})
+    try:
+        yield
+    finally:
+        _KEY_MEMO.reset(token)
+
+
+def _keyer() -> Callable[[str | Path], Optional[tuple[int, int]]]:
+    """A memoizing ``_file_key`` for one guard call (or the enclosing :func:`identity_batch`)."""
+    memo = _KEY_MEMO.get()
+    if memo is None:
+        memo = {}
+
+    def key(path: str | Path) -> Optional[tuple[int, int]]:
+        s = str(path)
+        if s not in memo:
+            memo[s] = _file_key(Path(s))
+        return memo[s]
+
+    return key
+
+
+def _identity_block_reason(resolved: Path, hermes_dirs: list[Path]) -> Optional[str]:
+    """The read deny-list matched by on-disk identity instead of spelling.
+
+    The checks in :func:`get_read_block_error` compare path strings, but macOS (APFS/HFS+) and Windows
+    file systems are case-insensitive (APFS is also Unicode-normalization-insensitive): ``AUTH.JSON``,
+    ``Auth.Json`` or ``MCP-Tokens/srv.json`` open the real store under a spelling no string match
+    catches, and a hardlink to one of the exact denied FILES is that store under another name. (A
+    hardlink to a file inside a denied directory isn't caught: its ancestors aren't that directory.
+    Making one needs the terminal tool, which these guards don't cover anyway.) So a target that exists
+    is refused when it IS a denied file, or when it or any ancestor IS a denied directory. A target that
+    doesn't exist has no contents to leak."""
+    key = _keyer()
+    target = key(resolved)
+    if target is None:
+        return None
+    if target in {key(hd / name) for name in _CREDENTIAL_FILE_NAMES for hd in hermes_dirs}:
+        return ("is a Hermes credential store and cannot be read directly. Provider tools "
+                "consume these credentials through internal channels." + _DID_SUFFIX)
+    chain = {key(anc) for anc in (resolved, *resolved.parents)} - {None}
+    hub_msg = ("is an internal Hermes cache file and cannot be read directly to prevent "
+               "prompt injection. Use the skills_list or skill_view tools instead.")
+    denied_dirs = ((os.path.join("skills", ".hub"), hub_msg, hub_msg), *(
+        (subdir, dir_msg + _DID_SUFFIX, file_msg + _DID_SUFFIX) for subdir, dir_msg, file_msg in _READ_DENIED_DIRS))
+    for subdir, dir_msg, file_msg in denied_dirs:
+        for hd in hermes_dirs:
+            dir_key = key(hd / subdir)
+            if dir_key is not None and dir_key in chain:
+                return dir_msg if dir_key == target else file_msg
+    return None
 
 
 def raise_if_read_blocked(path: str) -> None:
