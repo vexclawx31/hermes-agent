@@ -12,7 +12,7 @@ from plugins.platforms.google_chat import oauth
 
 def test_stale_google_transitives_are_reported_missing(monkeypatch):
     installed = {
-        "google-cloud-pubsub": "2.39.0",
+        "google-cloud-pubsub": "2.39.2",
         "google-api-python-client": "2.194.0",
         "google-auth": "2.55.0",
         "google-auth-oauthlib": "1.3.1",
