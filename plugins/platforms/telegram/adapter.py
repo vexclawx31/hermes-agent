@@ -178,6 +178,7 @@ _MEDIA_KIND_KEYS = {
     "video file": "platform.telegram.media.kind_video"}
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.speaker_tag import id_tagged_text
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
@@ -6174,8 +6175,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
-        user_id = event.source.user_id or "unknown"
-        return f"[{event.source.user_name or user_id}|{user_id}]\n{event.text or ''}"
+        return id_tagged_text(event.source.user_name, event.source.user_id, event.text)  # neutralized like the runner's tag
 
     def _telegram_group_observe_channel_prompt(self) -> str:
         username = self._current_bot_username() or "unknown"

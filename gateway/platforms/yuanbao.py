@@ -48,6 +48,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes_async, cache_image_from_bytes_async, cache_video_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.speaker_tag import id_tagged_text
 from gateway.platforms import helpers as _mdchunk
 from gateway.platforms._shared import get_scoped_secret as _yb_secret, profile_scoped as _profile_scoped
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task
@@ -1102,7 +1103,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
                 if summary:
                     body_text = f"{text}\n{summary}" if text else summary
             entry: dict = {
-                "role": "user", "content": f"[{sender_display}|{source.user_id or 'unknown'}]\n{body_text}",
+                "role": "user", "content": id_tagged_text(sender_display, source.user_id, body_text),
                 "timestamp": datetime.now(tz=UTC).isoformat(), "observed": True,
             }
             if msg_id:
@@ -1124,15 +1125,14 @@ class GroupAtGuardMiddleware(InboundMiddleware):
 
 
 class GroupAttributionMiddleware(InboundMiddleware):
-    """Group @bot turns: build channel_prompt, rewrite raw_text to ``[nickname|user_id]\\n<content>``
-    (matches observed-history format) and clear ``source.user_name`` to suppress the runner's
-    ``[user_name]`` prefix."""
+    """Group @bot turns: build channel_prompt, rewrite raw_text to the observed-history ``[nickname|user_id]\\n<content>``
+    (it replaces the runner's tag, so it is neutralized the same way) and clear ``source.user_name``."""
     name = "group-attribution"
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if ctx.chat_type == "group" and not ctx.owner_command:
             ctx.channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt(ctx.msg_body, ctx.adapter._bot_id)
-            ctx.raw_text = f"[{ctx.sender_nickname or ctx.from_account or 'unknown'}|{ctx.from_account or 'unknown'}]\n{ctx.raw_text}"
+            ctx.raw_text = id_tagged_text(ctx.sender_nickname or ctx.from_account, ctx.from_account, ctx.raw_text)
             if ctx.source is not None:
                 ctx.source = dataclasses.replace(ctx.source, user_name=None)
         await next_fn()

@@ -313,13 +313,13 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.speaker_tag import escape_speaker_tag_lines, safe_speaker_name
 from tools.url_safety import is_safe_url
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal, env_is_connected as _env_is_connected,
     extra_or_secret as _extra_or_secret, platform_gate_env as _scoped_gate_env, send_error,
     yaml_env_setter as _yaml_env_setter
 )
-
 
 
 def _unauthorized() -> str:
@@ -5309,7 +5309,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     content = "(attachment)"
                 if not content:
                     return None
-                name = (
+                name = safe_speaker_name(  # name and body can't pose as a speaker tag (gateway/speaker_tag.py)
                     getattr(msg.author, "display_name", None)
                     or getattr(msg.author, "name", None)
                     or "unknown"
@@ -5327,7 +5327,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     if is_authorized is False:
                         trust_tag = "[unverified] "
                         has_unverified = True
-                return f"{trust_tag}[{name}] {content}"
+                return f"{trust_tag}[{name}] {escape_speaker_tag_lines(content)}"
             # ── Primary window: recent channel activity since the last bot turn ──
             collected: list[tuple[str, str]] = []  # (message_id, line)
             seen_ids: set = set()

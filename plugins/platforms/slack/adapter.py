@@ -6063,6 +6063,7 @@ class SlackAdapter(BasePlatformAdapter):
         embedded newline could forge a "## SYSTEM" heading — so both collapse to one inert line."""
         # Local import: don't force gateway.session at module load.
         from gateway.session import neutralize_untrusted_inline_text
+        from gateway.speaker_tag import safe_speaker_name
         is_bot = self._event_declares_bot_sender(msg)
         msg_user = msg.get("user", "")
         msg_team = msg.get("team") or team_id  # our own bot for this message's workspace
@@ -6071,8 +6072,8 @@ class SlackAdapter(BasePlatformAdapter):
         ) or self._bot_user_id
         is_self_bot_reply = is_bot and not is_parent and self_bot_uid and msg_user == self_bot_uid
         prefix = "[thread parent] " if is_parent else "[assistant] " if is_self_bot_reply else ""
-        if is_self_bot_reply:
-            return f"{prefix}{msg_text}"
+        if is_self_bot_reply:  # may quote others' lines: one inert line, like a human body
+            return f"{prefix}{neutralize_untrusted_inline_text(msg_text, max_chars=0)}"
         display_user = msg_user or "unknown"
         if is_bot and not display_user:
             display_user = msg.get("username") or "bot"
@@ -6083,7 +6084,7 @@ class SlackAdapter(BasePlatformAdapter):
             if is_authorized is False:
                 trust_tag = "[unverified] "
         name = await self._resolve_user_name(display_user, chat_id=channel_id, team_id=team_id)
-        safe_name = neutralize_untrusted_inline_text(name)
+        safe_name = safe_speaker_name(name)  # no tag chars: "X | Slack user <@U…>" can't forge the id field
         safe_text = neutralize_untrusted_inline_text(msg_text, max_chars=0)  # untruncated
         if not is_bot and _SLACK_USER_ID.fullmatch(msg_user or "") and _recall_scope_enforced():
             # Sender attribution (agent/recall_scope.py): the platform id, not the editable display
@@ -7115,7 +7116,6 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
 
 
 _is_connected = _env_is_connected("SLACK_BOT_TOKEN")
-
 
 
 def register(ctx) -> None:

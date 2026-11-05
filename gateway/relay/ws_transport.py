@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.session import SessionSource
+from gateway.session import SessionSource, neutralize_untrusted_inline_text
+from gateway.speaker_tag import safe_speaker_name
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.transport import InboundHandler
 
@@ -115,7 +116,10 @@ def _render_relay_context(context: Any) -> Optional[str]:
             continue
         src = item.get("source") or {}
         author = (src.get("user_name") or src.get("user_id") or "") if isinstance(src, dict) else ""
-        lines.append(f"{author}: {text}" if author else str(text))
+        # Name and body are attacker-controlled: the name can't pose as a speaker tag
+        # (gateway/speaker_tag.py) and the body is one inert line, so it can't forge another line.
+        author = safe_speaker_name(author) if author else "unknown"
+        lines.append(f"{author}: {neutralize_untrusted_inline_text(text, max_chars=0)}")
     if not lines:
         return None
     return "[Recent channel messages]\n" + "\n".join(lines)
