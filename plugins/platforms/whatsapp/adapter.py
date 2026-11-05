@@ -2,6 +2,7 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
+import contextvars
 import copy
 import logging
 import mimetypes
@@ -10,6 +11,7 @@ import platform
 import re
 import signal
 import subprocess
+import threading
 import time
 from contextlib import suppress
 from functools import wraps
@@ -1213,9 +1215,6 @@ def _normalize_outbound_mentions(mentions: list[str] | None) -> list[str]:
     return list(dict.fromkeys(jid for m in mentions or () if (jid := normalize_whatsapp_mention_jid(m))))
 
 
-_STANDALONE_OBSERVER_TIMEOUT_SECS = 3.0
-
-
 def _bridge_message_ids(data: Any) -> list[str]:
     """Every message ID a bridge send reply names (``messageIds`` for a split send, else ``messageId``)."""
     if not isinstance(data, dict):
@@ -1224,24 +1223,37 @@ def _bridge_message_ids(data: Any) -> list[str]:
     return [str(i) for i in ids if i]
 
 
-async def _observe_standalone_outbound(chat_id: str, kind: str, message_ids: list[str], body: Any) -> None:
-    """The adapter's ``direction="outbound"`` event (#37) for a send that went out without the live adapter
+def _observe_standalone_outbound(chat_id: str, events: list[tuple[str, list[str], Any]]) -> None:
+    """The adapter's ``direction="outbound"`` event (#37) for sends that went out without the live adapter
     (cron's standalone lane, ``send_message`` from a worker), so an archive keeps the agent's own group
-    messages from every lane. In-process only; observing never changes the send result."""
-    if not chat_id.endswith("@g.us") or not message_ids:
+    messages from every lane. Fire-and-forget on a daemon thread in the sender's context (profile home and
+    secret scope): the send never waits on an observer, so a slow archive can't turn a delivered message
+    into a timeout or a resend. Observing never changes the send result."""
+    if not chat_id.endswith("@g.us") or not events:
         return
     try:
         from hermes_cli.lifecycle import has_hook
         if not has_hook("whatsapp_transport_event"):
             return
+    except Exception:  # health: allow BLE001 -- observer discovery must never affect a send
+        logger.debug("whatsapp_transport_event discovery failed", exc_info=True)
+        return
+
+    def _dispatch() -> None:
         from hermes_cli.plugins import invoke_hook
-        raw = {"chatId": chat_id, "isGroup": True, "fromMe": True, "kind": kind, "messageIds": list(message_ids),
-               "body": str(body or ""), "timestamp": int(time.time())}
-        await asyncio.wait_for(asyncio.to_thread(
-            invoke_hook, "whatsapp_transport_event", raw_message=raw, platform="whatsapp", direction="outbound"),
-            timeout=_STANDALONE_OBSERVER_TIMEOUT_SECS)
-    except Exception:  # health: allow BLE001 -- observer-only hook: errors never reach the send result
-        logger.debug("standalone whatsapp_transport_event dispatch error", exc_info=True)
+        for kind, message_ids, body in events:
+            raw = {"chatId": chat_id, "isGroup": True, "fromMe": True, "kind": kind,
+                   "messageIds": list(message_ids), "body": str(body or ""), "timestamp": int(time.time())}
+            try:
+                invoke_hook("whatsapp_transport_event", raw_message=raw, platform="whatsapp", direction="outbound")
+            except Exception:  # health: allow BLE001 -- observer-only hook: errors never reach the send result
+                logger.debug("standalone whatsapp_transport_event dispatch error", exc_info=True)
+
+    try:
+        threading.Thread(target=contextvars.copy_context().run, args=(_dispatch,), daemon=True,
+                         name="whatsapp-outbound-observer").start()
+    except Exception:  # health: allow BLE001 -- e.g. interpreter shutdown: the send result stands
+        logger.debug("standalone whatsapp_transport_event thread start failed", exc_info=True)
 
 
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
@@ -1344,8 +1356,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     except Exception as e:
         return _result(send_error(f"WhatsApp send failed: {e}"))
     finally:
-        for kind, ids, body in observed:
-            await _observe_standalone_outbound(normalized_chat_id, kind, ids, body)
+        _observe_standalone_outbound(normalized_chat_id, observed)
 
 
 def interactive_setup() -> None:

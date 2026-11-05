@@ -3161,10 +3161,12 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
-    if not d.should_deliver and job.get("last_delivery_queued"):
+    # A run that delivers nothing must not leave the previous run's receipts looking current.
+    stale = {key: None for key in ("last_delivery_queued", "last_delivery_message_ids") if job.get(key)}
+    if not d.should_deliver and stale:
         from cron.jobs import update_job
-        update_job(job["id"], {"last_delivery_queued": None})
-        job["last_delivery_queued"] = None
+        update_job(job["id"], stale)
+        job.update(stale)
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run

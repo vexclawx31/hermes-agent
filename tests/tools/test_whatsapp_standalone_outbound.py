@@ -10,6 +10,8 @@
 import asyncio
 import os
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -70,10 +72,18 @@ def hook():
         yield events
 
 
+def _join_observers(timeout=5.0):
+    for thread in threading.enumerate():
+        if thread.name == "whatsapp-outbound-observer":
+            thread.join(timeout)
+
+
 def _send(responses, *args, **kwargs):
     session_ctx, calls = _session_with(responses)
     with patch("aiohttp.ClientSession", return_value=session_ctx):
-        return asyncio.run(_standalone_send(_pconfig(), *args, **kwargs)), calls
+        res = asyncio.run(_standalone_send(_pconfig(), *args, **kwargs))
+    _join_observers()
+    return res, calls
 
 
 def test_group_text_send_fires_outbound_event_and_returns_ids(hook):
@@ -139,6 +149,68 @@ def test_observer_error_never_changes_the_send_result():
             patch("hermes_cli.plugins.invoke_hook", side_effect=RuntimeError("archive locked")):
         res, _ = _send([_resp(200, {"messageId": "A1"})], GROUP, "hello")
     assert res["success"] is True and res["message_ids"] == ["A1"]
+
+
+def test_slow_observer_never_delays_the_send():
+    """A slow archive (SQLite lock) must not hold the send: the standalone lane bounds it with a timeout,
+    and a false timeout after a delivered post would lose its IDs or queue a resend."""
+    release = threading.Event()
+    seen = []
+
+    def _slow(name, **kwargs):
+        release.wait(5)
+        seen.append(kwargs["raw_message"]["messageIds"])
+
+    session_ctx, _ = _session_with([_resp(200, {"messageId": "A1"})])
+    with patch("hermes_cli.lifecycle.has_hook", return_value=True), \
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_slow), \
+            patch("aiohttp.ClientSession", return_value=session_ctx):
+        started = time.monotonic()
+        res = asyncio.run(asyncio.wait_for(_standalone_send(_pconfig(), GROUP, "hello"), timeout=1.0))
+        elapsed = time.monotonic() - started
+        release.set()
+        _join_observers()
+    assert res["success"] is True and res["message_ids"] == ["A1"]
+    assert elapsed < 1.0
+    assert seen == [["A1"]]
+
+
+def test_cancelled_send_still_archives_what_went_out(hook):
+    """A send cancelled after its first post (outer timeout, shutdown) cancels promptly; the post that is
+    already on screen is still observed."""
+    async def _run():
+        never = asyncio.Event()  # the media upload hangs until cancelled
+
+        async def _hang(*_):
+            await never.wait()
+
+        def _ctx(**enter):
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(**enter)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        session = MagicMock()
+        session.post = MagicMock(side_effect=lambda url, **kw: _ctx(
+            return_value=_resp(200, {"messageId": "T1"})) if url.endswith("/send") else _ctx(side_effect=_hang))
+        session.get = MagicMock(side_effect=lambda url, **kw: _ctx(return_value=_resp(200)))
+        outer = _ctx(return_value=session)
+        f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        f.write(b"x")
+        f.close()
+        try:
+            with patch("aiohttp.ClientSession", return_value=outer):
+                await asyncio.wait_for(_standalone_send(_pconfig(), GROUP, "text", media_files=[(f.name, False)]),
+                                       timeout=0.3)
+        finally:
+            os.unlink(f.name)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        asyncio.run(_run())
+    assert time.monotonic() - started < 2.0
+    _join_observers()
+    assert [e[1]["raw_message"]["messageIds"] for e in hook] == [["T1"]]
 
 
 def test_no_subscriber_means_no_dispatch():
@@ -244,7 +316,8 @@ def test_live_lane_records_message_id(monkeypatch, persisted):
     from gateway.platforms.base import SendResult
 
     loop = asyncio.new_event_loop()
-    threading.Thread(target=loop.run_forever, daemon=True).start()
+    runner = threading.Thread(target=loop.run_forever, daemon=True)
+    runner.start()
     try:
         class Transport:
             adapter = object()
@@ -262,6 +335,8 @@ def test_live_lane_records_message_id(monkeypatch, persisted):
         assert job["_delivery_message_ids"] == {t.where: ["L1"]}
     finally:
         loop.call_soon_threadsafe(loop.stop)
+        runner.join(5)
+        loop.close()
 
 
 def test_next_run_clears_previous_ids(persisted):
