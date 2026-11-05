@@ -185,11 +185,11 @@ def _identity_matches(identity, record, home: Path) -> bool:
 
 
 def _same_home(a: Path | str, b: Path | str) -> bool:
-    try:
-        from gateway.status import _same_hermes_home
+    from gateway.status import _same_hermes_home
 
+    try:
         return bool(_same_hermes_home(Path(a), Path(b)))
-    except Exception:
+    except (OSError, ValueError):
         return str(a) == str(b)
 
 

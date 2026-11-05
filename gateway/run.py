@@ -1680,12 +1680,8 @@ def _cron_tick_profile_homes(config: object) -> list[tuple[str, Path]]:
     from hermes_cli.profiles import get_active_profile_name, get_profile_dir, profile_is_standalone
 
     active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
-    launch_home = get_process_hermes_home()  # the launch home, never a per-turn override
-    if profile_is_standalone(launch_home):
-        # A standalone gateway serves only its own home, so its ticker visits only that home: the
-        # launch HERMES_HOME itself (default root, a named profile or a custom path alike). Visiting
-        # default + every member profile made it race their own gateways for cron at a cold boot,
-        # before _cron_profile_gate could see their PIDs.
+    launch_home = get_process_hermes_home()  # never a per-turn override
+    if profile_is_standalone(launch_home):  # serves only its own home: tick only it (r21 cold boot)
         return [(active, Path(launch_home))]
     homes = _multiplex_profile_homes(config)
     if any(name == active for name, _home in homes):
@@ -5397,11 +5393,8 @@ def _claim_host_gateway_role(force: bool = False) -> None:
             hr.describe(owner))
         return
     if profile_is_standalone(get_hermes_home()):
-        # Recheck after losing the atomic lock, WITHOUT waiting for the owner's socket: at a cold
-        # boot the owner is usually another standalone profile still starting up, and only a peer
-        # that has positively answered "I multiplex and serve you" may stop us (see
-        # ``standalone_attach_decision``). Losing the lock is expected for every standalone
-        # profile but one under an OS user.
+        # Recheck WITHOUT waiting for the owner's socket: only a live multiplexer that positively
+        # serves us may stop a standalone profile (``standalone_attach_decision``, r21 cold boot).
         live_owner = host_gateway()
         decision = standalone_attach_decision(get_hermes_home(), live_owner)
         if decision is not None:
@@ -5443,9 +5436,9 @@ def _owner_is_standalone() -> bool:
         owner = host_gateway()
         if owner is None or owner.pid == os.getpid():
             return False
-        if owner.standalone:
-            return True  # its live record or identify already said multiplex:false; no rescan needed
-        answered = request_serve_profile(profile_name_for_home(get_hermes_home()), owner=owner)
+        # A live record or identify that already said multiplex:false needs no rescan.
+        answered = owner if owner.standalone else request_serve_profile(
+            profile_name_for_home(get_hermes_home()), owner=owner)
         return bool(answered is not None and answered.standalone)
     except Exception:
         logger.debug("standalone-owner probe failed; keeping the second-gateway refusal",
