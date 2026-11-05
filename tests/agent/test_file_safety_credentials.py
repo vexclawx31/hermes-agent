@@ -282,3 +282,109 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     root_tok.parent.mkdir(parents=True, exist_ok=True)
     root_tok.write_text("x")
     assert "MCP token" in (get_read_block_error(str(root_tok)) or "")
+
+
+# --- Identity matching: spellings a string comparison misses ---------------------------------------
+
+
+@pytest.fixture()
+def isolated_home(tmp_path, monkeypatch):
+    """Like ``fake_home`` but with the global root pinned too, so nothing outside tmp is stat'ed."""
+    import agent.file_safety as fs
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: home)
+    monkeypatch.setattr(fs, "_hermes_root_path", lambda: home)
+    return home
+
+
+def _case_insensitive_key(path):
+    """Simulated case-insensitive file system for ``fs._file_key`` (meaningful on Linux CI too)."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    return (0, hash(str(p.resolve()).casefold()))
+
+
+def _ensure(home: Path, rel: str) -> Path:
+    """Create HERMES_HOME/<rel> unless it exists (on a case-insensitive FS a case variant already does)."""
+    p = home / rel
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("variant", encoding="utf-8")
+    return p
+
+
+@pytest.mark.parametrize(
+    "store, variant, needle",
+    [
+        ("auth.json", "AUTH.JSON", "credential store"),
+        ("auth.json", "Auth.Json", "credential store"),
+        (os.path.join("auth", "google_oauth.json"), os.path.join("AUTH", "Google_OAuth.json"), "credential store"),
+        (os.path.join("mcp-tokens", "srv.json"), os.path.join("MCP-Tokens", "srv.json"), "MCP token"),
+        (os.path.join("vault", "vault.key"), os.path.join("VAULT", "vault.key"), "credential vault"),
+        (os.path.join("skills", ".hub", "x.md"), os.path.join("Skills", ".HUB", "x.md"), "internal Hermes cache"),
+    ],
+)
+def test_case_variant_of_denied_store_blocked(isolated_home, monkeypatch, store, variant, needle):
+    import agent.file_safety as fs
+    from agent.file_safety import get_read_block_error
+
+    monkeypatch.setattr(fs, "_file_key", _case_insensitive_key)
+    _create(isolated_home, store)
+    target = _ensure(isolated_home, variant)
+    assert needle in (get_read_block_error(str(target)) or "")
+
+
+def test_case_variant_of_denied_dir_itself_blocked(isolated_home, monkeypatch):
+    import agent.file_safety as fs
+    from agent.file_safety import get_read_block_error
+
+    monkeypatch.setattr(fs, "_file_key", _case_insensitive_key)
+    _create(isolated_home, os.path.join("mcp-tokens", "srv.json"))
+    (isolated_home / "MCP-TOKENS").mkdir(exist_ok=True)
+    assert "token directory" in (get_read_block_error(str(isolated_home / "MCP-TOKENS")) or "")
+
+
+def test_case_variant_of_unrelated_file_not_blocked(isolated_home, monkeypatch):
+    import agent.file_safety as fs
+    from agent.file_safety import get_read_block_error
+
+    monkeypatch.setattr(fs, "_file_key", _case_insensitive_key)
+    _create(isolated_home, "auth.json")
+    assert get_read_block_error(str(_create(isolated_home, "Config.YAML"))) is None
+    assert get_read_block_error(str(_create(isolated_home, os.path.join("Skills", "mine", "AUTH.JSON")))) is None
+
+
+def test_missing_variant_not_blocked_by_identity(isolated_home):
+    """A spelling that doesn't exist on disk has no identity (and no contents to leak)."""
+    from agent.file_safety import get_read_block_error
+
+    assert get_read_block_error(str(isolated_home / "nothing-here.json")) is None
+
+
+def test_hardlink_to_store_blocked(isolated_home):
+    """Real identity on any OS: a hardlink is the same file under an unlisted name."""
+    from agent.file_safety import get_read_block_error
+
+    store = _create(isolated_home, "auth.json")
+    alias = isolated_home / "innocent.json"
+    try:
+        os.link(store, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks not supported here")
+    assert "credential store" in (get_read_block_error(str(alias)) or "")
+
+
+def test_real_case_insensitive_file_system(isolated_home, tmp_path):
+    """No simulation: on a case-insensitive FS (macOS, Windows) AUTH.JSON is auth.json."""
+    from agent.file_safety import get_read_block_error
+
+    (tmp_path / "CaseProbe").write_text("x")
+    if not (tmp_path / "caseprobe").exists():
+        pytest.skip("case-sensitive file system; covered by the simulated tests")
+    _create(isolated_home, "auth.json")
+    _create(isolated_home, os.path.join("mcp-tokens", "srv.json"))
+    assert "credential store" in (get_read_block_error(str(isolated_home / "AUTH.JSON")) or "")
+    assert "MCP token" in (get_read_block_error(str(isolated_home / "Mcp-Tokens" / "SRV.json")) or "")

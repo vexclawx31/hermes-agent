@@ -15,9 +15,15 @@ from tools.credential_files import (
     iter_cache_files,
     iter_skills_files,
     map_cache_path_to_container,
-    register_credential_file,
     register_credential_files,
 )
+
+
+def _passes_skill_checks(relative_path: str) -> bool:
+    """The local backend's checks on a skill entry (containment, existence, deny-list): True when the
+    entry is not reported missing. Nothing is registered or mounted either way."""
+    with patch.dict(os.environ, {"TERMINAL_ENV": "local"}):
+        return register_credential_files([relative_path]) == []
 
 
 def _authorize(hermes_home: Path, cred_files: list) -> None:
@@ -440,7 +446,7 @@ class TestPathTraversalSecurity:
         sensitive = tmp_path / "sensitive.json"
         sensitive.write_text('{"secret": "value"}')
 
-        result = register_credential_file("../sensitive.json")
+        result = _passes_skill_checks("../sensitive.json")
 
         assert result is False
         assert get_credential_file_mounts() == []
@@ -456,7 +462,7 @@ class TestPathTraversalSecurity:
         ssh_dir.mkdir()
         (ssh_dir / "id_rsa").write_text("PRIVATE KEY")
 
-        result = register_credential_file("../../.ssh/id_rsa")
+        result = _passes_skill_checks("../../.ssh/id_rsa")
 
         assert result is False
         assert get_credential_file_mounts() == []
@@ -471,7 +477,7 @@ class TestPathTraversalSecurity:
         sensitive = tmp_path / "absolute.json"
         sensitive.write_text("{}")
 
-        result = register_credential_file(str(sensitive))
+        result = _passes_skill_checks(str(sensitive))
 
         assert result is False
         assert get_credential_file_mounts() == []
@@ -486,7 +492,7 @@ class TestPathTraversalSecurity:
         (subdir / "oauth.json").write_text("{}")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-        result = register_credential_file("creds/oauth.json")
+        result = _passes_skill_checks("creds/oauth.json")
 
         assert result is True
 
@@ -507,7 +513,7 @@ class TestPathTraversalSecurity:
         except (OSError, NotImplementedError):
             pytest.skip("Symlinks not supported on this platform")
 
-        result = register_credential_file("evil_link.json")
+        result = _passes_skill_checks("evil_link.json")
 
         # The resolved path escapes HERMES_HOME — must be rejected
         assert result is False
@@ -860,17 +866,22 @@ class TestMasterCredentialStoresAreNeverMountable:
     )
     def test_master_credential_store_is_refused(self, tmp_path, rel_path):
         home = self._home(tmp_path)
+        _authorize(home, [rel_path])
         with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
-            assert register_credential_file(rel_path) is False, (
+            assert _passes_skill_checks(rel_path) is False, (
                 f"{rel_path} would be bind-mounted into the sandbox"
             )
-            assert get_credential_file_mounts() == []
+            with patch.dict(os.environ, {"TERMINAL_ENV": "docker"}):
+                assert register_credential_files([rel_path]) == [rel_path]
+                assert get_credential_file_mounts() == []
 
     def test_per_service_token_still_mounts(self, tmp_path):
         """The module's legitimate purpose must keep working."""
         home = self._home(tmp_path)
-        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
-            assert register_credential_file("google_token.json") is True
+        _authorize(home, ["google_token.json"])
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "TERMINAL_ENV": "docker"}):
+            assert _passes_skill_checks("google_token.json") is True
+            assert register_credential_files(["google_token.json"]) == []
             mounts = get_credential_file_mounts()
         assert [m["container_path"] for m in mounts] == [
             "/root/.hermes/google_token.json"
@@ -901,7 +912,7 @@ class TestMasterCredentialStoresAreNeverMountable:
         with patch.dict(os.environ, {"HERMES_HOME": str(home)}), \
                 patch.object(cf, "get_read_block_error", None):
             with caplog.at_level("ERROR", logger="tools.credential_files"):
-                assert cf.register_credential_file("google_token.json") is False
+                assert _passes_skill_checks("google_token.json") is False
             assert cf.get_credential_file_mounts() == []
         assert any("deny-list cannot be consulted" in r.message for r in caplog.records)
 
@@ -917,7 +928,154 @@ class TestMasterCredentialStoresAreNeverMountable:
         with patch.dict(os.environ, {"HERMES_HOME": str(home)}), \
                 patch.object(cf, "get_read_block_error", _boom):
             with caplog.at_level("ERROR", logger="tools.credential_files"):
-                assert cf.register_credential_file("google_token.json") is False
+                assert _passes_skill_checks("google_token.json") is False
             assert cf.get_credential_file_mounts() == []
         rec = next(r for r in caplog.records if "read guard raised" in r.message)
         assert rec.exc_info is not None, "traceback must be attached (logger.exception)"
+
+
+def _simulated_case_insensitive_key(path):
+    """Stand-in for ``agent.file_safety._file_key`` on a case-insensitive file system: two spellings
+    that differ only in letter case are the same file. Lets the case-variant tests mean the same thing
+    on case-sensitive Linux CI as on macOS."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    return (0, hash(str(p.resolve()).casefold()))
+
+
+def _write_variant(home: Path, rel: str) -> None:
+    """Create HERMES_HOME/<rel> unless it already exists (on a case-insensitive file system a case
+    variant of an existing store already exists and IS that store; writing would clobber it)."""
+    p = home / rel
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("variant")
+
+
+class TestCaseVariantsOfMasterStores:
+    """terminal.credential_files: ["AUTH.JSON"] opened the real auth.json on macOS (case-insensitive
+    APFS) because the deny-list compared path strings. The guard now also matches by on-disk identity."""
+
+    VARIANTS = ["AUTH.JSON", "Auth.Json", ".ENV", "MCP-Tokens/srv.json", "CACHE/bws_cache.json",
+                "Cache/BWS_Cache.json", ".Anthropic_OAuth.json"]
+
+    @staticmethod
+    def _home(tmp_path, monkeypatch):
+        import agent.file_safety as fs
+        home = TestMasterCredentialStoresAreNeverMountable._home(tmp_path)
+        monkeypatch.setattr(fs, "_hermes_home_path", lambda: home)
+        monkeypatch.setattr(fs, "_hermes_root_path", lambda: home)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        return home
+
+    @pytest.mark.parametrize("rel_path", VARIANTS)
+    def test_case_variant_config_entry_is_refused(self, tmp_path, monkeypatch, rel_path):
+        import agent.file_safety as fs
+        home = self._home(tmp_path, monkeypatch)
+        monkeypatch.setattr(fs, "_file_key", _simulated_case_insensitive_key)
+        _write_variant(home, rel_path)
+        _authorize(home, [rel_path, "google_token.json"])
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        missing = register_credential_files([rel_path, "google_token.json"])
+        mounts = get_credential_file_mounts()
+
+        assert missing == [rel_path]
+        assert [m["container_path"] for m in mounts] == ["/root/.hermes/google_token.json"]
+
+    @pytest.mark.parametrize("rel_path", VARIANTS)
+    def test_case_variant_skill_entry_is_refused_locally(self, tmp_path, monkeypatch, rel_path):
+        import agent.file_safety as fs
+        home = self._home(tmp_path, monkeypatch)
+        monkeypatch.setattr(fs, "_file_key", _simulated_case_insensitive_key)
+        _write_variant(home, rel_path)
+
+        assert _passes_skill_checks(rel_path) is False
+
+    def test_unrelated_case_variant_still_mounts(self, tmp_path, monkeypatch):
+        """Only spellings of a denied store are refused, not every upper-case name."""
+        import agent.file_safety as fs
+        home = self._home(tmp_path, monkeypatch)
+        monkeypatch.setattr(fs, "_file_key", _simulated_case_insensitive_key)
+        _authorize(home, ["Google_Token.json"])
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        assert register_credential_files(["Google_Token.json"]) == []
+        assert [m["container_path"] for m in get_credential_file_mounts()] == [
+            "/root/.hermes/Google_Token.json"]
+
+    def test_real_case_insensitive_file_system(self, tmp_path, monkeypatch):
+        """No simulation: where the file system really is case-insensitive (macOS, Windows), the
+        spelling AUTH.JSON reaches auth.json and must be refused."""
+        probe = tmp_path / "CaseProbe"
+        probe.write_text("x")
+        if not (tmp_path / "caseprobe").exists():
+            pytest.skip("case-sensitive file system; covered by the simulated tests")
+        home = self._home(tmp_path, monkeypatch)
+        assert (home / "AUTH.JSON").read_text() == '{"providers":{}}', "precondition: same file"
+        _authorize(home, ["AUTH.JSON", "MCP-TOKENS/srv.json"])
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        assert get_credential_file_mounts() == []
+        assert _passes_skill_checks("AUTH.JSON") is False
+
+
+class TestRegisterCredentialFileRemoved:
+    def test_single_file_registration_api_is_gone(self):
+        """register_credential_file() mounted files without the config authorization check; any
+        caller would reopen the skill-authorizes-its-own-mount hole."""
+        import tools.credential_files as cf
+        assert not hasattr(cf, "register_credential_file")
+
+    def test_mounts_come_only_from_config(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "token.json").write_text("{}")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        assert register_credential_files(["token.json"]) == ["token.json"]
+        assert get_credential_file_mounts() == []
+
+
+class TestConfigReadFailureIsNotCached:
+    def test_transient_failure_retried_on_next_call(self, tmp_path, monkeypatch):
+        import hermes_cli.config as hc
+        import tools.credential_files as cf
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "token.json").write_text("{}")
+        _authorize(home, ["token.json"])
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        real = hc.read_raw_config
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("transient")
+            return real()
+
+        monkeypatch.setattr(hc, "read_raw_config", flaky)
+        assert cf._config_authorized_paths() == []
+        assert cf._config_files == {}, "a failed read must not be cached"
+        assert cf._config_authorized_paths() == ["token.json"]
+        assert calls["n"] == 2
+        assert cf._config_authorized_paths() == ["token.json"]
+        assert calls["n"] == 2, "a successful read is cached"
+
+    def test_clear_drops_cached_names(self, tmp_path, monkeypatch):
+        import tools.credential_files as cf
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "token.json").write_text("{}")
+        (home / "other.json").write_text("{}")
+        _authorize(home, ["token.json"])
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert cf._config_authorized_paths() == ["token.json"]
+        _authorize(home, ["other.json"])
+        cf.clear_credential_files()
+        assert cf._config_authorized_paths() == ["other.json"]

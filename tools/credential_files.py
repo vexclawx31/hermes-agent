@@ -1,8 +1,9 @@
 """File passthrough registry for remote terminal backends (Docker, Modal, SSH).
 
 Sandboxes start with no host files; this module tells them which credential files
-(skill ``required_credential_files`` + ``terminal.credential_files`` config), skill
-dirs, and host cache dirs to mount or sync in, at creation and before each command.
+(``terminal.credential_files`` config; skill ``required_credential_files`` are only
+checked against it), skill dirs, and host cache dirs to mount or sync in, at creation
+and before each command.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ import os
 import posixpath
 import stat
 import time
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -29,20 +29,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Session-scoped registry; ContextVar prevents cross-session bleed in the gateway.
-_registered_files_var: ContextVar[dict[str, str]] = ContextVar("_registered_files")
-
-# Cache for config-based file list, one entry per profile home (tests reset it).
-_config_files: dict[str, list[dict[str, str]]] = {}
+# Normalized ``terminal.credential_files`` names, one entry per profile home (tests reset it).
+# Only successful config reads are cached; the files themselves are checked whenever mounts are built.
+_config_files: dict[str, list[str]] = {}
 # Reused across calls so sanitized skill copies don't accumulate.
 _safe_skills_tempdir: Path | None = None
-
-
-def _get_registered() -> dict[str, str]:
-    val = _registered_files_var.get(None)
-    if val is None:
-        _registered_files_var.set(val := {})
-    return val
 
 
 def _mount(host_path: Path | str, container_path: str) -> dict[str, str]:
@@ -63,25 +54,15 @@ def _contained_host_path(rel: str, hermes_home: Path, abs_msg: str, traversal_ms
     return host_path.resolve()
 
 
-def register_credential_file(relative_path: str, container_base: str = "/root/.hermes") -> bool:
-    """Register a HERMES_HOME-relative credential file for mounting; True if it exists and was registered.
+def _checked_skill_file(relative_path: str) -> Optional[Path]:
+    """The contained, existing, non-master-store host file for *relative_path*, or None.
 
     Rejects absolute paths and traversal out of HERMES_HOME. Containment alone is not
     enough: HERMES_HOME holds the MASTER stores (``.env``, ``auth.json``, ``mcp-tokens/``),
-    which are refused via the canonical read deny-list so the mount surface cannot hand a
+    which are refused via the canonical read deny-list (matched by spelling and by on-disk
+    identity, so case variants on macOS are caught) so the mount surface cannot hand a
     skill what the read surface denies. Fails CLOSED (logged) if the guard is unavailable or raises.
     """
-    resolved = _checked_skill_file(relative_path)
-    if resolved is None:
-        return False
-    container_path = f"{container_base.rstrip('/')}/{relative_path}"
-    _get_registered()[container_path] = str(resolved)
-    logger.debug("credential_files: registered %s -> %s", resolved, container_path)
-    return True
-
-
-def _checked_skill_file(relative_path: str) -> Optional[Path]:
-    """The contained, existing, non-master-store host file for *relative_path*, or None (see above)."""
     resolved = _contained_host_path(
         relative_path, get_hermes_home(),
         "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
@@ -177,7 +158,9 @@ def _config_authorized_paths() -> list[str]:
             if rel not in result:
                 result.append(rel)
     except Exception as e:
+        # Not cached: one transient read failure must not drop the operator's mounts for the process.
         logger.warning("Could not read terminal.credential_files from config: %s", e)
+        return []
     _config_files[home_key] = result
     return result
 
@@ -219,13 +202,11 @@ def _load_config_files() -> list[dict[str, str]]:
 
 
 def get_credential_file_mounts() -> list[dict[str, str]]:
-    """Skill-registered + config credential files as ``host_path``/``container_path`` dicts (re-checked on each call)."""
-    mounts = {cp: hp for cp, hp in _get_registered().items() if Path(hp).is_file()}
-    for entry in _load_config_files():
-        cp, hp = entry["container_path"], entry["host_path"]
-        if cp not in mounts:
-            mounts[cp] = hp
-    return [_mount(hp, cp) for cp, hp in mounts.items()]
+    """Config-authorized credential files as ``host_path``/``container_path`` dicts (re-checked on each call).
+
+    ``terminal.credential_files`` is the only source: skills can't register mounts of their own
+    (see :func:`register_credential_files`)."""
+    return _load_config_files()
 
 
 # --- Skills directory mounts ---
@@ -471,5 +452,6 @@ def iter_cache_files(container_base: str = "/root/.hermes") -> list[dict[str, st
 
 
 def clear_credential_files() -> None:
-    """Reset the skill-scoped registry (e.g. on session reset)."""
-    _get_registered().clear()
+    """Drop the cached ``terminal.credential_files`` names (e.g. on session reset), so the next
+    mount build re-reads config.yaml."""
+    _config_files.clear()

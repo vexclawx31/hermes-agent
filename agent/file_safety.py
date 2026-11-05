@@ -411,7 +411,49 @@ def get_read_block_error(path: str) -> Optional[str]:
                 "is a secret-bearing environment file and cannot be read to prevent credential "
                 "leakage. If you need to check the file structure, read .env.example instead." + _DID_SUFFIX
             )
+    if reason is None:
+        reason = _identity_block_reason(resolved, hermes_dirs)
     return f"Access denied: {path} {reason}" if reason else None
+
+
+def _file_key(path: Path) -> Optional[tuple[int, int]]:
+    """On-disk identity ``(st_dev, st_ino)`` of *path* (symlinks followed), or None when it can't be
+    stat'ed or the file system reports no inode. Tests monkeypatch this to simulate a case-insensitive
+    file system on case-sensitive CI."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino) if st.st_ino else None
+
+
+def _identity_block_reason(resolved: Path, hermes_dirs: list[Path]) -> Optional[str]:
+    """The read deny-list matched by on-disk identity instead of spelling.
+
+    The checks in :func:`get_read_block_error` compare path strings, but macOS (APFS/HFS+) and Windows
+    file systems are case-insensitive (APFS is also Unicode-normalization-insensitive): ``AUTH.JSON``,
+    ``Auth.Json`` or ``MCP-Tokens/srv.json`` open the real store under a spelling no string match
+    catches, and a hardlink is the same store under another name. So a target that exists is refused
+    when it IS a denied file, or when it or any ancestor IS a denied directory. A target that doesn't
+    exist has no contents to leak."""
+    target = _file_key(resolved)
+    if target is None:
+        return None
+    for name in _CREDENTIAL_FILE_NAMES:
+        if any(_file_key(hd / name) == target for hd in hermes_dirs):
+            return ("is a Hermes credential store and cannot be read directly. Provider tools "
+                    "consume these credentials through internal channels." + _DID_SUFFIX)
+    chain = {_file_key(anc) for anc in (resolved, *resolved.parents)} - {None}
+    hub_msg = ("is an internal Hermes cache file and cannot be read directly to prevent "
+               "prompt injection. Use the skills_list or skill_view tools instead.")
+    denied_dirs = ((os.path.join("skills", ".hub"), hub_msg, hub_msg), *(
+        (subdir, dir_msg + _DID_SUFFIX, file_msg + _DID_SUFFIX) for subdir, dir_msg, file_msg in _READ_DENIED_DIRS))
+    for subdir, dir_msg, file_msg in denied_dirs:
+        for hd in hermes_dirs:
+            key = _file_key(hd / subdir)
+            if key is not None and key in chain:
+                return dir_msg if key == target else file_msg
+    return None
 
 
 def raise_if_read_blocked(path: str) -> None:
