@@ -47,28 +47,39 @@ def standalone_home(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("served,known", [(False, True), (True, True), (False, False)])
-def test_standalone_attach_requires_known_unserved_profile(standalone_home, monkeypatch, served, known):
+@pytest.mark.parametrize("replace", [False, True])
+def test_standalone_attach_refuses_only_a_multiplexer_that_serves_it(
+    standalone_home, monkeypatch, served, known, replace,
+):
+    """Only positive evidence refuses; an owner whose served set is UNKNOWN never does (r21:
+    refusing on unknown made every standalone gateway under one OS user exit 75 in lockstep)."""
     root, home = standalone_home
     owner = host_attach.HostGateway(os.getpid() + 1, root,
                                    ("default", "solo") if served else ("default",),
                                    served_known=known)
-    monkeypatch.setattr(host_attach, "host_gateway", lambda **kw: owner)
+    probes = []
+
+    def probe(**kw):
+        probes.append(kw.get("wait_for_channel", 0.0))
+        return owner
+
+    monkeypatch.setattr(host_attach, "host_gateway", probe)
     requests = []
     monkeypatch.setattr(host_attach, "request_serve_profile", lambda *a, **kw: requests.append(a))
-    decision = host_attach.decide(home)
-    if known and not served:
-        assert decision.outcome == host_attach.START
-    else:
+    decision = host_attach.decide(home, replace=replace)
+    if served and known:
         assert decision.outcome == host_attach.REFUSE
         assert decision.transient
-        if served:
-            assert "rescan-profiles" in decision.message
+        assert "rescan-profiles" in decision.message
+    else:
+        assert decision.outcome == host_attach.START
     assert requests == [], "an opted-out profile must never ask the host to serve it"
+    assert all(not wait for wait in probes), "a standalone profile never waits for the owner's socket"
 
 
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("served,known", [(False, True), (True, True), (False, False)])
-def test_standalone_lock_loser_requires_known_unserved_profile(
+def test_standalone_lock_loser_refuses_only_a_multiplexer_that_serves_it(
     standalone_home, monkeypatch, capsys, served, known,
 ):
     import fcntl
@@ -84,14 +95,13 @@ def test_standalone_lock_loser_requires_known_unserved_profile(
     hr.ensure_host_state_dir()
     with open(hr.lock_path(hr.ROLE_GATEWAY), "a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if known and not served:
-            run._claim_host_gateway_role()
-        else:
+        if served and known:
             with pytest.raises(SystemExit) as exc:
                 run._claim_host_gateway_role()
             assert exc.value.code == 75
-            if served:
-                assert "rescan-profiles" in capsys.readouterr().out
+            assert "rescan-profiles" in capsys.readouterr().out
+        else:
+            run._claim_host_gateway_role()
 
 
 @pytest.mark.platforms("linux")
@@ -120,19 +130,23 @@ def test_standalone_owner_cannot_hide_a_live_multiplexer(standalone_home, monkey
     hr.ensure_host_state_dir()
     with open(hr.lock_path(hr.ROLE_GATEWAY), "a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        for answer in (identity, None, {**identity, "pid": host_pid + 1}):
-            monkeypatch.setattr(host_attach, "_identify", lambda h: answer)
-            decision = host_attach.decide(home)
-            assert decision.outcome == host_attach.REFUSE
-            assert decision.transient
-            with pytest.raises(SystemExit) as exc:
-                run._claim_host_gateway_role()
-            assert exc.value.code == 75
-            run._claim_host_gateway_role(force=True)
-            # The original lock owner may exit without stopping the multiplexer.
-            with monkeypatch.context() as m:
-                m.setattr(host_attach, "host_gateway", lambda **kw: None)
-                assert host_attach.decide(home).outcome == host_attach.REFUSE
+        decision = host_attach.decide(home)
+        assert decision.outcome == host_attach.REFUSE
+        assert decision.transient
+        with pytest.raises(SystemExit) as exc:
+            run._claim_host_gateway_role()
+        assert exc.value.code == 75
+        run._claim_host_gateway_role(force=True)
+        # The original lock owner may exit without stopping the multiplexer.
+        with monkeypatch.context() as m:
+            m.setattr(host_attach, "host_gateway", lambda **kw: None)
+            assert host_attach.decide(home).outcome == host_attach.REFUSE
+        # A peer that has not answered, or whose answer is not its own PID, is UNKNOWN: it proves
+        # nothing about serving us, so it must not hold a cold boot hostage (r21).
+        for answer in (None, {**identity, "pid": host_pid + 1}):
+            monkeypatch.setattr(host_attach, "_identify", lambda h, answer=answer: answer)
+            assert host_attach.decide(home).outcome == host_attach.START
+            run._claim_host_gateway_role()
         # Once the live host confirms removal, both entry points permit coexistence.
         identity["served_profiles"] = [host_name]
         monkeypatch.setattr(host_attach, "_identify", lambda h: identity)

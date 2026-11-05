@@ -104,6 +104,11 @@ def build_identify_payload() -> dict[str, Any]:
         **{k: record.get(k) for k in ("kind", "pid", "start_time", "hermes_home")},
         "profile": _profile_label_for_home(record.get("hermes_home") or ""),
         "supervisor": _detect_supervisor(), **_get_code_identity_fields()}
+    with contextlib.suppress(ImportError):
+        from agent.secret_scope import is_multiplex_active
+
+        # Live mode, so a peer can tell a standalone gateway from a multiplexer (host_attach).
+        payload["multiplex"] = is_multiplex_active()
     with contextlib.suppress(Exception):
         # served_profiles (multiplex mode) is stamped into runtime status by the runner.
         served = (read_runtime_status() or {}).get("served_profiles")
