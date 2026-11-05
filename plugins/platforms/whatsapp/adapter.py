@@ -363,7 +363,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         super().__init__(config, Platform.WHATSAPP)
         if WhatsAppAdapter._DEFAULT_BRIDGE_DIR is None:
             from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-            WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
+            WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir(refresh=True)  # gateway start only
         extra = config.extra
         from hermes_constants import get_hermes_home
         self._profile_home = get_hermes_home()
@@ -469,7 +469,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._poll_task = asyncio.create_task(self._poll_messages())
 
     async def _reuse_running_bridge(self, bridge_path: Path) -> bool:
-        """Adopt a connected bridge serving the on-disk bridge.js + same read-receipt config; else say why it restarts."""
+        """Adopt a connected bridge serving the on-disk bridge.js (and, for a HERMES_HOME copy, the same release tree)
+        + same read-receipt config; else say why it restarts."""
         self._foreign_bridge_session = None
         self._bridge_probe_timed_out = False
         try:
@@ -489,13 +490,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
                 return False
             running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
-            if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
+            # A copy's marker covers every bridge file (bridge_helpers.js, ...), not only bridge.js.
+            from gateway.platforms.whatsapp_common import whatsapp_bridge_marker_hash
+            running_tree, disk_tree = data.get("treeHash", ""), whatsapp_bridge_marker_hash(bridge_path.parent)
+            tree_ok = not disk_tree or running_tree == disk_tree
+            if running_hash and disk_hash and running_hash == disk_hash and tree_ok and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                 self._mark_connected()
                 self._attach_to_bridge(None)  # Not managed by us
                 self._wire_plugin_handlers(None)
                 return True
-            stale_reason = f"running={running_hash or 'unversioned'}, disk={disk_hash}" if running_hash != disk_hash else "send_read_receipts config changed"
+            stale_reason = (f"running={running_hash or 'unversioned'}, disk={disk_hash}" if running_hash != disk_hash
+                            else f"tree running={running_tree or 'unversioned'}, disk={disk_tree}" if not tree_ok
+                            else "send_read_receipts config changed")
             print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
         except TimeoutError:
             self._bridge_probe_timed_out = True  # something holds the port but gave no identity; connect() leaves it
