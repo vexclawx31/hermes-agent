@@ -1090,6 +1090,14 @@ def _is_transient_transport_error(e: BaseException) -> bool:
         and not is_permanent_tls_error)
 
 
+def _is_transient_connect_error(e: BaseException) -> bool:
+    """Transient network failure during connect (DNS, refused, timeout), never an auth/API error.
+    Reuses the gateway's cause-chain classifier plus this adapter's aiohttp transport check."""
+    from gateway.run import _is_transient_network_error
+
+    return _is_transient_network_error(e) or _is_transient_transport_error(e)
+
+
 def _extra_or_env_flag_getter(key: str, env_var: str, *, strip: bool = False) -> Callable[..., bool]:
     """Method factory: ``self._extra_or_env_flag(key, env_var, strip=strip)``."""
 
@@ -1945,8 +1953,15 @@ class SlackAdapter(BasePlatformAdapter):
             logger.info("[Slack] Socket Mode connected (%d workspace(s))", len(self._team_clients))
             self._hint_allow_bots()
             return True
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[Slack] Connection failed: %s", e, exc_info=True)
+        except Exception as e:
+            if _is_transient_connect_error(e):
+                # DNS/connection blips (e.g. boot before the network is up): returning False with no
+                # fatal error queues the platform for the gateway's bounded reconnect backoff.
+                logger.warning(
+                    "[Slack] Cannot reach Slack yet (%s: %s); will retry with backoff",
+                    type(e).__name__, e)
+            else:
+                logger.error("[Slack] Connection failed: %s", e, exc_info=True)
             return False
         finally:
             if lock_acquired and not self._running:
