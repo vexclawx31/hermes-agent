@@ -630,8 +630,10 @@ async def _send_chunks(chunks, send_one):
         if isinstance(result, dict) and result.get("error"):
             break
     # Every chunk's message IDs, not just the last one's: earlier chunks are on screen too, also after a failure.
-    if isinstance(result, dict) and sent_ids:
-        result = {**result, "message_ids": list(dict.fromkeys(sent_ids))}
+    # Only when the last result doesn't already name them all, so a single-chunk result keeps its shape.
+    sent_ids = list(dict.fromkeys(sent_ids))
+    if isinstance(result, dict) and sent_ids and result_message_ids(result) != sent_ids:
+        result = {**result, "message_ids": sent_ids}
     return result
 
 
