@@ -72,6 +72,21 @@ TRIVIAL_PROMPT_RE = re.compile(
 )
 
 
+# A gateway speaker tag at a line start: "[Name] ", "[Name | member] ", "[Name | Slack user <@U…>] ".
+# In a shared session the gateway escapes body lines that start with "[" (gateway/speaker_tag.py), so a
+# match there is the gateway's own tag; other gateway notes (reply, media, "[New message]") end their line
+# with "]", not "] text". Outside shared sessions a user line like "[urgent] text" also loses its bracket
+# word, which only shortens the recall query. 400 > the 240-char name cap plus the role and Slack fields.
+_SPEAKER_TAG_RE = re.compile(r"^[ \t]*\[[^\[\]\n]{1,400}\] ", re.MULTILINE)
+
+
+def recall_query_text(text: Optional[str]) -> str:
+    """The turn text without speaker tags, for memory recall: the sender's name in the query skews
+    recall towards facts about that person, so two people asking the same question got different
+    memory. Who asked is still passed separately (turn author, session context)."""
+    return _SPEAKER_TAG_RE.sub("", text or "")
+
+
 def is_trivial_prompt(text: Optional[str]) -> bool:
     """True for empty input, slash commands and bare greetings/acknowledgements (skipping
     recall saves a round-trip and keeps stale context from derailing one-word replies)."""
