@@ -499,6 +499,8 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         "last_status": job.get("last_status"),
         "last_delivery_error": job.get("last_delivery_error"),
         "last_delivery_unverified": job.get("last_delivery_unverified"),
+        # What the last run put on screen, per target: lets the agent find and read back its own message.
+        "last_delivery_message_ids": job.get("last_delivery_message_ids"),
         "last_fire_error": job.get("last_fire_error"),
         "last_error": redact_sensitive_text(
             job["last_error"], force=True, redact_url_credentials=True,

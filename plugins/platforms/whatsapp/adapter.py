@@ -1213,13 +1213,53 @@ def _normalize_outbound_mentions(mentions: list[str] | None) -> list[str]:
     return list(dict.fromkeys(jid for m in mentions or () if (jid := normalize_whatsapp_mention_jid(m))))
 
 
+_STANDALONE_OBSERVER_TIMEOUT_SECS = 3.0
+
+
+def _bridge_message_ids(data: Any) -> list[str]:
+    """Every message ID a bridge send reply names (``messageIds`` for a split send, else ``messageId``)."""
+    if not isinstance(data, dict):
+        return []
+    ids = data.get("messageIds") if isinstance(data.get("messageIds"), list) else [data.get("messageId")]
+    return [str(i) for i in ids if i]
+
+
+async def _observe_standalone_outbound(chat_id: str, kind: str, message_ids: list[str], body: Any) -> None:
+    """The adapter's ``direction="outbound"`` event (#37) for a send that went out without the live adapter
+    (cron's standalone lane, ``send_message`` from a worker), so an archive keeps the agent's own group
+    messages from every lane. In-process only; observing never changes the send result."""
+    if not chat_id.endswith("@g.us") or not message_ids:
+        return
+    try:
+        from hermes_cli.lifecycle import has_hook
+        if not has_hook("whatsapp_transport_event"):
+            return
+        from hermes_cli.plugins import invoke_hook
+        raw = {"chatId": chat_id, "isGroup": True, "fromMe": True, "kind": kind, "messageIds": list(message_ids),
+               "body": str(body or ""), "timestamp": int(time.time())}
+        await asyncio.wait_for(asyncio.to_thread(
+            invoke_hook, "whatsapp_transport_event", raw_message=raw, platform="whatsapp", direction="outbound"),
+            timeout=_STANDALONE_OBSERVER_TIMEOUT_SECS)
+    except Exception:  # health: allow BLE001 -- observer-only hook: errors never reach the send result
+        logger.debug("standalone whatsapp_transport_event dispatch error", exc_info=True)
+
+
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
                            caption=None, mentions=None):
-    """Out-of-process delivery via the bridge HTTP API (standalone_sender_fn: cron apart from the gateway); ``caption`` rides on the media bubble."""
+    """Out-of-process delivery via the bridge HTTP API (standalone_sender_fn: cron apart from the gateway); ``caption`` rides on the media bubble.
+    The result carries ``message_ids`` (every message put on screen, also on a later failure), and each successful
+    group post fires the outbound observer event, as the live adapter does."""
     try:
         import aiohttp
     except ImportError:
         return send_error("aiohttp not installed. Run: pip install aiohttp")
+    sent_ids: list[str] = []  # kept even when a later post fails: those messages are already on screen
+    observed: list[tuple[str, list[str], Any]] = []
+
+    def _result(base: dict) -> dict:
+        return {**base, "message_ids": list(sent_ids)} if sent_ids else base
+
+    normalized_chat_id = ""
     try:
         from hermes_constants import get_hermes_home
         from .bridge_ownership import standalone_bridge_port
@@ -1264,18 +1304,23 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
                         "restart it from the same Hermes version.")}
 
             async def _post(path, payload, total, error_label=None):
-                """``(messageId, None)`` on 200, else ``(None, error_dict)`` (body read only when labelled)."""
+                """``(messageId, None)`` on 200, else ``(None, error_dict)`` (body read only when labelled).
+                A 200 records the IDs it names, with the posted text, for the result and the outbound event."""
                 url = f"http://localhost:{bridge_port}/{path}"
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=total)) as resp:
                     if resp.status == 200:
-                        return (await resp.json()).get("messageId"), None
+                        data = await resp.json()
+                        if ids := _bridge_message_ids(data):
+                            sent_ids.extend(ids)
+                            observed.append((_OUTBOUND_OBSERVED_KINDS[path], ids, payload.get(_OUTBOUND_BODY_KEYS[path])))
+                        return (data.get("messageId") if isinstance(data, dict) else None), None
                     return None, {} if error_label is None else send_error(f"WhatsApp {error_label} error ({resp.status}): {await resp.text()}")
             # 1) Text first (skipped when media-only or when the text rides as the caption).
             if (message or "").strip() and not media_caption:
                 payload = _mention_first_payload({"chatId": normalized_chat_id, "message": message})
                 last_message_id, err = await _post("send", payload, 30, "bridge")
                 if err:
-                    return err
+                    return _result(err)
             # 2) Each media file as a native attachment (mediaType picks the WhatsApp kind).
             for media_path, is_voice in media:
                 if not os.path.exists(media_path):
@@ -1286,18 +1331,21 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
                             await _post("send", payload, 30)
                         except Exception:
                             logger.warning("WhatsApp caption-fallback send failed for missing media")
-                    return send_error(f"WhatsApp media file not found: {media_path}")
+                    return _result(send_error(f"WhatsApp media file not found: {media_path}"))
                 media_type = _bridge_media_type(media_path, is_voice, force_document)
                 payload: dict[str, Any] = {"chatId": normalized_chat_id, "filePath": media_path, "mediaType": media_type}
                 payload.update({k: v for k, v in (("fileName", os.path.basename(media_path) if media_type == "document" else None), ("caption", media_caption)) if v})
                 payload = _mention_first_payload(payload)
                 mid, err = await _post("send-media", payload, 120, "media")
                 if err:
-                    return err
+                    return _result(err)
                 last_message_id = mid or last_message_id
-        return {"success": True, "platform": "whatsapp", "chat_id": normalized_chat_id, "message_id": last_message_id}
+        return _result({"success": True, "platform": "whatsapp", "chat_id": normalized_chat_id, "message_id": last_message_id})
     except Exception as e:
-        return send_error(f"WhatsApp send failed: {e}")
+        return _result(send_error(f"WhatsApp send failed: {e}"))
+    finally:
+        for kind, ids, body in observed:
+            await _observe_standalone_outbound(normalized_chat_id, kind, ids, body)
 
 
 def interactive_setup() -> None:
