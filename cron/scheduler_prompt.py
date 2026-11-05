@@ -383,7 +383,9 @@ def _build_job_prompt(
         prompt = f"{notepad_section}{prompt}"
         has_injected_data = True
 
-    prompt = _CRON_HINT + prompt
+    # This run's own identity, so a follow-up can bind to it (`hermes cron runs --id <execution_id>`).
+    run_line = f"[Cron run: job_id {job.get('id')}, execution_id {job['execution_id']}]\n\n" if job.get("execution_id") else ""
+    prompt = _CRON_HINT + run_line + prompt
     skill_names = _job_skill_names(job)
     if not skill_names:
         return _scan_assembled_cron_prompt(

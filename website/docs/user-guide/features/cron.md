@@ -429,6 +429,36 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+Each attempt has its own execution id, created once when the run is claimed
+(32 hex characters, time-prefixed so ids sort by creation time). Its row keeps
+that run's own delivery receipt: the delivery outcome (`delivered`, `queued`,
+`failed`, `suppressed`, `suppressed_acked` or `not_configured`), the targets it
+resolved (`platform:chat_id[:thread_id]`, named after the lane actually used, so
+a newly opened thread shows its thread id and an in-channel post shows none;
+the message ids use the same names), the provider message ids each target
+posted, and the delivery error (redacted, at most 500 characters) when one
+failed, so the next run does not overwrite it. `hermes cron runs --id
+<execution-id>` shows one attempt. The agent sees its own ids on one prompt
+line, `[Cron run: job_id <job-id>, execution_id <execution-id>]`.
+
+Notes on what the receipt covers:
+
+- `delivery_targets` lists every target the delivery resolved, including ones
+  that were then skipped (warning notifications suppressed for that platform,
+  or refused by outbound policy). A target with no message ids was not posted
+  to; the delivery error names a refused one.
+- The receipt describes the last delivery the run made. For a run that crashed
+  (raised out of the agent run), that is the failure notice, sent through
+  `failure_deliver` when the job sets one, not the output. The private notice
+  about a silent run after a tool refusal is not the job's delivery and is not
+  recorded on the receipt.
+
+```text
+001a1ac08a6e23e3e2de964db4171b95  completed  delivery=delivered  job=a1b2c3  source=builtin  2026-11-05T09:00:01+01:00
+    target: slack:C0123456789
+    message ids: slack:C0123456789=1762329601.000200
+```
+
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
 that the retained ledger records as completed, Hermes skips that replay and

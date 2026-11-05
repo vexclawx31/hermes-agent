@@ -334,19 +334,48 @@ def cron_tick():
     return 0
 
 
-def cron_runs(job_id: Optional[str] = None, limit: int = 20):
-    """Show indexed durable cron execution history."""
-    from cron.executions import list_executions
+def _print_execution(record: dict, *, detail: bool = False) -> None:
+    """One ledger row: id, status, delivery outcome, job, source, start time, then its receipt.
+
+    Rows written before r21 have no targets/message ids; rows before the outcome column show ``-``.
+    """
+    started = record.get("started_at") or record.get("claimed_at") or "?"
+    print(f"{record.get('id', '?')}  {record.get('status', '?'):<9}  "
+          f"delivery={record.get('delivery_outcome') or '-'}  "
+          f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  {started}")
+    if targets := record.get("delivery_targets"):
+        print(f"    target: {', '.join(str(t) for t in targets)}")
+    if message_ids := record.get("delivery_message_ids"):
+        shown = "; ".join(f"{where}={','.join(str(i) for i in (ids if isinstance(ids, list) else [ids]))}"
+                          for where, ids in message_ids.items())
+        print(f"    message ids: {shown}")
+    if record.get("delivery_error"):
+        print(f"    delivery error: {record['delivery_error']}")
+    if record.get("error"):
+        print(f"    {record['error']}")
+    if detail:
+        for label, key in (("claimed", "claimed_at"), ("finished", "finished_at"),
+                           ("occurrence", "scheduled_instant")):
+            if record.get(key):
+                print(f"    {label}: {record[key]}")
+
+
+def cron_runs(job_id: Optional[str] = None, limit: int = 20, execution_id: Optional[str] = None):
+    """Show indexed durable cron execution history, or one attempt by its execution id."""
+    from cron.executions import get_execution, list_executions
+    if execution_id:
+        record = get_execution(execution_id)
+        if record is None or (job_id and record.get("job_id") != job_id):
+            print(f"No cron execution attempt {execution_id}.")
+            return 1
+        _print_execution(record, detail=True)
+        return 0
     records = list_executions(job_id=job_id, limit=limit)
     if not records:
         print("No cron execution attempts recorded.")
         return
     for record in records:
-        print(f"{record.get('id', '?')}  {record.get('status', '?'):<9}  "
-              f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  "
-              f"{record.get('claimed_at', '?')}")
-        if record.get("error"):
-            print(f"    {record['error']}")
+        _print_execution(record)
 
 
 _INCIDENT_STATE_COLORS = {"detected": Colors.RED, "alerted": Colors.YELLOW, "resolved": Colors.GREEN,
@@ -973,7 +1002,8 @@ _CRON_SUBCOMMANDS = {
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),
     "tick": lambda a: cron_tick(),
-    "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
+    "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20),
+                                getattr(a, "execution_id", None)) or 0,
     "incidents": lambda a: cron_incidents(a),
     "notepad": lambda a: cron_notepad(a),
     "create": lambda a: cron_create(a),

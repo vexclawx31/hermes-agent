@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from agent.redact import redact_sensitive_text
 from cron.executions import _owner_is_live, _process_start_time
+from cron.scheduler_delivery_receipts import queued_delivery_receipt
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
@@ -134,6 +135,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
     )
+    # This send's own targets + message ids (JSON), read back by the worker by execution id (r21).
+    add_column_if_missing(conn, "deliveries", "receipt", "receipt TEXT")
 
 
 def _connect() -> sqlite3.Connection:
@@ -254,7 +257,10 @@ def claim_next() -> Optional[dict]:
     return result
 
 
-def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
+def _finish(
+    execution_id: str, *, error: Optional[str], suppressed: bool = False,
+    receipt: Optional[dict] = None,
+) -> bool:
     status = "failed" if error else "suppressed" if suppressed else "delivered"
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
@@ -263,13 +269,14 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
     )
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE deliveries SET status=?, finished_at=?, error=?
+            """UPDATE deliveries SET status=?, finished_at=?, error=?, receipt=?
                WHERE execution_id=? AND status='delivering'
                  AND owner_process_id=? AND owner_pid=?""",
             (
                 status,
                 _hermes_now().isoformat(),
                 safe_error,
+                json.dumps(receipt, sort_keys=True) if receipt else None,
                 execution_id,
                 _PROCESS_ID,
                 os.getpid(),
@@ -335,7 +342,8 @@ def drain(
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
             _finish(row["execution_id"], error=error,
-                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
+                    receipt=queued_delivery_receipt(row["job"]))
         finally:
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])
