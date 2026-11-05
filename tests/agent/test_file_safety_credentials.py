@@ -388,3 +388,83 @@ def test_real_case_insensitive_file_system(isolated_home, tmp_path):
     _create(isolated_home, os.path.join("mcp-tokens", "srv.json"))
     assert "credential store" in (get_read_block_error(str(isolated_home / "AUTH.JSON")) or "")
     assert "MCP token" in (get_read_block_error(str(isolated_home / "Mcp-Tokens" / "SRV.json")) or "")
+
+
+def _counting_file_key(monkeypatch):
+    import agent.file_safety as fs
+
+    real, seen = fs._file_key, []
+
+    def counting(path):
+        seen.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(fs, "_file_key", counting)
+    return seen
+
+
+def test_identity_batch_stats_each_path_once(isolated_home, monkeypatch):
+    """Filtering many search hits stats the denied stores once per batch, not once per hit."""
+    import agent.file_safety as fs
+
+    _create(isolated_home, "auth.json")
+    hits = [_create(isolated_home, os.path.join("src", f"f{i}.py")) for i in range(20)]
+    seen = _counting_file_key(monkeypatch)
+    with fs.identity_batch():
+        assert all(fs.get_read_block_error(str(h)) is None for h in hits)
+        alias = isolated_home / "src" / "alias.json"
+        try:
+            os.link(isolated_home / "auth.json", alias)
+        except (OSError, NotImplementedError):
+            alias = None
+        if alias is not None:
+            assert "credential store" in (fs.get_read_block_error(str(alias)) or "")
+    assert len(seen) == len(set(seen)), "a path was stat'ed twice inside one batch"
+    assert seen.count(str(isolated_home / "auth.json")) == 1
+
+
+def test_identity_lookups_once_per_call_without_batch(isolated_home, monkeypatch):
+    import agent.file_safety as fs
+
+    hit = _create(isolated_home, "notes.txt")
+    seen = _counting_file_key(monkeypatch)
+    assert fs.get_read_block_error(str(hit)) is None
+    assert len(seen) == len(set(seen))
+
+
+def test_identity_batch_does_not_outlive_its_block(isolated_home):
+    """No long-lived cache: a store hardlinked after the batch ends is caught by the next call."""
+    import agent.file_safety as fs
+
+    store = _create(isolated_home, "auth.json")
+    alias = isolated_home / "later.json"
+    with fs.identity_batch():
+        assert fs.get_read_block_error(str(alias)) is None  # doesn't exist yet
+    try:
+        os.link(store, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks not supported here")
+    assert "credential store" in (fs.get_read_block_error(str(alias)) or "")
+    assert fs._KEY_MEMO.get() is None
+
+
+def test_search_filter_uses_one_batch(isolated_home, monkeypatch):
+    """tools.file_tools._filter_read_blocked_search_results runs its whole result set in one batch."""
+    import agent.file_safety as fs
+    import tools.file_tools as ft
+
+    _create(isolated_home, "auth.json")
+    files = [str(_create(isolated_home, os.path.join("src", f"f{i}.py"))) for i in range(10)]
+    files.append(str(isolated_home / "auth.json"))
+    seen = _counting_file_key(monkeypatch)
+
+    class _Result:
+        matches = None
+        counts = None
+
+    result = _Result()
+    result.files = list(files)
+    assert ft._filter_read_blocked_search_results(result) == 1
+    assert result.files == files[:-1]
+    assert seen.count(str(isolated_home / "auth.json")) <= 1
+    assert fs._KEY_MEMO.get() is None

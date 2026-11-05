@@ -18,7 +18,7 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from agent.file_safety import get_nt_namespace_error, get_read_block_error
+from agent.file_safety import get_nt_namespace_error, get_read_block_error, identity_batch
 from agent.tool_result_classification import GUARDRAIL_REFUSAL_KEY
 from tools.binary_extensions import has_binary_extension
 from tools.skill_provenance import is_background_review
@@ -247,12 +247,13 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
             return False
         return True
 
-    if getattr(result, "matches", None):
-        result.matches = [m for m in result.matches if _allowed(m.path)]
-    if getattr(result, "files", None):
-        result.files = [f for f in result.files if _allowed(f)]
-    if getattr(result, "counts", None):
-        result.counts = {f: c for f, c in result.counts.items() if _allowed(f)}
+    with identity_batch():  # the denied stores are stat'ed once for the whole result set, not per hit
+        if getattr(result, "matches", None):
+            result.matches = [m for m in result.matches if _allowed(m.path)]
+        if getattr(result, "files", None):
+            result.files = [f for f in result.files if _allowed(f)]
+        if getattr(result, "counts", None):
+            result.counts = {f: c for f, c in result.counts.items() if _allowed(f)}
     return omitted
 
 

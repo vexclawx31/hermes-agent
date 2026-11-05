@@ -1039,9 +1039,13 @@ class TestRegisterCredentialFileRemoved:
 
 
 class TestConfigReadFailureIsNotCached:
-    def test_transient_failure_retried_on_next_call(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("failure", ["failed_read", "raises"])
+    def test_transient_failure_retried_on_next_call(self, tmp_path, monkeypatch, failure):
+        """read_raw_config() serves an empty FailedConfigRead (it doesn't raise) when config.yaml is
+        unreadable or unparseable; neither that nor an exception may be cached."""
         import hermes_cli.config as hc
         import tools.credential_files as cf
+        from hermes_cli.config_read_errors import FailedConfigRead
 
         home = tmp_path / ".hermes"
         home.mkdir()
@@ -1055,7 +1059,9 @@ class TestConfigReadFailureIsNotCached:
         def flaky():
             calls["n"] += 1
             if calls["n"] == 1:
-                raise OSError("transient")
+                if failure == "raises":
+                    raise OSError("transient")
+                return FailedConfigRead(error=OSError("EMFILE"))
             return real()
 
         monkeypatch.setattr(hc, "read_raw_config", flaky)
@@ -1065,6 +1071,25 @@ class TestConfigReadFailureIsNotCached:
         assert calls["n"] == 2
         assert cf._config_authorized_paths() == ["token.json"]
         assert calls["n"] == 2, "a successful read is cached"
+
+    def test_half_written_config_yaml_not_cached(self, tmp_path, monkeypatch):
+        """No monkeypatching: a real unparseable config.yaml, then the finished file."""
+        import tools.credential_files as cf
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "token.json").write_text("{}")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        (home / "config.yaml").write_text("terminal: [unclosed\n  credential_files: {\n")
+
+        assert cf._config_authorized_paths() == []
+        assert cf._config_files == {}, "a failed read must not be cached"
+        assert get_credential_file_mounts() == []
+
+        _authorize(home, ["token.json"])
+        assert cf._config_authorized_paths() == ["token.json"]
+        assert [m["container_path"] for m in get_credential_file_mounts()] == ["/root/.hermes/token.json"]
 
     def test_clear_drops_cached_names(self, tmp_path, monkeypatch):
         import tools.credential_files as cf

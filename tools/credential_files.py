@@ -148,7 +148,14 @@ def _config_authorized_paths() -> list[str]:
     result: list[str] = []
     try:
         from hermes_cli.config import read_raw_config
-        cred_files = cfg_get(read_raw_config(), "terminal", "credential_files")
+        from hermes_cli.config_read_errors import FailedConfigRead
+        raw = read_raw_config()
+        if isinstance(raw, FailedConfigRead):
+            # read_raw_config doesn't raise on an unreadable or half-written config.yaml; it serves an
+            # empty fallback. Same rule as an exception: no mounts now, and no cache, so the next call retries.
+            logger.warning("Could not read terminal.credential_files from config: %s", raw.read_error)
+            return []
+        cred_files = cfg_get(raw, "terminal", "credential_files")
         for item in cred_files if isinstance(cred_files, list) else []:
             rel = posixpath.normpath(item.strip()) if isinstance(item, str) and item.strip() else ""
             if not _is_relative_inside(rel):

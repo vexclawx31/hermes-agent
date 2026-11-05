@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import os
 import unicodedata
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from pathlib import Path
-from contextlib import suppress
-from typing import Optional
+from typing import Callable, Iterator, Optional
 
 
 def _constants_path(getter_name: str) -> Path:
@@ -321,20 +322,15 @@ def _write_identity_denied(resolved: str, denied_files: set[str], denied_dirs: s
     """The write deny-list matched by identity instead of spelling (see :func:`_identity_block_reason`).
 
     The string checks miss ``~/.SSH/id_rsa`` or ``.ENV`` on case-insensitive file systems, and a
-    hardlink to a store under another name. An existing target is denied when it IS a denied file, or
+    hardlink to one of the exact denied FILES under another name. (A hardlink to a file inside a denied
+    directory isn't caught: its ancestors aren't that directory. Making one needs the terminal tool,
+    which these guards don't cover anyway.) An existing target is denied when it IS a denied file, or
     it or an ancestor IS a denied directory. A target that doesn't exist yet is denied when its nearest
     existing ancestor is (or is inside) a denied directory, or when that ancestor IS an ancestor of a
     denied path and the rest of the target spells the rest of that path (compared case- and
     normalization-folded). The fold also refuses e.g. a new ``.ENV`` beside ``.env`` on a case-sensitive
     file system: fail-closed, the name only differs by case from a store."""
-    keys: dict[str, Optional[tuple[int, int]]] = {}
-
-    def key(p: Path) -> Optional[tuple[int, int]]:
-        s = str(p)
-        if s not in keys:
-            keys[s] = _file_key(p)
-        return keys[s]
-
+    key = _keyer()
     existing, tail = Path(resolved), []
     while key(existing) is None:
         if existing.parent == existing:
@@ -342,10 +338,10 @@ def _write_identity_denied(resolved: str, denied_files: set[str], denied_dirs: s
         tail.insert(0, _fold(existing.name))
         existing = existing.parent
     found = key(existing)
-    if not tail and any(key(Path(f)) == found for f in denied_files):
+    if not tail and found in {key(f) for f in denied_files}:
         return True
     chain = {key(a) for a in (existing, *existing.parents)} - {None}
-    if any(key(Path(d)) in chain for d in denied_dirs):
+    if chain & {key(d) for d in denied_dirs}:
         return True
     if not tail:
         return False
@@ -483,32 +479,69 @@ def _file_key(path: Path) -> Optional[tuple[int, int]]:
     return (st.st_dev, st.st_ino) if st.st_ino else None
 
 
+# Stat results shared by every guard call inside one ``identity_batch()`` (e.g. one search result set).
+_KEY_MEMO: ContextVar[Optional[dict[str, Optional[tuple[int, int]]]]] = ContextVar("_file_key_memo", default=None)
+
+
+@contextmanager
+def identity_batch() -> Iterator[None]:
+    """Share identity lookups across many guard calls, e.g. filtering one search result set: the
+    denied stores and shared parent dirs are stat'ed once per batch instead of once per hit. The memo
+    lives only for the ``with`` block, so nothing outlives the batch and goes stale. Nests (an inner
+    batch joins the outer one)."""
+    if _KEY_MEMO.get() is not None:
+        yield
+        return
+    token = _KEY_MEMO.set({})
+    try:
+        yield
+    finally:
+        _KEY_MEMO.reset(token)
+
+
+def _keyer() -> Callable[[str | Path], Optional[tuple[int, int]]]:
+    """A memoizing ``_file_key`` for one guard call (or the enclosing :func:`identity_batch`)."""
+    memo = _KEY_MEMO.get()
+    if memo is None:
+        memo = {}
+
+    def key(path: str | Path) -> Optional[tuple[int, int]]:
+        s = str(path)
+        if s not in memo:
+            memo[s] = _file_key(Path(s))
+        return memo[s]
+
+    return key
+
+
 def _identity_block_reason(resolved: Path, hermes_dirs: list[Path]) -> Optional[str]:
     """The read deny-list matched by on-disk identity instead of spelling.
 
     The checks in :func:`get_read_block_error` compare path strings, but macOS (APFS/HFS+) and Windows
     file systems are case-insensitive (APFS is also Unicode-normalization-insensitive): ``AUTH.JSON``,
     ``Auth.Json`` or ``MCP-Tokens/srv.json`` open the real store under a spelling no string match
-    catches, and a hardlink is the same store under another name. So a target that exists is refused
-    when it IS a denied file, or when it or any ancestor IS a denied directory. A target that doesn't
-    exist has no contents to leak."""
-    target = _file_key(resolved)
+    catches, and a hardlink to one of the exact denied FILES is that store under another name. (A
+    hardlink to a file inside a denied directory isn't caught: its ancestors aren't that directory.
+    Making one needs the terminal tool, which these guards don't cover anyway.) So a target that exists
+    is refused when it IS a denied file, or when it or any ancestor IS a denied directory. A target that
+    doesn't exist has no contents to leak."""
+    key = _keyer()
+    target = key(resolved)
     if target is None:
         return None
-    for name in _CREDENTIAL_FILE_NAMES:
-        if any(_file_key(hd / name) == target for hd in hermes_dirs):
-            return ("is a Hermes credential store and cannot be read directly. Provider tools "
-                    "consume these credentials through internal channels." + _DID_SUFFIX)
-    chain = {_file_key(anc) for anc in (resolved, *resolved.parents)} - {None}
+    if target in {key(hd / name) for name in _CREDENTIAL_FILE_NAMES for hd in hermes_dirs}:
+        return ("is a Hermes credential store and cannot be read directly. Provider tools "
+                "consume these credentials through internal channels." + _DID_SUFFIX)
+    chain = {key(anc) for anc in (resolved, *resolved.parents)} - {None}
     hub_msg = ("is an internal Hermes cache file and cannot be read directly to prevent "
                "prompt injection. Use the skills_list or skill_view tools instead.")
     denied_dirs = ((os.path.join("skills", ".hub"), hub_msg, hub_msg), *(
         (subdir, dir_msg + _DID_SUFFIX, file_msg + _DID_SUFFIX) for subdir, dir_msg, file_msg in _READ_DENIED_DIRS))
     for subdir, dir_msg, file_msg in denied_dirs:
         for hd in hermes_dirs:
-            key = _file_key(hd / subdir)
-            if key is not None and key in chain:
-                return dir_msg if key == target else file_msg
+            dir_key = key(hd / subdir)
+            if dir_key is not None and dir_key in chain:
+                return dir_msg if dir_key == target else file_msg
     return None
 
 
