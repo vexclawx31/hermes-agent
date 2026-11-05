@@ -266,3 +266,132 @@ class TestClarifyLogPrivacy:
             r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
         ]
         assert any(secret_choice in m for m in debug_msgs)
+
+
+def _connect_with_auth_error(exc):
+    """Run connect() with ``auth.test`` raising ``exc`` (no network); return (ok, adapter)."""
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+    mock_app = MagicMock()
+    mock_app.client = AsyncMock()
+    mock_web_client = AsyncMock()
+    mock_web_client.auth_test = AsyncMock(side_effect=exc)
+    with (
+        patch.object(_slack_mod, "AsyncApp", return_value=mock_app),
+        patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
+        patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
+        patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
+        patch("gateway.status.release_scoped_lock", return_value=None),
+    ):
+        ok = asyncio.run(adapter.connect())
+    return ok, adapter
+
+
+def _dns_failure():
+    """The boot-time error: aiohttp ClientConnectorError wrapping a getaddrinfo failure."""
+    import socket
+    from types import SimpleNamespace
+
+    import aiohttp
+
+    conn_key = SimpleNamespace(host="slack.com", port=443, ssl=True)
+    os_error = socket.gaierror(8, "nodename nor servname provided, or not known")
+    return aiohttp.ClientConnectorError(conn_key, os_error)
+
+
+class TestConnectNetworkFailureLogging:
+    """Boot before the network is up: one WARNING, no traceback, gateway retries with backoff."""
+
+    def test_dns_failure_logs_one_warning_without_traceback(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
+            ok, adapter = _connect_with_auth_error(_dns_failure())
+
+        assert ok is False
+        # No fatal error recorded: the startup path queues it for the bounded reconnect backoff.
+        assert not adapter.has_fatal_error
+        records = [r for r in caplog.records if r.name == ADAPTER_LOGGER and r.levelno >= logging.WARNING]
+        assert len(records) == 1
+        record = records[0]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None
+        message = record.getMessage()
+        assert message.startswith("[Slack] Cannot reach Slack yet (ClientConnectorError: ")
+        assert "nodename nor servname provided" in message
+        assert message.endswith("; will retry with backoff")
+
+    def test_timeout_is_transient(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
+            ok, _adapter = _connect_with_auth_error(TimeoutError("connect timed out"))
+
+        assert ok is False
+        levels = [r.levelno for r in caplog.records if r.name == ADAPTER_LOGGER and r.levelno >= logging.WARNING]
+        assert levels == [logging.WARNING]
+
+    def test_auth_failure_stays_error_with_traceback(self, caplog):
+        class SlackApiError(Exception):
+            """Stand-in for slack_sdk's error on ``invalid_auth`` (not a network error)."""
+
+        with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
+            ok, _adapter = _connect_with_auth_error(SlackApiError("The request to the Slack API failed. invalid_auth"))
+
+        assert ok is False
+        records = [r for r in caplog.records if r.name == ADAPTER_LOGGER and r.levelno >= logging.WARNING]
+        assert [r.levelno for r in records] == [logging.ERROR]
+        assert records[0].getMessage().startswith("[Slack] Connection failed: ")
+        assert records[0].exc_info is not None
+
+    def test_aiohttp_dns_error_is_transient(self):
+        """aiohttp 3.14 raises ClientConnectorDNSError for getaddrinfo failures."""
+        import socket
+        from types import SimpleNamespace
+
+        import aiohttp
+
+        conn_key = SimpleNamespace(host="slack.com", port=443, ssl=True)
+        exc = aiohttp.ClientConnectorDNSError(conn_key, socket.gaierror(8, "nodename nor servname provided"))
+        assert _slack_mod._is_transient_connect_error(exc) is True
+
+    def test_network_error_as_explicit_cause_is_transient(self):
+        class WrappedTransportError(Exception):
+            pass
+
+        try:
+            try:
+                raise _dns_failure()
+            except Exception as inner:
+                raise WrappedTransportError("wrapped") from inner
+        except WrappedTransportError as exc:
+            assert _slack_mod._is_transient_connect_error(exc) is True
+
+    def test_auth_error_raised_while_handling_network_error_is_not_transient(self):
+        class SlackApiError(Exception):
+            """Stand-in for slack_sdk's error on ``invalid_auth``."""
+
+        try:
+            try:
+                raise _dns_failure()
+            except Exception:
+                raise SlackApiError("The request to the Slack API failed. invalid_auth")  # implicit __context__
+        except SlackApiError as exc:
+            assert isinstance(exc.__context__, Exception)
+            assert _slack_mod._is_transient_connect_error(exc) is False
+
+    def test_bug_raised_while_handling_server_disconnect_is_not_transient(self):
+        import aiohttp
+
+        try:
+            try:
+                raise aiohttp.ServerDisconnectedError()
+            except aiohttp.ServerDisconnectedError:
+                raise ValueError("bad payload")  # implicit __context__
+        except ValueError as exc:
+            assert isinstance(exc.__context__, aiohttp.ServerDisconnectedError)
+            assert _slack_mod._is_transient_connect_error(exc) is False
+
+    def test_tls_failure_is_not_transient(self):
+        import ssl
+
+        import aiohttp
+
+        conn_key = MagicMock(host="slack.com", port=443, ssl=True)
+        exc = aiohttp.ClientConnectorCertificateError(conn_key, ssl.SSLCertVerificationError("bad cert"))
+        assert _slack_mod._is_transient_connect_error(exc) is False

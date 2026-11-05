@@ -41,9 +41,11 @@ SCOPES: list[str] = ["https://www.googleapis.com/auth/chat.messages.create"]
 
 # Declared extras (pyproject) and the exact pins they carry; the pins double as the
 # staleness probe so a half-synced interpreter is repaired instead of trusted.
+# Each spec carries the same PEP 508 environment marker as its pyproject entry, so a
+# package pyproject excludes on this platform is not reported missing.
 _DEPENDENCY_EXTRAS = ["google", "google-chat"]
 _REQUIRED_PACKAGES = [
-    "google-cloud-pubsub==2.39.2",
+    "google-cloud-pubsub==2.39.2; platform_machine != 'ARM64' or sys_platform != 'win32'",
     "google-api-python-client==2.194.0",
     "google-auth==2.55.1",
     "google-auth-oauthlib==1.3.1",
@@ -220,10 +222,16 @@ def _ensure_deps() -> None:
 
 
 def _missing_required_packages() -> list[str]:
-    """Return exact requirements absent or stale in this interpreter."""
+    """Return exact requirements absent or stale in this interpreter.
+
+    A requirement whose environment marker does not match the running interpreter is
+    not required here (pyproject never installs it on this platform).
+    """
     missing = []
     for spec in _REQUIRED_PACKAGES:
         requirement = Requirement(spec)
+        if requirement.marker is not None and not requirement.marker.evaluate({"extra": ""}):
+            continue
         try:
             installed = _distribution_version(requirement.name)
             satisfied = requirement.specifier.contains(installed, prereleases=True)
@@ -242,7 +250,12 @@ def install_deps() -> bool:
     print("Installing Google Chat dependencies...")
     try:
         import pm
-        pm.sync_venv(_DEPENDENCY_EXTRAS, explicit=True)
+        from pm import extras as pm_extras
+        # Same test as pm's feature policy: a gated-off extra (google-chat on win32-arm64) would make
+        # sync_venv refuse the whole request, so only the extras this platform supports are synced.
+        supported = [extra for extra in _DEPENDENCY_EXTRAS
+                     if pm_extras.extra_supported(extra, importable=lambda _: False)]
+        pm.sync_venv(supported, explicit=True)
         remaining = _missing_required_packages()
         if remaining:
             raise RuntimeError("dependencies remain stale after install: " + " ".join(remaining))
