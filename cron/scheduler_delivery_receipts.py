@@ -42,7 +42,7 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
 
 
 def target_label(target: dict) -> str:
-    """``platform:chat_id[:thread_id]``, the same name ``last_delivery_message_ids`` keys use."""
+    """``platform:chat_id[:thread_id]`` of a resolved (requested) target, before it is prepared."""
     base = f"{target.get('platform')}:{target.get('chat_id') or '(own)'}"
     return f"{base}:{target['thread_id']}" if target.get("thread_id") else base
 
@@ -54,6 +54,38 @@ def _begin_delivery_receipt(job: dict, targets: list) -> list:
         job.pop(key, None)
     job["_delivery_targets"] = [target_label(target) for target in targets]
     return targets
+
+
+def _note_actual_target(job: dict, target: dict, prepared) -> None:
+    """Rename a requested target to the lane it is actually sent to (``prepared.where``): preparing
+    can open a new thread or drop the thread id, and the message ids are keyed by that name, so
+    ``delivery_targets`` and the ``delivery_message_ids`` keys always agree."""
+    labels = job.get("_delivery_targets") or []
+    requested = target_label(target)
+    if prepared is not None and requested in labels:
+        labels[labels.index(requested)] = prepared.where
+
+
+def queued_delivery_receipt(job: dict) -> dict:
+    """What a gateway's send of a queued worker delivery stores on its queue row (``receipt``)."""
+    return {"targets": list(job.get("_delivery_targets") or ()),
+            "message_ids": dict(job.get("_delivery_message_ids") or {})}
+
+
+def _adopt_queued_receipt(job: dict, queue_row) -> None:
+    """Worker side: take this execution's own receipt from its queue row, never from the job record
+    (whose ``last_delivery_message_ids`` is last-writer-wins across runs)."""
+    import json
+
+    try:
+        receipt = json.loads((queue_row or {}).get("receipt") or "{}")
+    except ValueError:
+        receipt = {}
+    receipt = receipt if isinstance(receipt, dict) else {}
+    ids, targets = receipt.get("message_ids"), receipt.get("targets")
+    job["_delivery_message_ids"] = dict(ids) if isinstance(ids, dict) else {}
+    if isinstance(targets, list) and targets:
+        job["_delivery_targets"] = [str(t) for t in targets]
 
 
 def run_delivery_receipt(job: dict, delivery_error=None) -> dict:

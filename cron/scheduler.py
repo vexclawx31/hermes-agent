@@ -2826,11 +2826,13 @@ def _record_fire_ownership_lost(
             job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
             **({"ladder_rung": True} if is_retry_run(job) else {}),
         )
-        finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+        finish_execution(
+            execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED, **run_delivery_receipt(job))
     else:
+        # Whatever this run already sent stays on its receipt, even though its result is discarded.
         finish_execution(
             execution_id, success=False,
-            error="Fire claim ownership lost; stale result was discarded.")
+            error="Fire claim ownership lost; stale result was discarded.", **run_delivery_receipt(job))
 
 
 def _classify_delivery_outcome(
@@ -3125,7 +3127,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     if fire_owner is not None and not marked:
         finish_execution(
             execution_id, success=False,
-            error="Fire claim ownership lost before terminal completion.")
+            error="Fire claim ownership lost before terminal completion.",
+            **run_delivery_receipt(job, d.delivery_error))
         return True
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,

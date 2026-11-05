@@ -346,7 +346,8 @@ def _print_execution(record: dict, *, detail: bool = False) -> None:
     if targets := record.get("delivery_targets"):
         print(f"    target: {', '.join(str(t) for t in targets)}")
     if message_ids := record.get("delivery_message_ids"):
-        shown = "; ".join(f"{where}={','.join(str(i) for i in ids)}" for where, ids in message_ids.items())
+        shown = "; ".join(f"{where}={','.join(str(i) for i in (ids if isinstance(ids, list) else [ids]))}"
+                          for where, ids in message_ids.items())
         print(f"    message ids: {shown}")
     if record.get("delivery_error"):
         print(f"    delivery error: {record['delivery_error']}")

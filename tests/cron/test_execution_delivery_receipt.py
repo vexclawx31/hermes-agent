@@ -72,6 +72,176 @@ def test_each_run_keeps_its_own_receipt(tmp_path, monkeypatch, external_worker):
     assert jobs.get_job(job["id"])["last_delivery_message_ids"] == {"telegram:fixture-chat": ["msg-2"]}
 
 
+def test_queued_failed_send_never_borrows_an_earlier_runs_ids(tmp_path, monkeypatch):
+    """Worker path: the gateway's send crashed, so this run posted nothing. The job record still
+    holds the previous run's ids (last writer wins); the receipt must not report them."""
+    from cron import delivery_queue
+
+    _telegram_fixture(tmp_path, monkeypatch)
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:fixture-chat")
+    jobs.update_job(job["id"], {"last_delivery_message_ids": {"telegram:fixture-chat": ["earlier-run"]}})
+    run = dict(jobs.get_job(job["id"]))
+    _use_external_worker(run, monkeypatch, patch_queue=False)
+    original_wait = delivery_queue.enqueue_and_wait
+
+    def crash(queued_job, _content, _for_failure):
+        # Another run of the job posts meanwhile: the job record now names ITS ids.
+        jobs.update_job(queued_job["id"], {"last_delivery_message_ids": {"telegram:fixture-chat": ["other-run"]}})
+        raise RuntimeError("gateway send crashed")
+
+    def drain_with_crash(execution_id, job, content, *, for_failure=False):
+        delivery_queue.enqueue(execution_id, job, content, for_failure=for_failure)
+        assert delivery_queue.drain(crash) == 1
+        return original_wait(execution_id, job, content, for_failure=for_failure)
+
+    monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_with_crash)
+    scheduler.run_one_job(run)
+
+    row = executions.latest_execution(job["id"])
+    assert row["delivery_outcome"] == "failed"
+    assert row["delivery_message_ids"] is None
+    assert row["delivery_targets"] == ["telegram:fixture-chat"]
+    assert "gateway send crashed" in row["delivery_error"]
+
+
+def _slack_live_delivery(job, *, extra, opened_thread=None):
+    """Drive the real ``_deliver_result`` down the Slack live-adapter lane (mocked transport)."""
+    import asyncio
+    from concurrent.futures import Future
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from gateway.config import Platform
+
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    pconfig.extra = extra
+    config = MagicMock()
+    config.platforms = {Platform.SLACK: pconfig}
+    adapter = AsyncMock()
+    adapter.send.return_value = MagicMock(success=True, message_id="1790000000.000900", raw_response=None)
+    adapter.supports_inchannel_continuable = True
+    adapter.supports_inchannel_continuable_for_platform = None
+    adapter._session_store = MagicMock()
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def run_coro(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    class _Router:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def _deliver_to_platform(self, target, text, metadata, transport=None):
+            return {"success": True, "message_id": "1790000000.000900"}
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch("cron.scheduler_delivery._open_continuable_cron_thread", return_value=opened_thread), \
+         patch("cron.scheduler_delivery._seed_cron_channel_session", return_value=True), \
+         patch("asyncio.run_coroutine_threadsafe", side_effect=run_coro), \
+         patch("gateway.delivery.DeliveryRouter", _Router), \
+         patch("gateway.mirror.mirror_to_session", return_value=True):
+        error = scheduler._deliver_result(job, "Here is the brief.", adapters={Platform.SLACK: adapter}, loop=loop)
+    from cron.scheduler_delivery_receipts import run_delivery_receipt
+
+    return error, run_delivery_receipt(job)
+
+
+def test_opened_thread_names_the_target_like_its_message_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = {"id": "brief-job", "name": "Brief", "deliver": "origin", "attach_to_session": True,
+           "origin": {"platform": "slack", "chat_id": "C123", "user_id": "U_HUMAN"}}
+
+    error, receipt = _slack_live_delivery(job, extra={}, opened_thread="1790000000.000200")
+
+    assert error is None
+    assert receipt["delivery_targets"] == ["slack:C123:1790000000.000200"]
+    assert set(receipt["delivery_message_ids"]) == set(receipt["delivery_targets"])
+
+
+def test_in_channel_flat_post_names_the_target_like_its_message_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = {"id": "brief-job", "name": "Brief", "deliver": "origin", "attach_to_session": False,
+           "origin": {"platform": "slack", "chat_id": "C123", "user_id": "U_HUMAN",
+                      "thread_id": "1787188000.000100"}}
+
+    error, receipt = _slack_live_delivery(job, extra={"slack": {"cron_continuable_surface": "in_channel"}})
+
+    assert error is None
+    assert receipt["delivery_targets"] == ["slack:C123"]
+    assert set(receipt["delivery_message_ids"]) == {"slack:C123"}
+
+
+def test_lost_claim_after_delivery_keeps_the_receipt(monkeypatch, tmp_path):
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sent = {"_delivery_targets": ["telegram:42"], "_delivery_message_ids": {"telegram:42": ["m1"]}}
+    row = executions.create_execution("job-x", source="builtin")
+    d = scheduler._RunDelivery(job={"id": "job-x", **sent}, success=True, error=None,
+                               delivery_attempted=True, should_deliver=True)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *args, **kwargs: False)
+    monkeypatch.setattr(scheduler, "self_removal_delivery_allowed", lambda _job_id: False)
+
+    assert scheduler._finish_completed_run(d, "owner-1", row["id"]) is True
+    done = executions.get_execution(row["id"])
+    assert done["error"] == "Fire claim ownership lost before terminal completion."
+    assert done["delivery_message_ids"] == {"telegram:42": ["m1"]}
+
+    other = executions.create_execution("job-x", source="builtin")
+    scheduler._record_fire_ownership_lost({"id": "job-x", **sent}, None, other["id"])
+    discarded = executions.get_execution(other["id"])
+    assert discarded["error"] == "Fire claim ownership lost; stale result was discarded."
+    assert discarded["delivery_targets"] == ["telegram:42"]
+    assert discarded["delivery_message_ids"] == {"telegram:42": ["m1"]}
+
+
+def test_delivery_error_is_redacted(monkeypatch, tmp_path):
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    secret = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    row = executions.create_execution("job", source="builtin")
+    done = executions.finish_execution(
+        row["id"], success=True, delivery_outcome="failed",
+        delivery_error=f"POST https://bot:{secret}@hooks.example.test/send?token={secret} failed")
+
+    assert secret not in done["delivery_error"]
+    assert "hooks.example.test" in done["delivery_error"]
+
+
+def test_corrupt_receipt_columns_read_as_none(monkeypatch, tmp_path, capsys):
+    db = tmp_path / "cron" / "executions.db"
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", db)
+    row = executions.create_execution("job", source="builtin")
+    executions.finish_execution(row["id"], success=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE executions SET delivery_targets='{\"a\": 1}', delivery_message_ids='[1, 2]'"
+                     " WHERE id=?", (row["id"],))
+    record = executions.get_execution(row["id"])
+    assert record["delivery_targets"] is None and record["delivery_message_ids"] is None
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE executions SET delivery_message_ids='{\"slack:C1\": 7}' WHERE id=?", (row["id"],))
+    from hermes_cli.cron import cron_runs
+
+    cron_runs("job")
+    assert "message ids: slack:C1=7" in capsys.readouterr().out
+
+
+def test_prompt_carries_this_runs_execution_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from cron.scheduler_prompt import _build_job_prompt
+
+    job = {"id": "abc123", "name": "ids", "prompt": "check the inbox"}
+    assert "execution_id" not in _build_job_prompt(dict(job))
+    prompt = _build_job_prompt({**job, "execution_id": "001a1ac08a6e23e3e2de964db4171b95"})
+    assert "[Cron run: job_id abc123, execution_id 001a1ac08a6e23e3e2de964db4171b95]" in prompt
+    assert prompt.endswith("check the inbox")
+
+
 def test_failed_delivery_records_target_and_error(tmp_path, monkeypatch):
     _telegram_fixture(tmp_path, monkeypatch, fail_send=True)
     job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:fixture-chat")

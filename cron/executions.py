@@ -111,20 +111,22 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         yield conn
 
 
-# Columns stored as JSON text; decoded on read so callers see lists/dicts (None when absent).
-_JSON_COLUMNS = ("delivery_targets", "delivery_message_ids")
+# Columns stored as JSON text, with the type each must decode to; anything else reads as None.
+_JSON_COLUMNS = {"delivery_targets": list, "delivery_message_ids": dict}
 DELIVERY_ERROR_MAX_CHARS = 500
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
     record = dict(row)
-    for column in _JSON_COLUMNS:
+    for column, kind in _JSON_COLUMNS.items():
         raw = record.get(column)
-        if isinstance(raw, str):
-            try:
-                record[column] = json.loads(raw)
-            except ValueError:
-                record[column] = None
+        if raw is None:
+            continue
+        try:
+            decoded = json.loads(raw) if isinstance(raw, str) else None
+        except ValueError:
+            decoded = None
+        record[column] = decoded if isinstance(decoded, kind) else None
     return record
 
 
@@ -359,7 +361,12 @@ def finish_execution(
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
-    delivery_detail = str(delivery_error)[:DELIVERY_ERROR_MAX_CHARS] if delivery_error else None
+    delivery_detail = None
+    if delivery_error:
+        from agent.redact import redact_sensitive_text
+
+        delivery_detail = redact_sensitive_text(
+            str(delivery_error), force=True, redact_url_credentials=True)[:DELIVERY_ERROR_MAX_CHARS]
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions

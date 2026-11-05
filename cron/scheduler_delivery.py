@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from cron.scheduler_delivery_outbound import _open_continuable_cron_thread, authorize_cron_send
-from cron.scheduler_delivery_receipts import (
-    _begin_delivery_receipt, _note_delivered_message_ids, _record_delivery_verification)
+from cron.scheduler_delivery_receipts import (_adopt_queued_receipt, _begin_delivery_receipt,
+    _note_actual_target, _note_delivered_message_ids, _record_delivery_verification)
 
 
 # Log-record parity with the origin module.
@@ -1947,8 +1947,7 @@ def _deliver_result(
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
-        # The gateway's send recorded this run's message ids on the job; keep them for the receipt.
-        job["_delivery_message_ids"] = dict(refreshed.get("last_delivery_message_ids") or {})
+        _adopt_queued_receipt(job, delivery_status)  # this send's own receipt, never the job record's
         return error
 
     from gateway.config import load_gateway_config
@@ -2046,6 +2045,7 @@ def _deliver_result(
             job, target, adapters=adapters, loop=loop, config=config,
             notify_delivery=notify_delivery,
             mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
+        _note_actual_target(job, target, t)
         if t is None:
             continue
         # Outbound policy before either lane. A refusal is a delivery error for this target only.
