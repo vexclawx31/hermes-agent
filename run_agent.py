@@ -106,7 +106,7 @@ from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool_lifecycle import cleanup_browser
 from tools.connectors.turn import agent_connection_surface, scoped_connection_surface
 
-from agent.memory_provider import is_trivial_prompt
+from agent.memory_provider import is_trivial_prompt, recall_query_text
 from agent.client_lifecycle import ClientLifecycleMixin
 from agent.stream_delivery import StreamDeliveryMixin
 from agent.status_output import StatusOutputMixin
@@ -918,8 +918,9 @@ class AIAgent(
                 sync_kwargs["turn_author"] = turn_author
             self._memory_manager.sync_all(user_text, response_text, **sync_kwargs)
             # Sibling of the build_turn_context() prefetch gate: don't key recall on zero-signal prompts.
-            if not is_trivial_prompt(user_text):
-                self._memory_manager.queue_prefetch_all(user_text, session_id=self.session_id or "")
+            recall_query = recall_query_text(user_text)
+            if not is_trivial_prompt(recall_query):
+                self._memory_manager.queue_prefetch_all(recall_query, session_id=self.session_id or "")
         except Exception:
             pass
 

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
-from agent.memory_provider import is_trivial_prompt
+from agent.memory_provider import is_trivial_prompt, recall_query_text
 from agent.message_content import flatten_message_text
 from agent.plugin_live_notes import pop_plugin_notices
 from agent.skills_index_delta import stage_skills_index_note
@@ -922,9 +922,10 @@ def _memory_turn_start_and_prefetch(
             author_is_bot=bool(_author.get("is_bot")),
         )
     ext_prefetch_cache = ""
+    _recall_query = recall_query_text(_query)
     with suppress(Exception):
-        if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+        if not is_trivial_prompt(_recall_query):
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(_recall_query, session_id=agent.session_id) or ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
