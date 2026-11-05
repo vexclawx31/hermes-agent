@@ -1680,9 +1680,8 @@ def _cron_tick_profile_homes(config: object) -> list[tuple[str, Path]]:
     from hermes_cli.profiles import get_active_profile_name, get_profile_dir, profile_is_standalone
 
     active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
-    launch_home = get_process_hermes_home()  # never a per-turn override
-    if profile_is_standalone(launch_home):  # serves only its own home: tick only it (r21 cold boot)
-        return [(active, Path(launch_home))]
+    if profile_is_standalone(get_process_hermes_home()):  # serves only its launch home (r21 cold boot)
+        return [(active, get_process_hermes_home())]
     homes = _multiplex_profile_homes(config)
     if any(name == active for name, _home in homes):
         return homes
@@ -5436,8 +5435,7 @@ def _owner_is_standalone() -> bool:
         owner = host_gateway()
         if owner is None or owner.pid == os.getpid():
             return False
-        # A live record or identify that already said multiplex:false needs no rescan.
-        answered = owner if owner.standalone else request_serve_profile(
+        answered = owner if owner.standalone else request_serve_profile(  # multiplex:false: no rescan
             profile_name_for_home(get_hermes_home()), owner=owner)
         return bool(answered is not None and answered.standalone)
     except Exception:
