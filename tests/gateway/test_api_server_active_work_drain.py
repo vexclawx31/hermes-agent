@@ -128,13 +128,20 @@ class TestDrainWaitsForApiWork:
         task_started = asyncio.Event()
         allow_task = asyncio.Event()
 
-        def delayed_create_task(coro):
+        def delayed_create_task(coro, **kwargs):
+            # The patch replaces asyncio.create_task for every caller. aiohttp >= 3.14.5 starts
+            # its own request handler through it (eager_start=True); delaying that one would
+            # stall the request itself, so only the gateway's run task is held back.
+            frame = getattr(coro, "cr_frame", None)
+            if frame is None or not frame.f_globals.get("__name__", "").startswith("gateway."):
+                return original_create_task(coro, **kwargs)
+
             async def delayed():
                 task_started.set()
                 await allow_task.wait()
                 return await coro
 
-            return original_create_task(delayed())
+            return original_create_task(delayed(), **kwargs)
 
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "done"}
