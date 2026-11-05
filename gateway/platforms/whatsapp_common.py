@@ -397,10 +397,182 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         return result
 
 
-def resolve_whatsapp_bridge_dir() -> Path:
-    """Bridge directory for CLI and adapter. A read-only install tree (e.g. Docker
-    /opt/hermes) is mirrored to HERMES_HOME so npm install works."""
+# Runtime artefacts that never take part in the bridge content hash or the refresh copy.
+_BRIDGE_SKIP_DIRS = frozenset({"node_modules", ".git", "__pycache__"})
+# "<tree hash> <deps hash>" of the release the HERMES_HOME copy was made from; bridge.js reports the
+# tree hash as /health ``treeHash``.
+_BRIDGE_MARKER = ".hermes-release-hash"
+_BRIDGE_SKIP_FILES = frozenset({".write_test", ".DS_Store", _BRIDGE_MARKER})
+_BRIDGE_DEP_FILES = ("package.json", "package-lock.json")
+_HASH16 = re.compile(r"[0-9a-f]{16}")
+
+
+def _bridge_tree_hash(root: Path) -> str:
+    """Deterministic SHA-256 (first 16 hex) over relative paths + bytes of the bridge files,
+    skipping node_modules and runtime artefacts. Symlinks are refused (copytree would follow them)."""
+    import hashlib
+    if not root.is_dir():
+        raise FileNotFoundError(f"bridge directory missing: {root}")
+    digest = hashlib.sha256()
+
+    def _raise(err: OSError) -> None:
+        raise err
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
+        dirnames[:] = sorted(d for d in dirnames if d not in _BRIDGE_SKIP_DIRS)
+        for name in (*dirnames, *sorted(f for f in filenames if f not in _BRIDGE_SKIP_FILES)):
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                raise OSError(f"symlink in WhatsApp bridge tree: {path}")
+            if name in dirnames:
+                continue
+            digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+            digest.update(path.read_bytes() + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _bridge_deps_hash(root: Path) -> str:
+    """Fingerprint of the files npm installs from (package.json + lockfile; a missing file counts)."""
+    import hashlib
+    digest = hashlib.sha256()
+    for name in _BRIDGE_DEP_FILES:
+        path = root / name
+        digest.update(name.encode() + b"\0" + (path.read_bytes() if path.exists() else b"\x01missing") + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _read_bridge_marker(bridge: Path) -> tuple[str, str]:
+    """``(tree_hash, deps_hash)`` from the copy's marker; ``("", "")`` when missing, unreadable or corrupt."""
+    try:
+        tokens = (bridge / _BRIDGE_MARKER).read_text(encoding="utf-8-sig").split()
+    except (OSError, ValueError):  # ValueError: UnicodeDecodeError on a corrupt marker
+        return "", ""
+    if len(tokens) == 2 and all(_HASH16.fullmatch(t) for t in tokens):
+        return tokens[0], tokens[1]
+    return "", ""
+
+
+def whatsapp_bridge_marker_hash(bridge_dir: Path) -> str:
+    """Release tree hash recorded in a HERMES_HOME bridge copy ("" for an in-place tree or no marker)."""
+    return _read_bridge_marker(bridge_dir)[0]
+
+
+def _write_bridge_marker(bridge: Path, tree_hash: str, deps_hash: str) -> None:
+    (bridge / _BRIDGE_MARKER).write_text(f"{tree_hash} {deps_hash}\n", encoding="utf-8")
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    """Both missing, or both present with identical bytes."""
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except FileNotFoundError:
+        return not a.exists() and not b.exists()
+
+
+def _bridge_leftovers(copy: Path) -> list[Path]:
+    """Sibling temp dirs of a refresh (``.<name>.new-*`` being built, ``.<name>.old-*`` swapped out)."""
+    return sorted((*copy.parent.glob(f".{copy.name}.new-*"), *copy.parent.glob(f".{copy.name}.old-*")))
+
+
+def _recover_interrupted_refresh(copy: Path) -> None:
+    """Undo a refresh killed mid-way (caller holds the lock): put a swapped-out copy back, return
+    node_modules it had moved into the new tree, then drop the leftovers."""
     import shutil
+    olds = sorted(copy.parent.glob(f".{copy.name}.old-*"))
+    if not copy.exists() and len(olds) == 1:
+        os.replace(olds[0], copy)
+        logger.warning("[whatsapp] restored bridge copy %s after an interrupted refresh", copy)
+    if copy.is_dir() and not (copy / "node_modules").exists():
+        donor = next((d for d in copy.parent.glob(f".{copy.name}.new-*") if (d / "node_modules").is_dir()), None)
+        if donor is not None:
+            os.replace(donor / "node_modules", copy / "node_modules")
+    for stale in _bridge_leftovers(copy):
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def _refresh_whatsapp_bridge_copy(install_bridge: Path, copy: Path, release_hash: str, deps_hash: str,
+                                  keep_modules: bool) -> None:
+    """Replace ``copy`` with a fresh mirror of ``install_bridge``: build a sibling temp dir, then swap
+    it in by rename. ``keep_modules`` moves the copy's node_modules over; otherwise the new copy has
+    none, so the existing npm install paths run."""
+    import shutil
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix=f".{copy.name}.new-", dir=copy.parent))
+    old = tmp.with_name(tmp.name.replace(".new-", ".old-", 1))
+    moved_modules = False
+    try:
+        shutil.copytree(install_bridge, tmp, dirs_exist_ok=True, ignore=lambda _d, names: [
+            n for n in names if n in _BRIDGE_SKIP_DIRS or n in _BRIDGE_SKIP_FILES])
+        _write_bridge_marker(tmp, release_hash, deps_hash)
+        if keep_modules and (copy / "node_modules").is_dir():
+            os.replace(copy / "node_modules", tmp / "node_modules")
+            moved_modules = True
+        if copy.exists():
+            os.replace(copy, old)
+        try:
+            os.replace(tmp, copy)
+        except OSError:
+            if old.exists():
+                os.replace(old, copy)  # roll back to the previous copy
+            raise
+    except BaseException:
+        if moved_modules and copy.exists() and not (copy / "node_modules").exists():
+            os.replace(tmp / "node_modules", copy / "node_modules")
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def _sync_whatsapp_bridge_copy(install_bridge: Path, copy: Path, *, refresh: bool = True) -> None:
+    """Create ``copy`` if missing and, with ``refresh``, make it match the release bridge.
+
+    Cheap path: no refresh leftovers and (refresh) the marker names the release hash, or (no refresh)
+    the copy exists. Otherwise, under a file lock: recover an interrupted refresh, re-check, hash the
+    copy itself (a missing or wrong marker on an identical copy only rewrites the marker) and refresh
+    when the content differs. node_modules is kept when the release's dependency fingerprint equals the
+    one recorded at the last refresh; a copy without a marker keeps it when package.json is unchanged
+    and leaves the decision to the deps stamp (``node_modules/.hermes-pkg-hash``)."""
+    import time
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+    release_hash = _bridge_tree_hash(install_bridge) if refresh else ""
+    if not _bridge_leftovers(copy) and (
+            _read_bridge_marker(copy)[0] == release_hash if refresh else copy.is_dir()):
+        return
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    with open(copy.parent / f".{copy.name}.lock", "a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + 60
+        while not _try_acquire_file_lock(handle):
+            if time.monotonic() > deadline:
+                logger.warning("[whatsapp] bridge copy %s is locked by another process; not refreshing it", copy)
+                return
+            time.sleep(0.1)
+        try:
+            _recover_interrupted_refresh(copy)
+            if not refresh and copy.is_dir():
+                return  # read-only callers never replace an existing copy
+            release_hash = release_hash or _bridge_tree_hash(install_bridge)
+            deps_hash = _bridge_deps_hash(install_bridge)
+            old_tree, old_deps = _read_bridge_marker(copy)
+            if old_tree == release_hash:
+                return  # another process refreshed it while we waited
+            old_hash = _bridge_tree_hash(copy) if copy.is_dir() else ""  # "" = no copy yet
+            if old_hash == release_hash:
+                _write_bridge_marker(copy, release_hash, deps_hash)
+                return
+            keep = old_deps == deps_hash if old_deps else _same_bytes(install_bridge / "package.json", copy / "package.json")
+            _refresh_whatsapp_bridge_copy(install_bridge, copy, release_hash, deps_hash, keep)
+            if old_hash:
+                logger.info("[whatsapp] refreshed bridge copy %s from the release (%s -> %s)", copy, old_hash, release_hash)
+        finally:
+            _release_file_lock(handle)
+
+
+def resolve_whatsapp_bridge_dir(refresh: bool = False) -> Path:
+    """Bridge directory for CLI and adapter. A read-only install tree (e.g. Docker
+    /opt/hermes) is mirrored to HERMES_HOME so npm install works. Only the adapter at gateway
+    start passes ``refresh=True`` to bring the mirror up to date with the release; doctor, setup
+    and the pairing route only create a missing mirror, so they never swap a running gateway's
+    bridge or race its npm install (see ``_sync_whatsapp_bridge_copy``)."""
     from hermes_constants import get_hermes_home
     install_bridge = Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
     hermes_home_bridge = get_hermes_home() / "scripts" / "whatsapp-bridge"
@@ -410,11 +582,11 @@ def resolve_whatsapp_bridge_dir() -> Path:
         return install_bridge
     except OSError:
         pass
-    if hermes_home_bridge.exists():
-        return hermes_home_bridge
     try:
-        hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(install_bridge, hermes_home_bridge, dirs_exist_ok=False)
+        _sync_whatsapp_bridge_copy(install_bridge, hermes_home_bridge, refresh=refresh)
         return hermes_home_bridge
-    except Exception:
+    except OSError as exc:  # shutil.Error is an OSError too
+        if hermes_home_bridge.is_dir():
+            logger.warning("[whatsapp] could not refresh bridge copy %s (%s); using it as is", hermes_home_bridge, exc)
+            return hermes_home_bridge
         return install_bridge

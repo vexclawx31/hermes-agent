@@ -277,3 +277,51 @@ class TestCacheDirEnvPassthrough:
         assert env["HERMES_AUDIO_CACHE_DIR"] == str(get_audio_cache_dir())
         assert env["HERMES_DOCUMENT_CACHE_DIR"] == str(get_document_cache_dir())
         assert env["WHATSAPP_SEND_READ_RECEIPTS"] == "true"
+
+
+class TestReleaseTreeHandshake:
+    """A HERMES_HOME copy's marker covers every bridge file: a surviving bridge whose bridge.js is
+    unchanged but whose helper modules changed (``treeHash`` differs) is restarted, not adopted."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("running_tree,adopted", [
+        ("aaaaaaaaaaaaaaaa", True), ("bbbbbbbbbbbbbbbb", False), ("", False)],
+        ids=["same-tree", "helper-changed", "pre-marker-bridge"])
+    async def test_reuse_requires_matching_tree_hash(self, tmp_path, running_tree, adopted):
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        (bridge_dir / ".hermes-release-hash").write_text("aaaaaaaaaaaaaaaa cccccccccccccccc\n", encoding="utf-8")
+        adapter = _make_adapter(bridge_script=str(bridge_dir / "bridge.js"), session_path=tmp_path / "session")
+        mock_client = _mock_health({
+            "status": "connected",
+            "scriptHash": _file_content_hash(bridge_dir / "bridge.js"),
+            "treeHash": running_tree,
+            "sendReadReceipts": False,
+            "session": str(tmp_path / "session"),
+        })
+
+        with patch("aiohttp.ClientSession", mock_client), \
+             patch.object(adapter, "_mark_connected", create=True), \
+             patch.object(adapter, "_attach_to_bridge"), \
+             patch.object(adapter, "_wire_plugin_handlers", create=True):
+            assert await adapter._reuse_running_bridge(bridge_dir / "bridge.js") is adopted
+
+    @pytest.mark.asyncio
+    async def test_in_place_tree_without_marker_keeps_script_hash_check(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        adapter = _make_adapter(bridge_script=str(bridge_dir / "bridge.js"), session_path=tmp_path / "session")
+        mock_client = _mock_health({
+            "status": "connected",
+            "scriptHash": _file_content_hash(bridge_dir / "bridge.js"),
+            "sendReadReceipts": False,
+            "session": str(tmp_path / "session"),
+        })
+
+        with patch("aiohttp.ClientSession", mock_client), \
+             patch.object(adapter, "_mark_connected", create=True), \
+             patch.object(adapter, "_attach_to_bridge"), \
+             patch.object(adapter, "_wire_plugin_handlers", create=True):
+            assert await adapter._reuse_running_bridge(bridge_dir / "bridge.js") is True

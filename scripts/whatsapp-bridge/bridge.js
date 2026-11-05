@@ -127,6 +127,14 @@ try {
     .digest('hex')
     .slice(0, 16);
 } catch {}
+// Release tree hash of a HERMES_HOME bridge copy (first token of the marker the Python side writes
+// on refresh). Covers every bridge file, so a change to a helper module is caught too. Empty when
+// running in place from the install tree.
+let TREE_HASH = '';
+try {
+  TREE_HASH = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '.hermes-release-hash'), 'utf8')
+    .trim().split(/\s+/)[0] || '';
+} catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
@@ -1253,6 +1261,7 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    treeHash: TREE_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
     // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
     session: path.resolve(SESSION_DIR),
