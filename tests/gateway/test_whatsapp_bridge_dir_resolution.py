@@ -393,18 +393,16 @@ def test_resolver_keeps_existing_copy_when_refresh_fails(tmp_path, monkeypatch):
 # --- sealed (read-only) releases: the mirror inherits their modes (r21 follow-up) -------------------
 
 def _seal(root: Path) -> None:
-    """Make a tree read-only like a sealed release: dirs r-x, files r--, leaving node_modules alone."""
+    """Make a tree read-only like a sealed release, node_modules included: a mirror made before #46 copied
+    the release's modes into every directory (field: dr-xr-xr-x down into node_modules)."""
     for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-        if "node_modules" in path.relative_to(root).parts:
-            continue
         path.chmod(0o555 if path.is_dir() else 0o444)
     root.chmod(0o555)
 
 
 def _owner_writable(root: Path) -> bool:
     import stat
-    return all(p.stat().st_mode & stat.S_IWUSR for p in [root, *root.rglob("*")]
-               if "node_modules" not in p.relative_to(root).parts)
+    return all(p.stat().st_mode & stat.S_IWUSR for p in [root, *root.rglob("*")])
 
 
 @pytest.fixture
@@ -436,6 +434,23 @@ def test_read_only_copy_of_a_sealed_release_is_refreshed(tmp_path, unseal):
     assert (copy / "node_modules" / ".hermes-pkg-hash").read_text() == "stamp"  # deps carried over
     assert _owner_writable(copy), "the mirror is the home's working copy: npm and the next refresh write in it"
     assert _siblings(copy) == ["whatsapp-bridge"]  # the old copy was removed, not left as .old-*
+
+
+@root_bypasses_modes
+def test_read_only_copy_with_changed_deps_leaves_no_leftover(tmp_path, unseal):
+    """Deps changed: node_modules isn't moved over, so the old copy (with its read-only node_modules) must
+    still be removable after the swap, or a .old-* leftover sends every later start down the slow path."""
+    release = _release(tmp_path)
+    copy = _copy_of(release, tmp_path / "home" / "scripts" / "whatsapp-bridge", bridge_js="// v1\n")
+    (copy / "package.json").write_text('{"name": "whatsapp-bridge", "old": true}\n')
+    _seal(release)
+    _seal(copy)
+
+    whatsapp_common._sync_whatsapp_bridge_copy(release, copy)
+
+    assert (copy / "bridge.js").read_text() == "// v2\n"
+    assert not (copy / "node_modules").exists()  # the existing npm install path runs
+    assert _siblings(copy) == ["whatsapp-bridge"]
 
 
 @root_bypasses_modes

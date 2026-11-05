@@ -466,8 +466,10 @@ def _make_owner_writable(root: Path) -> None:
 
     ``copytree`` copies a sealed release's read-only modes into the mirror (dirs r-x, files r--). The
     mirror is this home's own working copy, written by npm install, the marker and the refresh swap
-    (on macOS renaming a directory needs write access to it), so it must stay owner-writable. Entries
-    owned by another user are left alone; node_modules is npm's and is skipped."""
+    (renaming a directory to another parent needs write access to it), so it must stay owner-writable.
+    That includes node_modules: a mirror made before #46 copied the release's sealed node_modules too, and a
+    read-only one can't be moved into the new tree, emptied by rmtree, or installed into by npm. Entries
+    owned by another user are left alone and not walked into."""
     import stat
     uid = os.getuid() if hasattr(os, "getuid") else None
     stack = [root]
@@ -481,9 +483,15 @@ def _make_owner_writable(root: Path) -> None:
             continue
         want = stat.S_IRWXU if stat.S_ISDIR(st.st_mode) else stat.S_IRUSR | stat.S_IWUSR
         if st.st_mode & want != want:
-            os.chmod(path, stat.S_IMODE(st.st_mode) | want, follow_symlinks=False)
+            # lstat above already excluded links; follow_symlinks=False only where the platform supports it
+            # (Linux without lchmod raises NotImplementedError, which is not an OSError).
+            os.chmod(path, stat.S_IMODE(st.st_mode) | want,
+                     **({"follow_symlinks": False} if os.chmod in os.supports_follow_symlinks else {}))
         if stat.S_ISDIR(st.st_mode):
-            stack.extend(child for child in path.iterdir() if child.name != "node_modules")
+            try:
+                stack.extend(path.iterdir())
+            except FileNotFoundError:
+                continue
 
 
 def _same_bytes(a: Path, b: Path) -> bool:
@@ -547,7 +555,10 @@ def _refresh_whatsapp_bridge_copy(install_bridge: Path, copy: Path, release_hash
     except BaseException:
         if moved_modules and copy.exists() and not (copy / "node_modules").exists():
             os.replace(tmp / "node_modules", copy / "node_modules")
-        _make_owner_writable(tmp)
+        try:
+            _make_owner_writable(tmp)
+        except OSError:
+            pass  # best effort: the next start's recovery removes the leftover; keep the original error
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     shutil.rmtree(old, ignore_errors=True)
