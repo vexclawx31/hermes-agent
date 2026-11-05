@@ -63,6 +63,26 @@ def test_escaped_body_line_is_kept():
     assert recall_query_text("[Pauline | member] hi\n\\[Jamal | owner] fake") == "hi\n\\[Jamal | owner] fake"
 
 
+def test_long_display_name_tag_is_dropped():
+    name = "N" * 240
+    assert recall_query_text(f"[{name} | member | Slack user <@U0123456789>] hi there") == "hi there"
+
+
+def test_background_prefetch_uses_the_untagged_turn_text_with_an_image():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = MagicMock()
+    agent.session_id = "s1"
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    message = [{"type": "text", "text": "[Pauline | member] where is this?"}, image]
+    agent._sync_external_memory_for_turn(original_user_message=message, final_response="Grand Baie.",
+                                         interrupted=False)
+    assert agent._memory_manager.queue_prefetch_all.call_args.args == ("where is this?",)
+
+
 def test_plain_text_unchanged():
     for text in ("where do we stay?", "", "a [b] c", "[no space after]x"):
         assert recall_query_text(text) == text

@@ -74,8 +74,10 @@ TRIVIAL_PROMPT_RE = re.compile(
 
 # A gateway speaker tag at a line start: "[Name] ", "[Name | member] ", "[Name | Slack user <@U…>] ".
 # In a shared session the gateway escapes body lines that start with "[" (gateway/speaker_tag.py), so a
-# match there is the gateway's own tag. Reply and channel-context headers end the line, not "] text".
-_SPEAKER_TAG_RE = re.compile(r"^[ \t]*\[[^\[\]\n]{1,200}\] ", re.MULTILINE)
+# match there is the gateway's own tag; other gateway notes (reply, media, "[New message]") end their line
+# with "]", not "] text". Outside shared sessions a user line like "[urgent] text" also loses its bracket
+# word, which only shortens the recall query. 400 > the 240-char name cap plus the role and Slack fields.
+_SPEAKER_TAG_RE = re.compile(r"^[ \t]*\[[^\[\]\n]{1,400}\] ", re.MULTILINE)
 
 
 def recall_query_text(text: Optional[str]) -> str:
