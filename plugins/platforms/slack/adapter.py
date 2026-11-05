@@ -6063,7 +6063,7 @@ class SlackAdapter(BasePlatformAdapter):
         embedded newline could forge a "## SYSTEM" heading — so both collapse to one inert line."""
         # Local import: don't force gateway.session at module load.
         from gateway.session import neutralize_untrusted_inline_text
-        from gateway.speaker_tag import escape_speaker_tag_lines, safe_speaker_name
+        from gateway.speaker_tag import safe_speaker_name
         is_bot = self._event_declares_bot_sender(msg)
         msg_user = msg.get("user", "")
         msg_team = msg.get("team") or team_id  # our own bot for this message's workspace
@@ -6072,8 +6072,8 @@ class SlackAdapter(BasePlatformAdapter):
         ) or self._bot_user_id
         is_self_bot_reply = is_bot and not is_parent and self_bot_uid and msg_user == self_bot_uid
         prefix = "[thread parent] " if is_parent else "[assistant] " if is_self_bot_reply else ""
-        if is_self_bot_reply:  # may quote others' text: its lines must not pose as a speaker tag
-            return f"{prefix}{escape_speaker_tag_lines(msg_text)}"
+        if is_self_bot_reply:  # may quote others' lines: one inert line, like a human body
+            return f"{prefix}{neutralize_untrusted_inline_text(msg_text, max_chars=0)}"
         display_user = msg_user or "unknown"
         if is_bot and not display_user:
             display_user = msg.get("username") or "bot"
