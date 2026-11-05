@@ -225,8 +225,10 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
     while True:
         identity = _identify(home)
         if _identity_matches(identity, record, home):
-            return HostGateway(record.pid, home, _served_from_identity(identity),
-                               standalone=recorded_standalone or identity.get("multiplex") is False)
+            # A live answer is the better evidence: its own mode wins over the record's flag.
+            live_mode = identity.get("multiplex")
+            standalone = live_mode is False if isinstance(live_mode, bool) else recorded_standalone
+            return HostGateway(record.pid, home, _served_from_identity(identity), standalone=standalone)
         if recorded_standalone or time.monotonic() >= deadline:
             break
         time.sleep(_CHANNEL_POLL_S)
@@ -376,6 +378,8 @@ def standalone_attach_decision(our_home: Path, owner: Optional[HostGateway]) -> 
         return None
     profile = profile_name_for_home(our_home)
     for peer in _coexisting_gateways(owner):
+        if _same_home(peer.home, our_home):
+            continue  # our own earlier instance: the per-home PID lock and --replace decide that
         if peer.served_known and not peer.standalone and peer.serves(profile):
             return HostAttachDecision(REFUSE, standalone_rescan_message(profile), peer, transient=True)
     logger.info("Profile '%s' is standalone by config; starting beside any other gateway", profile)
@@ -400,7 +404,7 @@ def decide(our_home: Path, *, replace: bool = False) -> HostAttachDecision:
     standalone = standalone_attach_decision(our_home, gateway)
     if standalone is not None:
         return standalone
-    if gateway.standalone and not _same_home(gateway.home, our_home):
+    if gateway.standalone and not gateway.serves(profile) and not _same_home(gateway.home, our_home):
         # The owner published (or answered) multiplex:false: another profile's standalone gateway.
         # It can never serve us, so asking it to rescan, waiting for its socket, or --replace-ing it
         # (refused for another profile's owner) would only delay or strand this start.
@@ -422,7 +426,7 @@ def decide(our_home: Path, *, replace: bool = False) -> HostAttachDecision:
         if waited is None:
             return HostAttachDecision(START, "")
         gateway = waited
-        if gateway.standalone and not _same_home(gateway.home, our_home):
+        if gateway.standalone and not gateway.serves(profile) and not _same_home(gateway.home, our_home):
             return HostAttachDecision(START, "", gateway)
         if gateway.serves(profile):
             return HostAttachDecision(ATTACH, attach_message(gateway, profile), gateway, transient=True)

@@ -60,6 +60,10 @@ _CHILD = textwrap.dedent('''
             else:
                 result["claim"] = "refused"
             result["seconds"] = round(time.monotonic() - started, 2)
+            from gateway import host_rendezvous as hr
+            result["owns_host_lock"] = hr.owns_host_lock(hr.ROLE_GATEWAY)
+            record = hr.read_record(hr.ROLE_GATEWAY, include_stale=True)
+            result["record"] = record.to_json() if record is not None else None
     except SystemExit as exc:
         result["claim"] = f"exit {exc.code}"
     out.write_text(json.dumps(result))
@@ -128,11 +132,12 @@ def test_standalone_profiles_cold_starting_together_all_start(tmp_path, names):
         assert result.get("claim") == "started", (name, result)
         assert result["seconds"] < host_attach.ATTACH_CHANNEL_WAIT_S, (name, result, "nobody waits")
     # Exactly one won the host lock, and its record says it cannot multiplex.
-    record = json.loads((tmp_path / "locks" / "gateway.json").read_text()) if (
-        tmp_path / "locks" / "gateway.json").exists() else None
-    if record is not None:
-        assert record["multiplex"] is False
-        assert record["pid"] in {r["pid"] for r in results.values()}
+    owners = [r for r in results.values() if r.get("owns_host_lock")]
+    assert len(owners) == 1, results
+    for result in results.values():  # everyone reads the same record: the owner's
+        assert result["record"] is not None, result
+        assert result["record"]["pid"] == owners[0]["pid"], results
+        assert result["record"]["multiplex"] is False, result
 
 
 def _outputs(children) -> str:
@@ -190,6 +195,24 @@ def test_every_record_write_carries_the_standalone_flag(fleet, monkeypatch, whic
     assert hr.publish_record(hr.ROLE_SERVE, profiles=(), home=str(home)).multiplex is None
 
 
+def test_a_multiplexing_process_never_publishes_false(fleet, monkeypatch):
+    """Config flipped to standalone while a multiplexer keeps running: its republish stays unknown."""
+    from agent import secret_scope
+
+    monkeypatch.setenv("HERMES_HOME", str(fleet.solo))
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: True)
+    assert hr.publish_record(hr.ROLE_GATEWAY, profiles=("solo", "member"), home=str(fleet.solo)).multiplex is None
+
+
+def test_identify_reports_the_live_mode(monkeypatch):
+    from agent import secret_scope
+    from gateway import control_socket
+
+    for active in (True, False):
+        monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda active=active: active)
+        assert control_socket.build_identify_payload()["multiplex"] is active
+
+
 def test_refresh_host_gateway_record_keeps_multiplex_false(fleet, monkeypatch):
     from gateway import run
 
@@ -236,6 +259,31 @@ def test_member_profile_starts_beside_a_standalone_owner_without_rescan(fleet, m
                         lambda *a, **kw: pytest.fail("no rescan of a standalone owner"))
     decision = host_attach.decide(fleet.member, replace=replace)
     assert decision.outcome == host_attach.START, "never REPLACE_HOST another profile's standalone owner"
+
+
+def test_a_live_multiplexer_answer_beats_a_stale_false_record(fleet, monkeypatch):
+    """Record says multiplex:false, but the live owner answers that it multiplexes and serves member."""
+    record = _live_standalone_record(monkeypatch, fleet.solo)
+    identity = {"pid": record.pid, "hermes_home": str(fleet.solo), "profile": "solo",
+                "multiplex": True, "served_profiles": ["solo", "member"]}
+    monkeypatch.setattr(host_attach, "_identify", lambda h: identity)
+    monkeypatch.setattr(host_attach, "_identity_matches", lambda ident, rec, home: ident is identity)
+    owner = host_attach.host_gateway()
+    assert owner is not None and not owner.standalone and owner.serves("member")
+    assert host_attach.decide(fleet.member).outcome == host_attach.ATTACH
+
+
+def test_a_standalone_restart_is_not_refused_by_its_own_old_instance(fleet, monkeypatch):
+    """`gateway run --replace` (or launchd with an orphan): the live peer IS this home's old process."""
+    from gateway import status
+
+    old_pid = os.getpid() + 7
+    monkeypatch.setattr(status, "live_gateway_pid_for_home",
+                        lambda h: old_pid if Path(h) == fleet.solo else None)
+    old = {"pid": old_pid, "hermes_home": str(fleet.solo), "profile": "solo", "multiplex": False}
+    monkeypatch.setattr(host_attach, "_identify", lambda h: old if Path(h) == fleet.solo else None)
+    monkeypatch.setattr(host_attach, "host_gateway", lambda **kw: None)
+    assert host_attach.decide(fleet.solo, replace=True).outcome == host_attach.START
 
 
 def test_owner_is_standalone_answers_from_the_record_without_rescan(fleet, monkeypatch):

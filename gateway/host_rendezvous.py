@@ -606,14 +606,19 @@ def publish_record(
 
 
 def own_multiplex_flag(home: str = "") -> Optional[bool]:
-    """``False`` when this gateway's launch home is ``gateway.standalone`` by config, else ``None``.
+    """``False`` when this gateway is standalone, else ``None`` (unknown).
 
-    Config is the only thing known at claim time, and a standalone profile never multiplexes
-    (``standalone_launcher_decision``), so ``False`` is safe to publish before the runner settles.
-    Anything else stays UNKNOWN until a live ``identify`` answers.
+    Both must hold: the launch home is ``gateway.standalone`` by config AND this process does not
+    multiplex. The runner settles the mode (``set_multiplex_active``) before the PID/host claim, so
+    the claim already sees it; a multiplexer whose config was flipped to standalone without a
+    restart keeps multiplexing, and must not advertise ``false`` on its next republish.
     """
     try:
+        from agent.secret_scope import is_multiplex_active
         from hermes_cli.profiles import profile_is_standalone
+
+        if is_multiplex_active():
+            return None
 
         if not home:
             from hermes_constants import get_hermes_home
