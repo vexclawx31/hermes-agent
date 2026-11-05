@@ -81,9 +81,17 @@ scheduled run, against the stored job: the skills and delivery checks below, too
 runs never get (`messaging`, `clarify`, `cronjob` unless `cron.allow_agent_scheduling`, and `agent.disabled_toolsets`),
 and the plugins' own permission checks through the `cron_job_preflight` hook. Problems come back as `wont_work`
 (plain sentences) plus a `tell_requester` instruction, so the agent tells the person right away instead of the first
-run failing quietly. Each check fails open. Updates through the tool also record `last_edited_by` (the editing
-session's platform and user, `cron` from inside a scheduled run, `local` with no session), so a plugin that trusts a
-job because of who created it can tell when someone else changed it.
+run failing quietly. Each check fails open.
+
+**Who changed it.** Every edit and every manual `run` through the `cronjob` tool records `last_changed_by`: the bound
+session's platform and user, `cron` from inside a scheduled run, or `local` with no bound session (the operator's CLI;
+the ambient environment never counts). The HTTP API's `PATCH /api/jobs/{id}` records `api_server`. A plugin that
+trusts a job because of who created it can tell when someone else changed or ran it.
+
+**`context_from` stays with one person.** A job can read the latest output of another job only when both belong to the
+same person (creator and last changer; jobs made only by the operator are free). Creating or editing such a reference
+to someone else's job is refused, and at run time another person's output is left out and counted as a refusal
+(`cron/job_trust.py`).
 
 ## Pre-dispatch configuration validation
 
@@ -844,13 +852,16 @@ Otherwise, report the issue.
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
 
-**Silent after a refusal: the owner is told.** When a tool was refused during the run (a permission, access or
-approval check said no) and the run then ends `[SILENT]` or empty, the scheduler sends one plain line to where the job
-was created (its `origin`, the owner's chat), never to the normal delivery target: which tool was refused, why, and
-that the job or its permissions need changing. A job without an origin (created from the CLI) uses `failure_deliver`
-when set, otherwise the scheduler logs a warning. A tool result counts as a refusal when its JSON says
-`"refused": true` (the contract for tools and plugins), `"status": "blocked"` (approval and guardrail blocks, such as a
-dangerous command under `approvals.cron_mode: deny`), or a `pre_tool_call` plugin veto (`tools/tool_refusals.py`).
+**Silent after a refusal: the owner is told, privately.** When a tool was refused during the run (a permission,
+access or approval check said no) and the run then ends `[SILENT]` or empty, the scheduler sends one plain line saying
+which tool was refused, why, and that the job or its permissions need changing. It goes to the chat the job was
+created in only when that is a direct chat (`origin.chat_type: dm`, recorded at creation; for older jobs a WhatsApp
+user or a Slack DM), else to `failure_deliver`, else only to the log: never to a group or the delivery target. The
+same refusals are reported once (`last_refusal_notice`); a normal delivery clears that. The notice doesn't count as
+the job's delivery (its receipts are kept). A tool result counts as a refusal when its JSON says `"refused": true` (the
+contract for tools and plugins), `"status": "blocked"` with an `error` and no `"ok": true` (approval and guardrail
+blocks, such as a dangerous command under `approvals.cron_mode: deny`), or a `pre_tool_call` plugin veto
+(`tools/tool_refusals.py`).
 
 ### Declaring a failed run
 

@@ -8,7 +8,8 @@ tool result to :func:`observe`, which keeps the refusals.
 A tool result counts as a refusal when its JSON object says so:
 
 - ``"refused": true`` (the explicit contract for tools and plugins; add a plain ``error`` saying why), or
-- ``"status": "blocked"`` (approval and guardrail blocks, e.g. a dangerous command in cron), or
+- ``"status": "blocked"`` with an ``error`` and no ``"ok": true`` (approval and guardrail blocks, e.g. a dangerous
+  command in cron; a kanban task that merely *is* blocked returns ``ok: true`` and does not count), or
 - the dispatcher reports ``error_type="plugin_block"`` (a ``pre_tool_call`` veto).
 
 The collection is a list placed in the context BEFORE the agent's context is copied into its worker
@@ -55,10 +56,12 @@ def refusal_reason(result: Any, *, error_type: Optional[str] = None) -> Optional
                 data = None
     if not isinstance(data, dict):
         return "the tool call was blocked" if error_type == "plugin_block" else None
-    if not (data.get("refused") is True or data.get("status") == "blocked" or error_type == "plugin_block"):
+    blocked = data.get("status") == "blocked" and bool(data.get("error")) and data.get("ok") is not True
+    if not (data.get("refused") is True or blocked or error_type == "plugin_block"):
         return None
     reason = data.get("error") or data.get("message") or data.get("reason") or "no reason given"
-    return " ".join(str(reason).split())[:_REASON_CHARS]
+    # The reason is tool-supplied text that ends up in a delivery: never let it carry a MEDIA: attachment tag.
+    return " ".join(str(reason).replace("MEDIA:", "MEDIA ").split())[:_REASON_CHARS]
 
 
 def observe(tool_name: str, result: Any, *, error_type: Optional[str] = None) -> None:

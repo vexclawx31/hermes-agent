@@ -68,10 +68,10 @@ def _plugin_problems(job: dict) -> list[str]:
 
 def job_wont_work(job: Any) -> list[str]:
     """Plain-sentence reasons this job's scheduled runs will be refused or undeliverable; [] when none."""
-    if not isinstance(job, dict) or job.get("no_agent"):
-        return _core_problems(job)[:_MAX_PROBLEMS] if isinstance(job, dict) else []
+    if not isinstance(job, dict):
+        return []
     seen: list[str] = []
-    for problem in _core_problems(job) + _plugin_problems(job):
+    for problem in _core_problems(job) + ([] if job.get("no_agent") else _plugin_problems(job)):
         if problem not in seen:
             seen.append(problem)
     return seen[:_MAX_PROBLEMS]

@@ -44,11 +44,6 @@ def emit_terminal_post_tool_call(
     middleware_trace: Optional[list] = None,
 ) -> None:
     """Emit the one terminal ``post_tool_call`` hook for a tool_call_id (best-effort)."""
-    try:  # an unattended run (cron) keeps refusals so a silent run can tell its owner why
-        from tools.tool_refusals import observe
-        observe(function_name, result, error_type=error_type)
-    except Exception:
-        logging.getLogger(__name__).debug("tool refusal observer failed", exc_info=True)
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(

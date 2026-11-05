@@ -46,7 +46,7 @@ from hermes_cli.config import (
 from hermes_cli.fallback_config import get_fallback_chain, scoped_fallback_chain
 from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
-from cron.scheduler_refusals import notify_silent_refusals
+from cron.scheduler_refusals import clear_refusal_notice, notify_silent_refusals
 from cron.scheduler_run_scope import _CronRunScope  # per-run ContextVar scope (sibling split)
 from agent.memory_provider import ctx_bound
 from agent.session_activity import AwakeIdleMeter
@@ -3093,6 +3093,9 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         from cron.jobs import update_job
         update_job(job["id"], stale)
         job.update(stale)
+    if d.success and d.should_deliver and not d.delivery_error:  # delivered: a returning refusal is news again
+        clear_refusal_notice(job)
+    job.pop("_tool_refusals", None)
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
