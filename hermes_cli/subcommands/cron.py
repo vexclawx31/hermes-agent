@@ -176,6 +176,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "runs", aliases=["history"], help="Show durable execution attempts")
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
+    cron_runs.add_argument("--id", dest="execution_id", metavar="EXECUTION_ID",
+                           help="Show one attempt by its execution id")
 
     # cron incidents — durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(

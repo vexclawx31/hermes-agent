@@ -7,6 +7,7 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -92,6 +93,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
+    # Per-run delivery receipt (r21). Additive only: older readers select * and ignore them.
+    add_column_if_missing(conn, "executions", "delivery_targets", "delivery_targets TEXT")
+    add_column_if_missing(conn, "executions", "delivery_message_ids", "delivery_message_ids TEXT")
+    add_column_if_missing(conn, "executions", "delivery_error", "delivery_error TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -106,9 +111,35 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         yield conn
 
 
+# Columns stored as JSON text; decoded on read so callers see lists/dicts (None when absent).
+_JSON_COLUMNS = ("delivery_targets", "delivery_message_ids")
+DELIVERY_ERROR_MAX_CHARS = 500
+
+
+def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    for column in _JSON_COLUMNS:
+        raw = record.get(column)
+        if isinstance(raw, str):
+            try:
+                record[column] = json.loads(raw)
+            except ValueError:
+                record[column] = None
+    return record
+
+
+def _record(row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:
+    return _row_dict(row) if row is not None else None
+
+
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[dict[str, Any]]:
-    row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
-    return dict(row) if row is not None else None
+    return _record(conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone())
+
+
+def new_execution_id() -> str:
+    """32 lowercase hex chars, like the uuid4 ids before r21, but time-prefixed: 13 hex digits of
+    epoch milliseconds then 19 random ones, so ids sort by creation time (to the millisecond)."""
+    return f"{int(time.time() * 1000):013x}{uuid.uuid4().hex[:19]}"
 
 
 def _emit_execution_state(
@@ -217,7 +248,7 @@ def create_execution(
     from cron.occurrences import scheduled_instant as canonical_instant
 
     now = _hermes_now().isoformat()
-    execution_id = uuid.uuid4().hex
+    execution_id = new_execution_id()
     pid = os.getpid()
     with _transaction() as conn:
         conn.execute(
@@ -309,22 +340,37 @@ def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
     return record
 
 
+def _json_or_none(value: Any) -> Optional[str]:
+    return json.dumps(value, sort_keys=True) if value else None
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
+    delivery_targets: Optional[list[str]] = None,
+    delivery_message_ids: Optional[dict[str, list[str]]] = None,
+    delivery_error: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    ``delivery_*`` is this run's own receipt: the ``platform:chat_id[:thread_id]`` targets it
+    resolved, the provider message ids each one put on screen, and the delivery error summary.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
+    delivery_detail = str(delivery_error)[:DELIVERY_ERROR_MAX_CHARS] if delivery_error else None
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?,
+                   delivery_targets=?, delivery_message_ids=?, delivery_error=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, _json_or_none(delivery_targets),
+             _json_or_none(delivery_message_ids), delivery_detail,
+             execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -506,7 +552,7 @@ def list_executions(
             + " ORDER BY julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT ?",
             params,
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [_row_dict(row) for row in rows]
 
 
 def get_execution(execution_id: str) -> Optional[dict[str, Any]]:
@@ -516,7 +562,7 @@ def get_execution(execution_id: str) -> Optional[dict[str, Any]]:
             "SELECT * FROM executions WHERE id=?",
             (str(execution_id),),
         ).fetchone()
-    return dict(row) if row is not None else None
+    return _record(row)
 
 
 def latest_execution(job_id: str) -> Optional[dict[str, Any]]:
@@ -559,4 +605,4 @@ def latest_executions(job_ids: list[str]) -> dict[str, dict[str, Any]]:
                   WHERE rn=1)""",
             clean,
         ).fetchall()
-    return {row["job_id"]: dict(row) for row in rows}
+    return {row["job_id"]: _row_dict(row) for row in rows}

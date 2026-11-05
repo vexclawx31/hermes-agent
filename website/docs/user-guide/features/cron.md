@@ -429,6 +429,20 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+Each attempt has its own execution id, created once when the run is claimed
+(32 hex characters, time-prefixed so ids sort by creation time). Its row keeps
+that run's own delivery receipt: the delivery outcome (`delivered`, `queued`,
+`failed`, `suppressed`, `suppressed_acked` or `not_configured`), the targets it
+resolved (`platform:chat_id[:thread_id]`), the provider message ids each target
+posted, and the delivery error when one failed, so the next run does not
+overwrite it. `hermes cron runs --id <execution-id>` shows one attempt.
+
+```text
+001a1ac08a6e23e3e2de964db4171b95  completed  delivery=delivered  job=a1b2c3  source=builtin  2026-11-05T09:00:01+01:00
+    target: slack:C0123456789
+    message ids: slack:C0123456789=1762329601.000200
+```
+
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
 that the retained ledger records as completed, Hermes skips that replay and

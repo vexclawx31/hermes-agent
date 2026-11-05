@@ -22,7 +22,8 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from cron.scheduler_delivery_outbound import _open_continuable_cron_thread, authorize_cron_send
-from cron.scheduler_delivery_receipts import _note_delivered_message_ids, _record_delivery_verification
+from cron.scheduler_delivery_receipts import (
+    _begin_delivery_receipt, _note_delivered_message_ids, _record_delivery_verification)
 
 
 # Log-record parity with the origin module.
@@ -1921,10 +1922,7 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
-    job.pop("_bot_chat_delivery_receipts", None)
-    job.pop("_delivery_message_ids", None)
-    job.pop("_notification_all_targets_suppressed", None)
-    targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    targets = _begin_delivery_receipt(job, _resolve_delivery_targets(job, for_failure=for_failure))
     if not targets:
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
@@ -1949,6 +1947,8 @@ def _deliver_result(
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+        # The gateway's send recorded this run's message ids on the job; keep them for the receipt.
+        job["_delivery_message_ids"] = dict(refreshed.get("last_delivery_message_ids") or {})
         return error
 
     from gateway.config import load_gateway_config

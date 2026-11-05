@@ -521,6 +521,7 @@ from cron.executions import (
     get_execution, mark_execution_handoff_pending, mark_execution_running,
     recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
+from cron.scheduler_delivery_receipts import run_delivery_receipt
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -2763,7 +2764,8 @@ def run_one_job(
             finally:
                 finish_execution(
                     execution_id, success=False, error=error,
-                    delivery_outcome=delivery_outcome)
+                    delivery_outcome=delivery_outcome,
+                    **run_delivery_receipt(job, delivery_error))
             return True
         if handed_off:
             from cron.scheduler_worker_failure import record_unknown_worker_outcome
@@ -3081,7 +3083,8 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
     finish_execution(
         execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+        error="Interrupted by gateway shutdown before terminal completion.",
+        **run_delivery_receipt(job, delivery_error))
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
@@ -3139,7 +3142,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome,
+        **run_delivery_receipt(job, d.delivery_error))
     return True
 
 
@@ -3438,7 +3442,8 @@ def _run_one_job_body(
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
         try:
             finish_execution(
-                execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
+                execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome,
+                **run_delivery_receipt(job, delivery_error))
         except Exception as record_err:
             logger.error("Failed to finish execution record for job %s: %s", job["id"], record_err)
         if not isinstance(e, Exception):
