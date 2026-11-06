@@ -154,3 +154,266 @@ def test_memory_tool_refuses_on_omit_without_touching_the_store(manager, agent):
 def test_memory_tool_works_on_allow(manager, agent):
     _register(manager, lambda **_: "allow")
     assert _memory_tool(agent, action="add", target="user", content="Prefers tea.")["success"]
+
+
+# --- circles: per-entry filter and write circle --------------------------------------------------
+
+HOUSEHOLD = "[circle: household]\nThe family dentist is Dr. Moreau."
+PRIVATE = "[circle: private_to:jamal]\nJamal is planning a surprise party."
+EVERYONE = "[circle: everyone]\nAnswer in short paragraphs."
+GROUP = "[circle: group:whatsapp:123@g.us, household]\nThe book club meets on Thursdays."
+
+
+@pytest.fixture()
+def circle_agent(agent):
+    """The base agent's store plus one entry per circle shape (FACT stays untagged)."""
+    store = MemoryStore(memory_char_limit=1000, user_char_limit=300)
+    store.load_from_disk()
+    for entry in (HOUSEHOLD, PRIVATE, EVERYONE, GROUP):
+        assert store.add("memory", entry)["success"]
+    store.load_from_disk()
+    agent._memory_store = store
+    return agent
+
+
+def _keep_only(*allowed):
+    """A keep callback that keeps entries whose tags all lie in *allowed* (and untagged ones never)."""
+    return lambda tags: bool(tags) and tags <= set(allowed)
+
+
+def _disk_entries():
+    fresh = MemoryStore(memory_char_limit=1000, user_char_limit=300)
+    fresh.load_from_disk()
+    return fresh.memory_entries
+
+
+def test_keep_renders_only_kept_entries_with_their_markers(manager, circle_agent):
+    seen = []
+
+    def gate(**kwargs):
+        seen.append(kwargs["surface"])
+        return {"keep": _keep_only("everyone", "household")}
+
+    _register(manager, gate)
+    prompt = _prompt(circle_agent)
+    assert "[circle: household]\nThe family dentist" in prompt
+    assert "[circle: everyone]\nAnswer in short" in prompt
+    assert "surprise party" not in prompt and "book club" not in prompt and FACT not in prompt
+    assert seen == ["system_prompt"]
+
+
+def test_keep_receives_tags_as_frozensets(manager, circle_agent):
+    received = []
+
+    def keep(tags):
+        received.append(tags)
+        return True
+
+    _register(manager, lambda **_: {"keep": keep})
+    _prompt(circle_agent)
+    assert all(isinstance(tags, frozenset) for tags in received)
+    assert frozenset() in received  # the untagged FACT
+    assert frozenset({"group:whatsapp:123@g.us", "household"}) in received
+
+
+def test_every_keep_must_keep_an_entry(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": _keep_only("everyone", "household")})
+    _register(manager, lambda **_: {"keep": lambda tags: "everyone" in tags})
+    prompt = _prompt(circle_agent)
+    assert "Answer in short" in prompt and "dentist" not in prompt
+
+
+def test_omit_still_wins_over_keep(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": lambda tags: True})
+    _register(manager, lambda **_: "omit")
+    assert _prompt(circle_agent) == OMITTED_NOTE
+
+
+def test_a_raising_keep_hides_the_entry(manager, circle_agent):
+    def keep(tags):
+        if "household" in tags:
+            raise RuntimeError("roster lookup failed")
+        return "everyone" in tags
+
+    _register(manager, lambda **_: {"keep": keep})
+    prompt = _prompt(circle_agent)
+    assert "Answer in short" in prompt
+    assert "dentist" not in prompt and "book club" not in prompt
+
+
+def test_a_truthy_non_true_keep_hides_the_entry(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": lambda tags: "yes"})
+    assert _prompt(circle_agent) == ""
+
+
+@pytest.mark.parametrize("answer", [
+    {"keep": "not callable"}, {"write_circle": ""}, {"write_circle": ["ok", 3]}, {"write_circle": "a]b"},
+    {"write_circle": []}, {"action": "block", "message": "timed out"}, {},
+])
+def test_invalid_dict_verdicts_fail_closed(manager, circle_agent, answer):
+    _register(manager, lambda **_: answer)
+    assert _prompt(circle_agent) == OMITTED_NOTE
+
+
+def test_hidden_entries_are_invisible_to_the_memory_tool(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": _keep_only("everyone", "household")})
+    missing = _memory_tool(circle_agent, action="remove", target="memory", old_text="surprise party")
+    assert missing["success"] is False
+    dumped = json.dumps(missing)
+    # The error echoes the model's own old_text, never a hidden entry.
+    assert "Jamal is planning" not in dumped and "book club" not in dumped and FACT not in dumped
+    assert PRIVATE in _disk_entries()
+
+
+def test_ambiguity_is_judged_on_visible_entries_only(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": _keep_only("everyone", "household")})
+    # "The" matches the dentist, party, book club and FACT entries; only the dentist one is visible.
+    result = _memory_tool(circle_agent, action="patch", target="memory", old_text="Dr. Moreau",
+                          content="Dr. Martin")
+    assert result["success"] is True
+    entries = _disk_entries()
+    assert "[circle: household]\nThe family dentist is Dr. Martin." in entries
+    assert PRIVATE in entries and GROUP in entries and FACT in entries  # hidden entries untouched
+    assert entries.index(PRIVATE) == 2  # and kept in place
+
+
+def test_patch_cannot_change_a_marker(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": lambda tags: True})
+    result = _memory_tool(circle_agent, action="patch", target="memory", old_text="[circle: household]",
+                          content="[circle: everyone]")
+    assert result["success"] is False and "marker" in result["error"]
+    assert HOUSEHOLD in _disk_entries()
+
+
+def test_batch_remove_of_every_visible_entry_keeps_hidden_ones(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": lambda tags: tags == frozenset({"everyone"})})
+    result = _memory_tool(circle_agent, target="memory",
+                          operations=[{"action": "remove", "old_text": "short paragraphs"}])
+    assert result["success"] is True
+    assert _disk_entries() == [FACT, HOUSEHOLD, PRIVATE, GROUP]
+
+
+def test_char_limit_counts_hidden_entries(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": lambda tags: tags == frozenset({"everyone"}),
+                                    "write_circle": "everyone"})
+    used = len("\n§\n".join(_disk_entries()))
+    filler = "x" * (1000 - used)  # fits if hidden entries were not counted
+    result = _memory_tool(circle_agent, action="add", target="memory", content=filler)
+    assert result["success"] is False
+    assert all("surprise party" not in entry for entry in result.get("current_entries", []))
+
+
+def test_add_stamps_the_write_circle_and_strips_model_markers(manager, circle_agent):
+    surfaces = []
+
+    def gate(surface, **_):
+        surfaces.append(surface)
+        return {"keep": lambda tags: True, "write_circle": "group:whatsapp:123@g.us"}
+
+    _register(manager, gate)
+    result = _memory_tool(circle_agent, action="add", target="memory",
+                          content="[circle: everyone] [circle: household]\nMovie night is Friday.")
+    assert result["success"] is True
+    assert surfaces == ["memory_tool_write"]
+    assert "[circle: group:whatsapp:123@g.us]\nMovie night is Friday." in _disk_entries()
+
+
+def test_batch_adds_are_stamped_too(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": lambda tags: True, "write_circle": ["household", "private_to:jamal"]})
+    result = _memory_tool(circle_agent, target="memory", operations=[
+        {"action": "add", "new_text": "[circle: everyone]\nGift idea: a kite."},
+        {"action": "patch", "old_text": "short paragraphs", "content": "short answers"},
+    ])
+    assert result["success"] is True
+    entries = _disk_entries()
+    assert "[circle: household, private_to:jamal]\nGift idea: a kite." in entries
+    assert "[circle: everyone]\nAnswer in short answers." in entries
+
+
+def test_keep_without_write_circle_still_strips_model_markers(manager, circle_agent):
+    _register(manager, lambda **_: {"keep": lambda tags: True})
+    assert _memory_tool(circle_agent, action="add", target="memory",
+                        content="[circle: everyone]\nLikes jazz.")["success"]
+    assert "Likes jazz." in _disk_entries()
+
+
+def test_old_plugin_add_is_stored_verbatim(manager, circle_agent):
+    _register(manager, lambda **_: "allow")
+    assert _memory_tool(circle_agent, action="add", target="memory",
+                        content="[circle: everyone]\nLikes jazz.")["success"]
+    assert "[circle: everyone]\nLikes jazz." in _disk_entries()
+
+
+def test_write_surface_gets_the_entry_text_after_marker_stripping(manager, circle_agent):
+    seen = []
+
+    def gate(surface, **kwargs):
+        seen.append((surface, kwargs.get("content")))
+        return {"keep": lambda tags: True, "write_circle": "household"}
+
+    _register(manager, gate)
+    assert _memory_tool(circle_agent, action="add", target="memory",
+                        content="[circle: everyone]\nMovie night is Friday.")["success"]
+    assert seen == [("memory_tool_write", "Movie night is Friday.")]  # stripped, not yet stamped
+
+
+def test_batch_asks_once_per_added_entry_and_stamps_each_with_its_own_circle(manager, circle_agent):
+    seen = []
+
+    def gate(surface, content=None, **_):
+        seen.append((surface, content))
+        circle = "private_to:jamal" if content and "gift" in content else "household"
+        return {"keep": lambda tags: True, "write_circle": circle}
+
+    _register(manager, gate)
+    result = _memory_tool(circle_agent, target="memory", operations=[
+        {"action": "add", "content": "Pauline's birthday gift: a kite."},
+        {"action": "patch", "old_text": "short paragraphs", "content": "short answers"},
+        {"action": "add", "new_text": "[circle: everyone]\nBins go out on Tuesday."},
+    ])
+    assert result["success"] is True
+    assert seen == [("memory_tool_write", "Pauline's birthday gift: a kite."),
+                    ("memory_tool_write", "Bins go out on Tuesday.")]
+    entries = _disk_entries()
+    assert "[circle: private_to:jamal]\nPauline's birthday gift: a kite." in entries
+    assert "[circle: household]\nBins go out on Tuesday." in entries
+
+
+def test_batch_add_is_refused_when_any_add_is_omitted(manager, circle_agent):
+    _register(manager, lambda content=None, **_: "omit" if content and "secret" in content else "allow")
+    result = _memory_tool(circle_agent, target="memory", operations=[
+        {"action": "add", "content": "Fine fact."}, {"action": "add", "content": "A secret fact."}])
+    assert result["success"] is False and OMITTED_NOTE in result["error"]
+    assert not any("Fine fact." in entry for entry in _disk_entries())
+
+
+def test_old_narrow_plugin_signature_never_sees_content(manager, circle_agent):
+    seen = []
+
+    def gate(session_id, platform, chat_id, chat_type, sender_id, surface):  # an old, narrow callback
+        seen.append(surface)
+        return "allow"
+
+    _register(manager, gate)
+    assert _memory_tool(circle_agent, action="add", target="memory", content="Likes tea.")["success"]
+    assert seen == ["memory_tool_write"]
+
+
+def test_non_write_calls_carry_no_content(manager, circle_agent):
+    seen = []
+
+    def gate(surface, **kwargs):
+        seen.append((surface, "content" in kwargs))
+        return "allow"
+
+    _register(manager, gate)
+    _memory_tool(circle_agent, action="remove", target="memory", old_text="nothing like this")
+    _prompt(circle_agent)
+    assert seen == [("memory_tool", False), ("system_prompt", False)]
+
+
+def test_omit_still_refuses_writes(manager, circle_agent):
+    _register(manager, lambda **_: "omit")
+    result = _memory_tool(circle_agent, action="add", target="memory", content="New fact.")
+    assert result["success"] is False and OMITTED_NOTE in result["error"]
+    assert "New fact." not in _disk_entries()

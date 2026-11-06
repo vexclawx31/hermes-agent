@@ -10,7 +10,7 @@ import time
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from utils import atomic_write_text
 from tools.threat_patterns import first_threat_message as _first_threat_message
@@ -23,6 +23,89 @@ MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (your personal notes)", "user": "USER PROFILE (who the user is)"}
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Circle marker (agent/builtin_memory_gate.py): an entry may start with ``[circle: <tag>[, <tag>...]]``
+# on its first line. Plain text, so the files stay human-readable; core only parses it, and the
+# filter_builtin_memory plugin decides what the tags mean.
+_CIRCLE_MARKER_RE = re.compile(r"\[circle:([^\]\n]*)\]")
+
+
+def entry_circles(entry: str) -> frozenset[str]:
+    """The circle tags on *entry*'s leading marker; empty when it has none."""
+    match = _CIRCLE_MARKER_RE.match(str(entry or "").lstrip())
+    if match is None:
+        return frozenset()
+    return frozenset(tag for tag in (t.strip() for t in match.group(1).split(",")) if tag)
+
+
+def strip_circle_markers(text: str) -> str:
+    """*text* without any leading circle marker(s): the model can't choose its own circle."""
+    text = str(text or "").strip()
+    while (match := _CIRCLE_MARKER_RE.match(text)) is not None:
+        text = text[match.end():].strip()
+    return text
+
+
+def circle_marker(tags) -> str:
+    """``[circle: a, b]`` for *tags* (order kept, duplicates dropped)."""
+    return f"[circle: {', '.join(dict.fromkeys(tags))}]"
+
+
+# Per-call view of the store for the memory tool (agent/builtin_memory_gate.py): a predicate over an
+# entry's text. Entries it rejects are hidden: not echoed, not matchable, and never changed; the
+# char limit still counts them. None (the default) means every entry is visible, as before.
+_ENTRY_VIEW: ContextVar[Optional[Callable[[str], bool]]] = ContextVar("memory_entry_view", default=None)
+# The entries the current _mutate call hides (read by the closures' budget checks).
+_HIDDEN_ENTRIES: ContextVar[tuple[str, ...]] = ContextVar("memory_hidden_entries", default=())
+
+
+@contextmanager
+def entry_view(keep: Optional[Callable[[str], bool]]) -> Iterator[None]:
+    """Bind the memory tool's entry view for the duration of one call (``None``: no view)."""
+    token = _ENTRY_VIEW.set(keep)
+    try:
+        yield
+    finally:
+        _ENTRY_VIEW.reset(token)
+
+
+def _delimiter_error(content: str) -> Optional[str]:
+    """Error when *content* would split into several entries: it holds the entry delimiter or a
+    line that is just "§". Always refused: the next load would read a second entry with a
+    model-chosen first line (e.g. a forged circle marker)."""
+    text = str(content or "")
+    if ENTRY_DELIMITER in text or any(line.strip() == "§" for line in text.splitlines()):
+        return ("Content can't contain a line that is just '§': that separates memory entries. "
+                "Write one entry per add, or use another symbol.")
+    return None
+
+
+def _entry_visible(entry: str) -> bool:
+    view = _ENTRY_VIEW.get()
+    if view is None:
+        return True
+    try:
+        return view(entry) is True
+    except Exception:
+        logger.warning("memory entry view raised; hiding the entry (fail closed)", exc_info=True)
+        return False
+
+
+def _joined_len(entries: list[str]) -> int:
+    """File length of *entries* plus the entries the current view hides (the limit counts the whole file)."""
+    return len(ENTRY_DELIMITER.join([*entries, *_HIDDEN_ENTRIES.get()]))
+
+
+def _merge_hidden(original: list[str], visible_mask: list[bool], new_visible: list[str]) -> list[str]:
+    """Put the hidden entries back at their positions around the edited visible ones."""
+    merged, rest = [], iter(new_visible)
+    for entry, visible in zip(original, visible_mask):
+        if not visible:
+            merged.append(entry)
+        elif (nxt := next(rest, None)) is not None:
+            merged.append(nxt)
+    merged.extend(rest)
+    return list(dict.fromkeys(merged))
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
@@ -142,15 +225,21 @@ def _span_occurrences(text: str, span: str) -> int:
     return sum(text.startswith(span, i) for i in range(len(text) - len(span) + 1))
 
 
-def _patch_entry(entry: str, old_text: str, new_text: str) -> tuple[Optional[str], str, str]:
+def _patch_entry(entry: str, old_text: str, new_text: str,
+                 pinned: bool = False) -> tuple[Optional[str], str, str]:
     """``(patched entry, "", "none")``, or ``(None, error, failure class)`` when the span occurs more
-    than once in the entry, the edit changes nothing, or the patched entry fails the threat scan.
-    Single and batch patches both go through here, so they share one rule."""
+    than once in the entry, the edit changes nothing, the result would split into several entries,
+    its circle marker changes (under an entry view, or for a *pinned* staged/approved patch), or the
+    patched entry fails the threat scan. Single and batch patches both go through here."""
     if (count := _span_occurrences(entry, old_text)) > 1:
         return None, _repeated_span_message(old_text, count), "ambiguous"
     patched = entry.replace(old_text, new_text, 1)
     if patched == entry:
         return None, f"Patch is a no-op: '{old_text}' -> '{new_text}' leaves the entry unchanged.", "invalid_args"
+    if (delimiter_error := _delimiter_error(patched)) is not None:
+        return None, delimiter_error, "invalid_args"
+    if (pinned or _ENTRY_VIEW.get() is not None) and entry_circles(patched) != entry_circles(entry):
+        return None, "A patch can't change an entry's [circle: ...] marker; edit the text after it.", "invalid_args"
     if scan_error := _scan_memory_content(patched):
         return None, scan_error, "scan_blocked"
     return patched, "", "none"
@@ -190,6 +279,8 @@ class MemoryStore:
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
         self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
+        # Per target, (stored entry, prompt text) pairs behind the snapshot, for per-entry filtering.
+        self._snapshot_entries: dict[str, list[tuple[str, str]]] = {"memory": [], "user": []}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
         # Recall-scope partition (bind_recall_scope): None = unenforced legacy files, "" = no scope.
         self._scope_partition: Optional[str] = None
@@ -253,7 +344,9 @@ class MemoryStore:
                 logger.warning("%s exceeds its char limit on load: %d/%d chars. Entries stay loaded; "
                                "further additions are blocked until it is back under the limit.",
                                path.name, count, limit)
-            self._system_prompt_snapshot[target] = self._render_block(target, [_sanitize(e, path.name) for e in entries])
+            self._snapshot_entries[target] = [(e, _sanitize(e, path.name)) for e in entries]
+            self._system_prompt_snapshot[target] = self._render_block(
+                target, [shown for _entry, shown in self._snapshot_entries[target]])
 
     @staticmethod
     @contextmanager
@@ -323,6 +416,7 @@ class MemoryStore:
             self.memory_enabled = self.user_profile_enabled = False
             self.memory_entries, self.user_entries = [], []
             self._system_prompt_snapshot = {"memory": "", "user": ""}
+            self._snapshot_entries = {"memory": [], "user": []}
             return True
         self.memory_enabled, self.user_profile_enabled = self._unscoped_flags
         self.load_from_disk()
@@ -333,6 +427,10 @@ class MemoryStore:
 
     def _set_entries(self, target: str, entries: list[str]):
         setattr(self, "user_entries" if target == "user" else "memory_entries", entries)
+
+    def _visible_entries(self, target: str) -> list[str]:
+        """The entries the current memory tool call may see (all of them without a view)."""
+        return [e for e in self._entries_for(target) if _entry_visible(e)]
 
     def _char_count(self, target: str) -> int:
         return len(ENTRY_DELIMITER.join(self._entries_for(target)))
@@ -350,7 +448,7 @@ class MemoryStore:
     def _failure_with_entries(self, target: str, message: str) -> dict[str, Any]:
         """Over-budget consolidation failure carrying the live entries so the model can consolidate."""
         return self._consolidation_failure(
-            _error(message, "over_budget", current_entries=self._entries_for(target), usage=self._usage(target)))
+            _error(message, "over_budget", current_entries=self._visible_entries(target), usage=self._usage(target)))
 
     def _batch_failure(self, target: str, message: str, failure_class: str,
                        closest_entries: Optional[list[str]] = None) -> dict[str, Any]:
@@ -380,17 +478,33 @@ class MemoryStore:
             if not read_ok:
                 return _read_failed_error(path)
             bak = None if skip_drift else self._detect_external_drift(target, raw)
-            self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
+            entries = list(dict.fromkeys(self._parse_entries(raw)))
+            self._set_entries(target, entries)
             if bak:
                 return _drift_error(path, bak)
-            result = mutate(self._entries_for(target), self._char_limit(target))
+            # A filter_builtin_memory entry view hides some entries: the closure sees only the
+            # visible ones, its budget checks count the hidden ones too, and they are put back as-is.
+            visible_mask = [_entry_visible(e) for e in entries]
+            hidden = tuple(e for e, visible in zip(entries, visible_mask) if not visible)
+            hidden_token = _HIDDEN_ENTRIES.set(hidden)
+            try:
+                result = mutate([e for e, visible in zip(entries, visible_mask) if visible] if hidden else entries,
+                                self._char_limit(target))
+            finally:
+                _HIDDEN_ENTRIES.reset(hidden_token)
             if isinstance(result, dict):
                 return result
-            self._set_entries(target, result[0])
+            new_entries = _merge_hidden(entries, visible_mask, result[0]) if hidden else result[0]
+            # The file must read back as exactly these entries (same count, same first lines and
+            # markers); anything else would let written text forge another entry on the next load.
+            if self._parse_entries(ENTRY_DELIMITER.join(new_entries)) != [e.strip() for e in new_entries]:
+                return _error("Refusing to write: the result would not read back as the same entries "
+                              "(an entry contains the '§' separator). Nothing was changed.", "invalid_args")
+            self._set_entries(target, new_entries)
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
-            self._write_file(path, result[0])
+            self._write_file(path, new_entries)
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 
@@ -399,14 +513,16 @@ class MemoryStore:
         content = content.strip()
         if not content:
             return _error("Content cannot be empty.", "missing_content")
+        if (delimiter_error := _delimiter_error(content)) is not None:
+            return _error(delimiter_error, "invalid_args")
         if scan_error := _scan_memory_content(content):
             return _error(scan_error, "scan_blocked")
 
         def _add(entries, limit):
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
-            if len(ENTRY_DELIMITER.join(entries + [content])) > limit:
-                new_total = len(ENTRY_DELIMITER.join(entries + [content]))
+            if _joined_len(entries + [content]) > limit:
+                new_total = _joined_len(entries + [content])
                 return self._failure_with_entries(target, (
                     f"Memory at {self._char_count(target):,}/{limit:,} chars; adding this entry ({len(content)} chars) "
                     f"would exceed the limit by {new_total - limit:,} chars. Retry as ONE 'operations' batch that "
@@ -427,6 +543,8 @@ class MemoryStore:
             return _error("old_text cannot be empty.", "missing_old_text")
         if not new_content:
             return _error("new_content cannot be empty. Use 'remove' to delete entries.", "missing_content")
+        if (delimiter_error := _delimiter_error(new_content)) is not None:
+            return _error(delimiter_error, "invalid_args")
         if scan_error := _scan_memory_content(new_content):
             return _error(scan_error, "scan_blocked")
         return self._edit(target, old_text.strip(), new_content, matched_entry)
@@ -452,11 +570,11 @@ class MemoryStore:
             if isinstance(idx, dict):
                 return idx
             before = entries[idx]
-            after, message, failure_class = _patch_entry(before, old_text, new_text)
+            after, message, failure_class = _patch_entry(before, old_text, new_text, matched_entry is not None)
             if after is None:
                 return _error(message, failure_class)
             patched = entries[:idx] + [after] + entries[idx + 1:]
-            new_total = len(ENTRY_DELIMITER.join(patched))
+            new_total = _joined_len(patched)
             if new_total > limit:
                 return self._failure_with_entries(target, (
                     f"Patch would put memory at {new_total:,}/{limit:,} chars. Shorten the new "
@@ -507,7 +625,7 @@ class MemoryStore:
             replaced = entries[:idx] + ([] if new_content is None else [new_content]) + entries[idx + 1:]
             if new_content is None:
                 return replaced, "Entry removed.", {"removed_entry": entries[idx]}
-            new_total = len(ENTRY_DELIMITER.join(replaced))
+            new_total = _joined_len(replaced)
             if new_total > limit:
                 return self._failure_with_entries(target, (
                     f"Replacement {_over_limit(new_total, limit)}. Shorten the new content, or retry as ONE "
@@ -526,6 +644,8 @@ class MemoryStore:
         It is published only after the entire batch has been validated and persisted.
         A staged op's *matched_entry* selects exactly that entry, as in ``_locate``.
         """
+        if act in ("add", "replace") and (delimiter_error := _delimiter_error(content)) is not None:
+            return f"{pos}: {delimiter_error}", None, "invalid_args", None
         if act == "add":
             if not content:
                 return f"{pos}: content is required.", None, "missing_content", None
@@ -558,7 +678,7 @@ class MemoryStore:
         if act != "patch":
             working[idx:idx + 1] = [content] if act == "replace" else []
             return None, previous_content, "none", None
-        patched, message, failure_class = _patch_entry(previous_content, old_text, content)
+        patched, message, failure_class = _patch_entry(previous_content, old_text, content, matched_entry is not None)
         if patched is None:
             return f"{pos}: {message}", None, failure_class, None
         working[idx:idx + 1] = [patched]
@@ -608,7 +728,7 @@ class MemoryStore:
                 matched.append(previous_content)
                 if after is not None:
                     produced[i + 1] = after
-            if entries and not working:
+            if entries and not working and not _HIDDEN_ENTRIES.get():
                 # #103419: a consolidation batch that removes the last entry would
                 # commit an empty file as a normal successful write. Refuse; single
                 # remove() is the deliberate-wipe path.
@@ -618,7 +738,7 @@ class MemoryStore:
                     f"previously non-empty store. Keep at least one entry — merge overlapping "
                     f"entries into a shorter one instead of removing the last one. To delete the "
                     f"final entry deliberately, use single remove() calls."), "would_empty")
-            new_total = len(ENTRY_DELIMITER.join(working))  # budget check against the FINAL state only
+            new_total = _joined_len(working)  # budget check against the FINAL state only
             if new_total > limit:
                 return self._batch_failure(target, (
                     f"Applying all {len(operations)} operations {_over_limit(new_total, limit)} more. Add "
@@ -643,10 +763,26 @@ class MemoryStore:
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
         return self._mutate(target, _apply, skip_drift=not commit)
 
-    def format_for_system_prompt(self, target: str) -> Optional[str]:
+    def format_for_system_prompt(self, target: str,
+                                 keep: Optional[Callable[[str], bool]] = None) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
-        it, preserving the prefix cache); None if empty."""
-        return self._system_prompt_snapshot.get(target, "") or None
+        it, preserving the prefix cache); None if empty. *keep* (a filter_builtin_memory
+        verdict) renders only the snapshot entries it keeps, judged on the stored text,
+        marker included; the usage figure still counts the whole file."""
+        if keep is None:
+            return self._system_prompt_snapshot.get(target, "") or None
+        snapshot = self._snapshot_entries.get(target) or []
+        shown = []
+        for entry, text in snapshot:
+            try:
+                kept = keep(entry) is True
+            except Exception:
+                logger.warning("memory entry filter raised; omitting the entry (fail closed)", exc_info=True)
+                kept = False
+            if kept:
+                shown.append(text)
+        full = len(ENTRY_DELIMITER.join(text for _entry, text in snapshot))
+        return self._render_block(target, shown, usage_chars=full) or None
 
     def _success_response(self, target: str, message: str | None = None, **extra) -> dict[str, Any]:
         """TERMINAL and WITHOUT the entries list: echoing entries invites the model to
@@ -659,17 +795,18 @@ class MemoryStore:
         self._consolidation_failures = 0
         return {"success": True, "done": True, "target": target,
                 "usage": self._usage_pct(target, self._char_count(target)),
-                "entry_count": len(self._entries_for(target)), **({"message": message} if message else {}),
+                "entry_count": len(self._visible_entries(target)), **({"message": message} if message else {}),
                 **extra,
                 "note": "Write saved. This update is complete — do not repeat it."}
 
-    def _render_block(self, target: str, entries: list[str]) -> str:
+    def _render_block(self, target: str, entries: list[str], usage_chars: Optional[int] = None) -> str:
         """System prompt block: header + usage indicator + entries ("" when empty)."""
         if not entries:
             return ""
         content, sep = ENTRY_DELIMITER.join(entries), "═" * 46
         title = MEMORY_BLOCK_HEADERS["user" if target == "user" else "memory"]
-        return f"{sep}\n{title} [{self._usage_pct(target, len(content))}]\n{sep}\n{content}"
+        usage = self._usage_pct(target, len(content) if usage_chars is None else usage_chars)
+        return f"{sep}\n{title} [{usage}]\n{sep}\n{content}"
 
     @staticmethod
     def _read_raw_checked(path: Path) -> tuple[str, bool]:

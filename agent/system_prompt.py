@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent.builtin_memory_gate import OMITTED_NOTE as BUILTIN_MEMORY_OMITTED_NOTE, builtin_memory_allowed
+from agent.builtin_memory_gate import OMITTED_NOTE as BUILTIN_MEMORY_OMITTED_NOTE, builtin_memory_verdict
 from agent.delegation_context import owned_kanban_task
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -530,13 +530,18 @@ def _memory_parts(agent: Any) -> list[str]:
     tools the toolset config gated off)."""
     parts: list[str] = []
     if agent._memory_store:
-        for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):
-            block = agent._memory_store.format_for_system_prompt(kind) if enabled else None
-            if block:
-                parts.append(block)
-        # A filter_builtin_memory plugin may keep the curated notes out of this chat (per prompt build).
-        if parts and not builtin_memory_allowed(agent, "system_prompt"):
-            parts = [BUILTIN_MEMORY_OMITTED_NOTE]
+        kinds = [kind for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user"))
+                 if enabled]
+        parts = [block for kind in kinds if (block := agent._memory_store.format_for_system_prompt(kind))]
+        # A filter_builtin_memory plugin may keep the curated notes, or some entries, out of this chat
+        # (decided per prompt build; agent/builtin_memory_gate.py).
+        if parts:
+            verdict = builtin_memory_verdict(agent, "system_prompt")
+            if not verdict.allowed:
+                parts = [BUILTIN_MEMORY_OMITTED_NOTE]
+            elif verdict.keeps:
+                parts = [block for kind in kinds
+                         if (block := agent._memory_store.format_for_system_prompt(kind, keep=verdict.keeps_entry))]
     # External memory provider system prompt block (additive to built-in). Gated on the same check
     # ``inject_memory_provider_tools`` uses so we never advertise provider tools that the agent's toolset
     # configuration has already gated off (#81014).

@@ -449,8 +449,8 @@ Payload fields below are the exact event-specific fields supplied by each call s
 
 | Hook | Category | Exact timing and return behavior | Explicit payload fields | Privacy / sensitivity |
 |---|---|---|---|---|
-| [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; any valid `block` wins over any `approve` (then the first valid `approve`), and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
-| `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
+| [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; any valid `block` wins over any `approve` (then the first valid `approve`), and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace`, `sender_role`, `sender_id` | Raw arguments may contain user content, paths, commands, or secrets. |
+| `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace`, `sender_role`, `sender_id` | Result/error text may contain arbitrary tool or user content and secrets. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
@@ -562,6 +562,8 @@ def my_callback(tool_name: str, args: dict, task_id: str, **kwargs):
 | `tool_name` | `str` | Name of the tool about to execute (e.g. `"terminal"`, `"web_search"`, `"read_file"`) |
 | `args` | `dict` | The arguments the model passed to the tool |
 | `task_id` | `str` | Session/task identifier. Empty string if not set. |
+| `sender_role` | `str` | The trusted role of the gateway turn that issued the call: `"owner"` or `"member"` in a trusted group (adapter-verified from the sender id, never from message text; merged senders count as `"member"`), `""` elsewhere or when unknown (CLI, cron, plugin-authored turns). In a shared group session it is the role of the turn the call belongs to. |
+| `sender_id` | `str` | The transport sender id of that turn (`""` when unknown or for merged senders). |
 
 **Fires:** In `model_tools.py`, inside `handle_function_call()`, before the tool's handler runs. Fires once per tool call — if the model calls 3 tools in parallel, this fires 3 times.
 
@@ -644,6 +646,7 @@ def my_callback(tool_name: str, args: dict, result: str, task_id: str,
 | `result` | `str` | The tool's return value (always a JSON string) |
 | `task_id` | `str` | Session/task identifier. Empty string if not set. |
 | `duration_ms` | `int` | How long the tool's dispatch took, in milliseconds (measured with `time.monotonic()` around `registry.dispatch()`). |
+| `sender_role`, `sender_id` | `str` | The issuing turn's trusted sender, as for `pre_tool_call`. |
 
 **Fires:** In `model_tools.py`, inside `handle_function_call()`, after the tool's handler returns. Fires once per tool call. Does **not** fire if the tool raised an unhandled exception (the error is caught and returned as an error JSON string instead, and `post_tool_call` fires with that error string as `result`).
 
@@ -1743,18 +1746,21 @@ The hook is guarded on a non-empty, non-interrupted response — it will not fir
 Gates the built-in memory store (MEMORY.md / USER.md) per chat, for plugins that know a chat's audience (for example a household privacy plugin). With no callback registered nothing changes and the hook is not invoked.
 
 ```python
-def filter_builtin_memory(session_id, platform, chat_id, chat_type, sender_id, **kwargs) -> str | None:
-    return "omit"  # or "allow" / None (no opinion)
+def filter_builtin_memory(session_id, platform, chat_id, chat_type, sender_id, **kwargs) -> str | dict | None:
+    return "omit"  # or "allow" / None (no opinion) / {"keep": keep, "write_circle": "<tag>"}
 ```
 
 | Parameter | Description |
 |---|---|
 | `session_id`, `platform`, `chat_id`, `chat_type`, `sender_id`, `thread_id`, `session_key` | The trusted transport identity the agent was created for (empty strings when unset, e.g. CLI). |
-| `surface` | `"system_prompt"` or `"memory_tool"`. |
+| `surface` | `"system_prompt"`, `"memory_tool"`, `"memory_tool_write"` (a `memory` tool call that adds entries: asked once per added entry), or `"memory_command"` (the gateway `/memory` command). |
+| `content` | `"memory_tool_write"` only: the text of the entry being added, leading `[circle: …]` markers stripped, before core stamps it. Callbacks without `content` or `**kwargs` in their signature don't receive it. |
 
 **Decision:** any callback returning `"omit"` omits; `"allow"` and `None` allow. **Fail closed:** a callback that raises, times out (`plugins.hook_callback_timeout`) or returns anything else counts as `"omit"`.
 
 **Where it applies:** the system prompt is built once per session and cached (prompt-cache invariant), so the prompt decision is per session, re-evaluated whenever the prompt is rebuilt (context compression); a resumed session reuses its stored prompt. On omit the memory blocks are replaced by the line `Curated notes are not shown in this chat.` The `memory` tool asks the hook on every call and, on omit, refuses without touching the store (its results echo stored entries). Files read through other tools (`read_file`, `terminal`) are not gated. The background-review fork carries the parent chat's identity, so its `memory` tool calls are judged by the same audience.
+
+**Per-entry filter (circles).** An entry may start with a plain-text marker on its first line, `[circle: <tag>[, <tag>...]]`. A callback may return `{"keep": keep}`, where `keep(tags: frozenset[str]) -> bool` decides one entry by its tags (an entry without a marker gets `frozenset()`). `keep` must return `True` to keep an entry; anything else, or a raise, hides it, and with several callbacks every `keep` must keep it (any `"omit"` still omits everything). The prompt then renders only the kept entries, markers visible; the `memory` tool sees, matches and changes only kept entries (hidden ones are left untouched), and its char limit still counts the whole file. A patch cannot change an entry's marker. On `"memory_tool_write"` the dict may add `"write_circle": "<tag>"` (or a list): core strips any marker the model wrote at the start of the new entry and prefixes `[circle: <tag>]`. A batch with several adds asks once per add, so each add gets its own write circle; every call's `keep` must keep an entry for the call to see it, and any omit refuses the whole call. The `/memory` command (`"memory_command"`) runs only on a plain `"allow"` or `None`: a dict verdict refuses it, because pending writes carry no circle yet. Text containing a line that is just `§` (the entry separator) is always refused. A dict without a callable `keep` or a valid `write_circle` fails closed. `"allow"` / `"omit"` / `None` keep their meaning, so an older plugin sees no change.
 
 **Allow only stable audiences.** Because the prompt decision is taken per system-prompt build, an `"allow"` stays in the prompt until the next rebuild even if the chat's membership changes (someone joins a group mid-session). A plugin should therefore return `"allow"` only for audiences that cannot change mid-session, such as 1:1 DMs with a known person, and `"omit"` for groups and channels.
 

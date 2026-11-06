@@ -166,7 +166,7 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
             "error": (f"'{action}' needs old_text -- a short unique substring of the entry "
                       f"to {action}. None was provided. Reissue the {action} with old_text "
                       f"set to part of one of the current_entries below."),
-            "current_entries": store._entries_for(target), "usage": store._usage(target)}, ensure_ascii=False)
+            "current_entries": store._visible_entries(target), "usage": store._usage(target)}, ensure_ascii=False)
     if action == "patch" and not content:
         FAILURE_CLASS.set("missing_content")
         return tool_error(f"content (the new text for the old_text span) is required for 'patch' action. "
