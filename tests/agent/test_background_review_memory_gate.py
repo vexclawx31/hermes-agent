@@ -80,6 +80,6 @@ def test_fork_memory_tool_is_gated_by_the_parent_chat(manager, agent_patches):
         fork, {"action": "add", "target": "memory", "content": "Group chat detail."}, ctx))
 
     assert result.get("success") is False
-    assert seen == [("C123", "group", "U9", "memory_tool")]
+    assert seen == [("C123", "group", "U9", "memory_tool_write")]  # an add asks the write surface
     fork._memory_store.load_from_disk()
     assert not fork._memory_store.format_for_system_prompt("memory")

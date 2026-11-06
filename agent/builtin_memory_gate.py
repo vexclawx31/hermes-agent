@@ -12,20 +12,42 @@ Contract:
 - Any callback answering ``"omit"`` omits; ``"allow"`` and ``None`` allow. Fail closed: a callback
   that raises, times out (``plugins.hook_callback_timeout``) or returns anything else omits, and so
   does a failure to dispatch the hook at all.
+- Per-entry filter (circles): a callback may instead return ``{"keep": keep}``, where
+  ``keep(tags: frozenset[str]) -> bool`` decides one entry by its circle tags. An entry carries tags
+  when its first line starts with a marker, ``[circle: <tag>[, <tag>...]]`` (plain text, so the
+  files stay readable); an entry without one gets ``frozenset()`` and the plugin decides what that
+  means. ``keep`` must return ``True`` to keep an entry: anything else, or a raise, hides it. With
+  several callbacks an entry is kept only if every ``keep`` keeps it, and any ``"omit"`` still
+  omits everything. A dict that is not a valid verdict (no callable ``keep`` and no valid
+  ``write_circle``, e.g. the block directive a timeout produces) omits.
 - System prompt (``surface="system_prompt"``): evaluated each time the prompt is built, i.e. once per
   session and again at a rebuild boundary (context compression). The prompt is cached per session
   (prompt-cache invariant), so a mid-session audience change takes effect at the next rebuild or
   session; a resumed session reuses its stored prompt bytes and the decision baked into them. On
-  omit the block is replaced by :data:`OMITTED_NOTE`.
-- ``memory`` tool (``surface="memory_tool"``): evaluated on every call; on omit the tool refuses
-  without touching the store, because its results echo stored entries (``current_entries``,
-  ``matches``) and its writes would mix this chat's content into the curated notes.
+  omit the block is replaced by :data:`OMITTED_NOTE`. With ``keep`` only the kept entries are
+  rendered, marker included (the model sees each entry's circle); the usage figure still counts the
+  whole file.
+- ``memory`` tool (``surface="memory_tool"``, or ``"memory_tool_write"`` when the call adds an entry):
+  evaluated on every call; on omit the tool refuses without touching the store, because its results
+  echo stored entries (``current_entries``, ``matches``) and its writes would mix this chat's content
+  into the curated notes. With ``keep``, hidden entries are invisible to the call: never echoed,
+  never matched by ``patch``/``remove``, never changed; char limits still count the whole file. A
+  patch may not change an entry's marker.
+- Write circle: on ``"memory_tool_write"`` a dict verdict may carry ``"write_circle": "<tag>"`` (or a
+  list of tags); core prefixes each added entry with that marker on its own first line. Whenever any
+  callback answers with a dict, markers the model wrote at the start of an added entry are stripped
+  first, because the model can't choose its own circle. Several callbacks' write circles are united
+  (more tags only narrow who may see the entry). Without a dict verdict (an old plugin) adds are
+  stored exactly as today.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+from tools.memory_tool_store import circle_marker, entry_circles, strip_circle_markers
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +55,54 @@ HOOK_NAME = "filter_builtin_memory"
 ALLOW = "allow"
 OMIT = "omit"
 OMITTED_NOTE = "Curated notes are not shown in this chat."
+SURFACE_SYSTEM_PROMPT = "system_prompt"
+SURFACE_MEMORY_TOOL = "memory_tool"
+SURFACE_MEMORY_TOOL_WRITE = "memory_tool_write"
+# Characters that would break the marker's one-line ``[circle: a, b]`` syntax.
+_BAD_TAG_CHARS = frozenset("[],\n\r")
+
+__all__ = [
+    "ALLOW", "OMIT", "OMITTED_NOTE", "BuiltinMemoryVerdict", "builtin_memory_allowed",
+    "builtin_memory_verdict", "circle_marker", "entry_circles", "strip_circle_markers",
+]
+
+
+@dataclass(frozen=True)
+class BuiltinMemoryVerdict:
+    """The combined answer of every ``filter_builtin_memory`` callback for one surface."""
+    allowed: bool
+    keeps: tuple[Callable[[frozenset[str]], Any], ...] = ()
+    write_circle: tuple[str, ...] = ()
+    circles: bool = False  # some callback answered with a dict (circle-aware plugin)
+
+    def keeps_entry(self, entry: str) -> bool:
+        """Whether one stored entry (marker included) may be shown; fails closed."""
+        if not self.allowed:
+            return False
+        tags = entry_circles(entry)
+        for keep in self.keeps:
+            try:
+                if keep(tags) is not True:
+                    return False
+            except Exception:
+                logger.warning("%s keep callback raised; omitting the entry (fail closed)", HOOK_NAME,
+                               exc_info=True)
+                return False
+        return True
+
+    def stamp(self, content: Any) -> Any:
+        """An added entry as it is stored: model-written markers stripped, the write circle prefixed.
+        Unchanged without a circle-aware verdict (old plugins keep today's behaviour)."""
+        if not self.circles or not isinstance(content, str):
+            return content
+        body = strip_circle_markers(content)
+        if not body or not self.write_circle:
+            return body
+        return f"{circle_marker(self.write_circle)}\n{body}"
+
+
+_ALLOW_ALL = BuiltinMemoryVerdict(allowed=True)
+_OMIT_ALL = BuiltinMemoryVerdict(allowed=False)
 
 
 def _payload(agent: Any, surface: str) -> dict[str, Any]:
@@ -47,22 +117,76 @@ def _payload(agent: Any, surface: str) -> dict[str, Any]:
     }
 
 
-def builtin_memory_allowed(agent: Any, surface: str) -> bool:
-    """Whether the built-in memory block may be shown for *agent*'s chat (contract above)."""
+def _write_circle_tags(value: Any) -> Optional[tuple[str, ...]]:
+    """Validated write_circle tags, or None when malformed (fail closed)."""
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, (list, tuple)) or not items:
+        return None
+    tags = []
+    for item in items:
+        tag = item.strip() if isinstance(item, str) else ""
+        if not tag or _BAD_TAG_CHARS.intersection(tag):
+            return None
+        tags.append(tag)
+    return tuple(tags)
+
+
+def _dict_verdict(result: dict) -> Optional[tuple[Optional[Callable], tuple[str, ...]]]:
+    """``(keep or None, write_circle tags)`` for a valid dict answer, else None."""
+    has_keep, has_circle = "keep" in result, "write_circle" in result
+    if not (has_keep or has_circle):
+        return None
+    keep = result.get("keep") if has_keep else None
+    if has_keep and not callable(keep):
+        return None
+    tags: tuple[str, ...] = ()
+    if has_circle:
+        parsed = _write_circle_tags(result.get("write_circle"))
+        if parsed is None:
+            return None
+        tags = parsed
+    return keep, tags
+
+
+def builtin_memory_verdict(agent: Any, surface: str) -> BuiltinMemoryVerdict:
+    """Ask every ``filter_builtin_memory`` callback about *agent*'s chat (contract above)."""
     try:
         from hermes_cli import plugins
 
         if not plugins.has_hook(HOOK_NAME):
-            return True
+            return _ALLOW_ALL
         results = plugins.invoke_hook(HOOK_NAME, **_payload(agent, surface))
     except Exception:
         logger.warning("%s dispatch failed; omitting built-in memory (fail closed)", HOOK_NAME, exc_info=True)
-        return False
+        return _OMIT_ALL
+    keeps: list[Callable] = []
+    write_circle: list[str] = []
+    circles = False
     for result in results:
+        if isinstance(result, dict):
+            parsed = _dict_verdict(result)
+            if parsed is None:
+                # Timeouts and raises arrive as block directives (fail-closed hook); malformed dicts too.
+                logger.warning("%s returned an invalid verdict; omitting built-in memory (fail closed)", HOOK_NAME)
+                return _OMIT_ALL
+            circles = True
+            if parsed[0] is not None:
+                keeps.append(parsed[0])
+            write_circle.extend(parsed[1])
+            continue
         if result == ALLOW:
             continue
         if result != OMIT:
-            # Timeouts and raises arrive as block directives (fail-closed hook); unknown values too.
             logger.warning("%s returned %r; omitting built-in memory (fail closed)", HOOK_NAME, result)
-        return False
-    return True
+        return _OMIT_ALL
+    if not circles:
+        return _ALLOW_ALL
+    return BuiltinMemoryVerdict(allowed=True, keeps=tuple(keeps),
+                                write_circle=tuple(dict.fromkeys(write_circle)), circles=True)
+
+
+def builtin_memory_allowed(agent: Any, surface: str) -> bool:
+    """Whether the WHOLE built-in memory block may be shown for *agent*'s chat. False when a
+    callback omits it or filters it per entry; callers that can filter use :func:`builtin_memory_verdict`."""
+    verdict = builtin_memory_verdict(agent, surface)
+    return verdict.allowed and not verdict.keeps

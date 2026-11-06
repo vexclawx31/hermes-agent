@@ -143,21 +143,54 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
     )
 
 
+def _memory_call_adds(args: dict) -> bool:
+    """Whether a memory tool call adds an entry (single op or inside a batch)."""
+    operations = args.get("operations")
+    return args.get("action") == "add" or (isinstance(operations, list) and any(
+        isinstance(op, dict) and op.get("action") == "add" for op in operations))
+
+
+def _stamp_memory_adds(args: dict, verdict: Any) -> dict:
+    """Copy of *args* with every added entry stamped with the verdict's circle (agent/builtin_memory_gate.py)."""
+    args = dict(args)
+    if args.get("action") == "add":
+        args["content"] = verdict.stamp(args.get("content") or args.get("new_text") or "")
+        args.pop("new_text", None)
+    operations = args.get("operations")
+    if isinstance(operations, list):
+        stamped = []
+        for op in operations:
+            if isinstance(op, dict) and op.get("action") == "add":
+                op = {**op, "content": verdict.stamp(op.get("content") or op.get("new_text") or "")}
+                op.pop("new_text", None)
+            stamped.append(op)
+        args["operations"] = stamped
+    return args
+
+
 def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
     # Same filter_builtin_memory gate as the prompt block: results echo stored entries, and writes
-    # would carry this chat's content into the curated notes. Evaluated per call; never touches the store.
-    from agent.builtin_memory_gate import OMITTED_NOTE, builtin_memory_allowed
-    if agent._memory_store is not None and not builtin_memory_allowed(agent, "memory_tool"):
-        from tools.registry import tool_error
-        return tool_error(f"{OMITTED_NOTE} The memory tool is unavailable here.", success=False)
-    result = _call_tool(
-        "tools.memory_tool", "memory_tool", args,
-        (
-            ("action", "action"), ("target", "target"), ("content", "content"),
-            ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
-        ),
-        store=agent._memory_store,
-    )
+    # would carry this chat's content into the curated notes. Evaluated per call; an omit never
+    # touches the store, and a per-entry verdict limits the call to the entries it keeps.
+    from agent.builtin_memory_gate import OMITTED_NOTE, builtin_memory_verdict
+    from tools.memory_tool_store import entry_view
+    keep = None
+    if agent._memory_store is not None:
+        verdict = builtin_memory_verdict(agent, "memory_tool_write" if _memory_call_adds(args) else "memory_tool")
+        if not verdict.allowed:
+            from tools.registry import tool_error
+            return tool_error(f"{OMITTED_NOTE} The memory tool is unavailable here.", success=False)
+        if verdict.circles:
+            args, keep = _stamp_memory_adds(args, verdict), verdict.keeps_entry
+    with entry_view(keep):
+        result = _call_tool(
+            "tools.memory_tool", "memory_tool", args,
+            (
+                ("action", "action"), ("target", "target"), ("content", "content"),
+                ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
+            ),
+            store=agent._memory_store,
+        )
     # Mirror built-in memory writes to external providers; gating lives in
     # MemoryManager.notify_memory_tool_write.
     if agent._memory_manager:
