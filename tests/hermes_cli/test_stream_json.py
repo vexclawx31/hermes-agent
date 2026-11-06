@@ -43,7 +43,7 @@ def test_emitter_event_stream_is_valid_jsonl(capsys):
     assert all("timestamp" in e for e in events)
 
 
-def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=True):
+def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=True, launch_skills=None):
     """parser → cmd_chat → cli.main → quiet single-query path with a deterministic fake agent."""
     import cli
     import hermes_cli.main as cli_entry
@@ -63,6 +63,8 @@ def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=
             self.agent = None
             self._active_agent_route_signature = None
             self.tool_progress_mode = None
+            if launch_skills is not None:
+                self.launch_skills = launch_skills
 
         def _claim_active_session(self, *_a, **_k):
             return True
@@ -113,9 +115,9 @@ def _interrupted_turn(_agent):
 
 
 @pytest.mark.parametrize("turn, credentials_ok, exit_code, types", [
-    (_ok_turn, True, 0, ["system", "text", "tool_use", "tool_result", "result"]),
-    (_interrupted_turn, True, 130, ["system", "result"]),
-    (_ok_turn, False, 1, ["system", "result"]),  # credentials fail before the agent exists
+    (_ok_turn, True, 0, ["system", "system", "text", "tool_use", "tool_result", "result"]),
+    (_interrupted_turn, True, 130, ["system", "system", "result"]),
+    (_ok_turn, False, 1, ["system", "result"]),  # credentials fail before the agent exists: no skills event
 ])
 def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, capsys, turn, credentials_ok, exit_code,
                                                                 types):
@@ -124,6 +126,24 @@ def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, caps
     assert code == exit_code
     assert [e["type"] for e in events] == types
     assert events[-1]["exit_code"] == exit_code and events[-1]["session_id"] == "session-123"
+
+
+def test_chat_stream_json_reports_loaded_and_missing_skills(monkeypatch, capsys):
+    """``system/skills`` follows ``init`` once the agent exists and names what `-s` really loaded."""
+    _code, events = _run_stream_json_chat(
+        monkeypatch, capsys, _ok_turn,
+        launch_skills={"loaded": ["switchboard-intake"], "missing": ["typo-skill"]})
+    assert [(e["type"], e.get("subtype")) for e in events[:2]] == [("system", "init"), ("system", "skills")]
+    skills = events[1]
+    assert skills["loaded"] == ["switchboard-intake"] and skills["missing"] == ["typo-skill"]
+    assert skills["session_id"] == "session-123"
+    assert [e for e in events if e.get("subtype") == "skills"] == [skills]
+
+
+def test_chat_stream_json_skills_event_is_empty_without_skills(monkeypatch, capsys):
+    """No `-s`: the event still comes, with empty lists, so a consumer never has to time out on it."""
+    _code, events = _run_stream_json_chat(monkeypatch, capsys, _ok_turn)
+    assert events[1]["subtype"] == "skills" and events[1]["loaded"] == [] and events[1]["missing"] == []
 
 
 @pytest.mark.parametrize("argv, message", [

@@ -81,3 +81,29 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
     # finalized (agent init), preserving the fail-loud contract.
     with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):
         _real_finalize(created["cli"])
+    # The -s outcome is recorded before the raise, so a caller can still report it.
+    assert created["cli"].launch_skills == {"loaded": [], "missing": ["missing-skill"]}
+
+
+def test_finalize_records_launch_skills_on_partial_miss(monkeypatch):
+    import cli as cli_mod
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None, excluded_loaded_names=None: ("skill prompt", ["tenant-desk"], ["typo-skill"]),
+    )
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(skills="tenant-desk,typo-skill", list_tools=True)
+
+    _real_finalize(created["cli"])
+    assert created["cli"].launch_skills == {"loaded": ["tenant-desk"], "missing": ["typo-skill"]}
+    assert created["cli"].preloaded_skills == ["tenant-desk"]

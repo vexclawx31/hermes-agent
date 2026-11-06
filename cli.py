@@ -1025,6 +1025,9 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         if not result:
             return
         skills_prompt, loaded_skills, missing_skills = result
+        # What `-s` actually loaded, for the stream-json ``system/skills`` event (set before a
+        # possible all-missing raise, so a caller can still report what was missing).
+        self.launch_skills = {"loaded": list(loaded_skills), "missing": list(missing_skills)}
         if missing_skills:
             from agent.skill_commands import format_missing_skills
             # A typo'd name must not crash a kanban worker; only a fully-missing set fails loudly.

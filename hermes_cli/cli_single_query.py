@@ -550,6 +550,9 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                     _configure_quiet_agent(cli.agent)
                     if emitter is not None:
                         emitter.attach(cli.agent)
+                        # _init_agent ran finalize_preloaded_skills: the -s outcome is final here.
+                        launch_skills = getattr(cli, "launch_skills", None) or {}
+                        emitter.emit_skills(launch_skills.get("loaded"), launch_skills.get("missing"))
                     _run_quiet_single_query(cli, effective_query, emitter=emitter)
 
             fail_code = _single_query_exit_code(
