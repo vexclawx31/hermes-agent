@@ -412,6 +412,8 @@ class CLIInitMixin:
         from hermes_cli.prompt_stash import PromptStash as _PromptStash
         self._prompt_stash = _PromptStash()
         self.preloaded_skills: list[str] = []
+        # `-s/--skills` outcome only (not skills.auto_load), filled by finalize_preloaded_skills.
+        self.launch_skills: dict[str, list[str]] = {"loaded": [], "missing": []}
         self._startup_skills_line_shown = False
         # skills.auto_load rendered in the preload thread; None until joined. Handed to every
         # agent this CLI builds so the prompt bytes never depend on when the agent was created.
@@ -421,6 +423,7 @@ class CLIInitMixin:
         self._preload_skills_result: Optional[tuple] = None
         self._preload_skills_error: Optional[BaseException] = None
         self._preload_skills_requested: list = []
+        self._launch_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
 

@@ -471,6 +471,12 @@ def _install_single_query_signal_handlers(cli):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
 
 
+def _emit_launch_skills(emitter, cli) -> None:
+    """Write the stream-json ``system/skills`` event from the CLI's finalized ``-s`` outcome."""
+    launch_skills = getattr(cli, "launch_skills", None) or {}
+    emitter.emit_skills(launch_skills.get("loaded"), launch_skills.get("missing"))
+
+
 def _configure_quiet_agent(agent) -> None:
     """Neutralize every stdout-writing callback so -Q stdout carries only the final response."""
     agent.quiet_mode = True
@@ -542,14 +548,27 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                 turn_route = cli._resolve_turn_agent_config(effective_query)
                 if turn_route["signature"] != cli._active_agent_route_signature:
                     cli.agent = None
-                if cli._init_agent(
-                    model_override=turn_route["model"],
-                    runtime_override=turn_route["runtime"],
-                    request_overrides=turn_route.get("request_overrides"),
-                ):
+                try:
+                    agent_ready = cli._init_agent(
+                        model_override=turn_route["model"],
+                        runtime_override=turn_route["runtime"],
+                        request_overrides=turn_route.get("request_overrides"),
+                    )
+                except Exception as init_exc:
+                    if emitter is None:
+                        raise
+                    # e.g. every -s skill unknown (finalize_preloaded_skills raises): keep stdout
+                    # JSONL-only and close the protocol with what -s did load (nothing) and why.
+                    _emit_launch_skills(emitter, cli)
+                    emitter.emit_result({"failed": True, "error": str(init_exc)},
+                                        session_id=cli.session_id or "", exit_code=1)
+                    exit_single_query(1)
+                if agent_ready:
                     _configure_quiet_agent(cli.agent)
                     if emitter is not None:
                         emitter.attach(cli.agent)
+                        # _init_agent ran finalize_preloaded_skills: the -s outcome is final here.
+                        _emit_launch_skills(emitter, cli)
                     _run_quiet_single_query(cli, effective_query, emitter=emitter)
 
             fail_code = _single_query_exit_code(

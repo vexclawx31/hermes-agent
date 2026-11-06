@@ -79,6 +79,16 @@ class StreamJsonEmitter:
                         "output": output if len(output) <= _TOOL_OUTPUT_CAP else output[:_TOOL_OUTPUT_CAP] + "...",
                         "duration_ms": int(float(duration) * 1000), "is_error": bool(kwargs.get("is_error", False))})
 
+    def emit_skills(self, loaded: Any = None, missing: Any = None) -> None:
+        """``system/skills``: which ``-s/--skills`` skills actually loaded into the prompt and which
+        were skipped, written once after agent init, or before the failing ``result`` when agent
+        init raised (``init`` precedes the preload by design). ``loaded`` holds canonical skill
+        names (a ``category/name`` argument reports as ``name``); ``missing`` holds the requested
+        identifiers, possibly with an ambiguity note."""
+        self._emit({"type": "system", "subtype": "skills", "session_id": self._session_id,
+                    "loaded": [str(name) for name in loaded or []],
+                    "missing": [str(name) for name in missing or []]})
+
     def emit_result(self, result: Any, session_id: str = "", exit_code: int = 0) -> int:
         """Write the terminal ``result`` record (once) and return the process exit code it reports."""
         data = result if isinstance(result, dict) else {"final_response": "" if result is None else str(result)}
