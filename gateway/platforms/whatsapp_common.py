@@ -318,11 +318,25 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         source.sender_role = "owner" if self._is_whatsapp_owner(getattr(source, "user_id", None)) else "member"
 
     def toolsets_for_source(self, source) -> Optional[list[str]]:
-        """``extra.guest_toolsets`` for any caller that is not an owner; owners keep the platform toolsets.
-        In a trusted group every member gets the owner's toolsets."""
+        """Toolsets for any caller that is not an owner; owners keep the platform toolsets.
+
+        In a group, ``groups.<chat_id>.guest_toolsets`` (same lookup as ``allow_from``: exact, then
+        case-insensitive, then ``"*"``) replaces ``extra.guest_toolsets`` for that group only.
+
+        A trusted group is one shared session, so its tool schema stays the owner's for every turn
+        (None here, and ``guest_toolsets`` is not applied there). Members are not promised owner
+        parity: a member kit is enforced per turn at the tool boundary by a ``pre_tool_call`` plugin,
+        which sees each turn's trusted ``sender_role``. Without such a plugin members can call the
+        owner's tools."""
         if getattr(source, "chat_type", "") == "group" and self._group_is_trusted(str(getattr(source, "chat_id", "") or "")):
             return None
         guest = self.config.extra.get("guest_toolsets")
+        if getattr(source, "chat_type", "") == "group":
+            group_cfg = self._resolve_group_cfg(str(getattr(source, "chat_id", "") or ""))
+            if "guest_toolsets" in group_cfg:
+                # Present means this group's kit: a null/blank value is an empty kit (no tools), never
+                # "unset", which with no owners configured would widen to the platform toolsets.
+                guest = group_cfg["guest_toolsets"] if group_cfg["guest_toolsets"] is not None else []
         if guest is None and not getattr(self, "_owners", None):
             return None
         if self._is_whatsapp_owner(getattr(source, "user_id", None)):

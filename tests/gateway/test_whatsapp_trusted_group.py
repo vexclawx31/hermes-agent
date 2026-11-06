@@ -1,5 +1,6 @@
-"""Trusted WhatsApp groups: ``groups.<jid>.trust: trusted`` gives every member the owner's toolsets,
-one shared group session, and a sender tag whose role comes from the verified sender id."""
+"""Trusted WhatsApp groups: ``groups.<jid>.trust: trusted`` gives the shared session the owner's tool
+schema for every turn, one shared group session, and a sender tag whose role comes from the verified
+sender id. A member kit is enforced per turn at the tool boundary by a plugin, not by the schema."""
 
 import asyncio
 from types import SimpleNamespace
@@ -63,6 +64,19 @@ def test_closed_group_and_wildcard_keep_guest_toolsets():
     assert sorted(adapter.toolsets_for_source(_source(MEMBER, chat_id=CLOSED))) == ["vision", "web"]
     other = "120363000000000009@g.us"  # only matches "*", whose trust key is ignored
     assert sorted(adapter.toolsets_for_source(_source(MEMBER, chat_id=other))) == ["vision", "web"]
+
+
+def test_trusted_group_kit_keeps_the_owner_schema_untrusted_kit_applies():
+    kit = ["web", "todo"]
+    adapter = _adapter({**EXTRA, "groups": {
+        TRUSTED: {"allow_from": ["*"], "trust": "trusted", "guest_toolsets": kit},
+        CLOSED: {"allow_from": ["*"], "guest_toolsets": kit},
+    }})
+    # One shared session: its schema stays the owner's; the plugin locks member turns per call.
+    assert adapter.toolsets_for_source(_source(MEMBER)) is None
+    assert adapter.toolsets_for_source(_source(OWNER)) is None
+    assert sorted(adapter.toolsets_for_source(_source(MEMBER, chat_id=CLOSED))) == ["todo", "web"]
+    assert adapter.toolsets_for_source(_source(OWNER, chat_id=CLOSED)) is None
 
 
 def test_trust_key_is_case_insensitive_and_value_strict():
