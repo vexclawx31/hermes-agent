@@ -143,45 +143,54 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
     )
 
 
-def _memory_call_adds(args: dict) -> bool:
-    """Whether a memory tool call adds an entry (single op or inside a batch)."""
-    operations = args.get("operations")
-    return args.get("action") == "add" or (isinstance(operations, list) and any(
-        isinstance(op, dict) and op.get("action") == "add" for op in operations))
-
-
-def _stamp_memory_adds(args: dict, verdict: Any) -> dict:
-    """Copy of *args* with every added entry stamped with the verdict's circle (agent/builtin_memory_gate.py)."""
-    args = dict(args)
-    if args.get("action") == "add":
-        args["content"] = verdict.stamp(args.get("content") or args.get("new_text") or "")
-        args.pop("new_text", None)
+def _added_entries(args: dict) -> list[str]:
+    """Text of every entry a memory tool call adds (single op, then batch order), model markers stripped."""
+    from tools.memory_tool_store import strip_circle_markers
+    ops = [args] if args.get("action") == "add" else []
     operations = args.get("operations")
     if isinstance(operations, list):
-        stamped = []
-        for op in operations:
-            if isinstance(op, dict) and op.get("action") == "add":
-                op = {**op, "content": verdict.stamp(op.get("content") or op.get("new_text") or "")}
-                op.pop("new_text", None)
-            stamped.append(op)
-        args["operations"] = stamped
+        ops += [op for op in operations if isinstance(op, dict) and op.get("action") == "add"]
+    return [strip_circle_markers(op.get("content") or op.get("new_text") or "") for op in ops]
+
+
+def _stamp_memory_adds(args: dict, verdicts: list) -> dict:
+    """Copy of *args* with each added entry stamped by its own verdict (agent/builtin_memory_gate.py)."""
+    args, stamps = dict(args), iter(verdicts)
+
+    def _stamped(op: dict) -> dict:
+        op = {**op, "content": next(stamps).stamp(op.get("content") or op.get("new_text") or "", strip=True)}
+        op.pop("new_text", None)
+        return op
+
+    if args.get("action") == "add":
+        args = _stamped(args)
+    operations = args.get("operations")
+    if isinstance(operations, list):
+        args["operations"] = [_stamped(op) if isinstance(op, dict) and op.get("action") == "add" else op
+                              for op in operations]
     return args
 
 
 def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
     # Same filter_builtin_memory gate as the prompt block: results echo stored entries, and writes
-    # would carry this chat's content into the curated notes. Evaluated per call; an omit never
-    # touches the store, and a per-entry verdict limits the call to the entries it keeps.
+    # would carry this chat's content into the curated notes. Evaluated per call (once per added
+    # entry, with its text); an omit never touches the store, and per-entry verdicts limit the call
+    # to the entries every one of them keeps.
     from agent.builtin_memory_gate import OMITTED_NOTE, builtin_memory_verdict
     from tools.memory_tool_store import entry_view
     keep = None
     if agent._memory_store is not None:
-        verdict = builtin_memory_verdict(agent, "memory_tool_write" if _memory_call_adds(args) else "memory_tool")
-        if not verdict.allowed:
+        added = _added_entries(args)
+        verdicts = ([builtin_memory_verdict(agent, "memory_tool_write", content=text) for text in added]
+                    or [builtin_memory_verdict(agent, "memory_tool")])
+        if not all(verdict.allowed for verdict in verdicts):
             from tools.registry import tool_error
             return tool_error(f"{OMITTED_NOTE} The memory tool is unavailable here.", success=False)
-        if verdict.circles:
-            args, keep = _stamp_memory_adds(args, verdict), verdict.keeps_entry
+        if any(verdict.circles for verdict in verdicts):
+            args = _stamp_memory_adds(args, verdicts) if added else args
+
+            def keep(entry: str) -> bool:
+                return all(verdict.keeps_entry(entry) for verdict in verdicts)
     with entry_view(keep):
         result = _call_tool(
             "tools.memory_tool", "memory_tool", args,

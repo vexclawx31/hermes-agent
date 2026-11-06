@@ -33,8 +33,12 @@ Contract:
   into the curated notes. With ``keep``, hidden entries are invisible to the call: never echoed,
   never matched by ``patch``/``remove``, never changed; char limits still count the whole file. A
   patch may not change an entry's marker.
-- Write circle: on ``"memory_tool_write"`` a dict verdict may carry ``"write_circle": "<tag>"`` (or a
-  list of tags); core prefixes each added entry with that marker on its own first line. Whenever any
+- Write circle: a ``memory`` call that adds entries asks once per added entry with
+  ``surface="memory_tool_write"`` and ``content=<that entry's text>`` (leading markers stripped, not
+  yet stamped), so a plugin can classify it; a batch with several adds makes one call per add, and
+  every call's ``keep`` must keep an entry for the whole call to see it. A dict verdict may carry
+  ``"write_circle": "<tag>"`` (or a list of tags); core prefixes that add with the marker on its own
+  first line. Callbacks without ``content`` (or ``**kwargs``) in their signature don't receive it. Whenever any
   callback answers with a dict, markers the model wrote at the start of an added entry are stripped
   first, because the model can't choose its own circle. Several callbacks' write circles are united
   (more tags only narrow who may see the entry). Without a dict verdict (an old plugin) adds are
@@ -100,10 +104,11 @@ class BuiltinMemoryVerdict:
                 return False
         return True
 
-    def stamp(self, content: Any) -> Any:
+    def stamp(self, content: Any, strip: Optional[bool] = None) -> Any:
         """An added entry as it is stored: model-written markers stripped, the write circle prefixed.
-        Unchanged without a circle-aware verdict (old plugins keep today's behaviour)."""
-        if not self.circles or not isinstance(content, str):
+        Unchanged without a circle-aware verdict (old plugins keep today's behaviour); *strip* forces
+        the stripping when another callback answer of the same call was circle-aware."""
+        if not (self.circles if strip is None else strip) or not isinstance(content, str):
             return content
         body = strip_circle_markers(content)
         if not body or not self.write_circle:
@@ -158,14 +163,18 @@ def _dict_verdict(result: dict) -> Optional[tuple[Optional[Callable], tuple[str,
     return keep, tags
 
 
-def builtin_memory_verdict(agent: Any, surface: str) -> BuiltinMemoryVerdict:
-    """Ask every ``filter_builtin_memory`` callback about *agent*'s chat (contract above)."""
+def builtin_memory_verdict(agent: Any, surface: str, content: Optional[str] = None) -> BuiltinMemoryVerdict:
+    """Ask every ``filter_builtin_memory`` callback about *agent*'s chat (contract above). On
+    ``"memory_tool_write"`` *content* is the entry being added (model markers stripped, not yet stamped)."""
     try:
         from hermes_cli import plugins
 
         if not plugins.has_hook(HOOK_NAME):
             return _ALLOW_ALL
-        results = plugins.invoke_hook(HOOK_NAME, **_payload(agent, surface))
+        payload = _payload(agent, surface)
+        if content is not None:
+            payload["content"] = content
+        results = plugins.invoke_hook(HOOK_NAME, **payload)
     except Exception:
         logger.warning("%s dispatch failed; omitting built-in memory (fail closed)", HOOK_NAME, exc_info=True)
         return _OMIT_ALL

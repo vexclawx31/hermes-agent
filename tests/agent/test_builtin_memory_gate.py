@@ -344,6 +344,74 @@ def test_old_plugin_add_is_stored_verbatim(manager, circle_agent):
     assert "[circle: everyone]\nLikes jazz." in _disk_entries()
 
 
+def test_write_surface_gets_the_entry_text_after_marker_stripping(manager, circle_agent):
+    seen = []
+
+    def gate(surface, **kwargs):
+        seen.append((surface, kwargs.get("content")))
+        return {"keep": lambda tags: True, "write_circle": "household"}
+
+    _register(manager, gate)
+    assert _memory_tool(circle_agent, action="add", target="memory",
+                        content="[circle: everyone]\nMovie night is Friday.")["success"]
+    assert seen == [("memory_tool_write", "Movie night is Friday.")]  # stripped, not yet stamped
+
+
+def test_batch_asks_once_per_added_entry_and_stamps_each_with_its_own_circle(manager, circle_agent):
+    seen = []
+
+    def gate(surface, content=None, **_):
+        seen.append((surface, content))
+        circle = "private_to:jamal" if content and "gift" in content else "household"
+        return {"keep": lambda tags: True, "write_circle": circle}
+
+    _register(manager, gate)
+    result = _memory_tool(circle_agent, target="memory", operations=[
+        {"action": "add", "content": "Pauline's birthday gift: a kite."},
+        {"action": "patch", "old_text": "short paragraphs", "content": "short answers"},
+        {"action": "add", "new_text": "[circle: everyone]\nBins go out on Tuesday."},
+    ])
+    assert result["success"] is True
+    assert seen == [("memory_tool_write", "Pauline's birthday gift: a kite."),
+                    ("memory_tool_write", "Bins go out on Tuesday.")]
+    entries = _disk_entries()
+    assert "[circle: private_to:jamal]\nPauline's birthday gift: a kite." in entries
+    assert "[circle: household]\nBins go out on Tuesday." in entries
+
+
+def test_batch_add_is_refused_when_any_add_is_omitted(manager, circle_agent):
+    _register(manager, lambda content=None, **_: "omit" if content and "secret" in content else "allow")
+    result = _memory_tool(circle_agent, target="memory", operations=[
+        {"action": "add", "content": "Fine fact."}, {"action": "add", "content": "A secret fact."}])
+    assert result["success"] is False and OMITTED_NOTE in result["error"]
+    assert not any("Fine fact." in entry for entry in _disk_entries())
+
+
+def test_old_narrow_plugin_signature_never_sees_content(manager, circle_agent):
+    seen = []
+
+    def gate(session_id, platform, chat_id, chat_type, sender_id, surface):  # an old, narrow callback
+        seen.append(surface)
+        return "allow"
+
+    _register(manager, gate)
+    assert _memory_tool(circle_agent, action="add", target="memory", content="Likes tea.")["success"]
+    assert seen == ["memory_tool_write"]
+
+
+def test_non_write_calls_carry_no_content(manager, circle_agent):
+    seen = []
+
+    def gate(surface, **kwargs):
+        seen.append((surface, "content" in kwargs))
+        return "allow"
+
+    _register(manager, gate)
+    _memory_tool(circle_agent, action="remove", target="memory", old_text="nothing like this")
+    _prompt(circle_agent)
+    assert seen == [("memory_tool", False), ("system_prompt", False)]
+
+
 def test_omit_still_refuses_writes(manager, circle_agent):
     _register(manager, lambda **_: "omit")
     result = _memory_tool(circle_agent, action="add", target="memory", content="New fact.")
