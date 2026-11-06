@@ -382,14 +382,16 @@ def _resolve_supporting_file(skill_dir: Path, file_path: str):
 
 
 def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
-    """Find the skill; a delete also runs the background-review delete guard; a skill whose
-    directory is not writable is refused -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
+    """Find the skill; a delete also runs the background-review delete guard; delete and edit (whose
+    target is SKILL.md) are refused up front when the agent cannot write the directories they touch
+    (patch/write_file/remove_file check their resolved target) -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
     existing = _find_skill(name)
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
     guard = _background_review_delete_guard(name, skill_dir) if action == "delete" else None
-    guard = guard or _read_only_skill_guard(name, skill_dir, action)
+    if not guard and action in ("delete", "edit"):
+        guard = _read_only_skill_guard(name, skill_dir, action)
     return (None, guard) if guard else (skill_dir, None)
 
 
@@ -527,6 +529,8 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
         target = skill_dir / "SKILL.md"
     if not target.exists():
         return _err(f"File not found: {target.relative_to(skill_dir)}")
+    if ro_guard := _read_only_skill_guard(name, skill_dir, "patch", target):
+        return ro_guard
     if read_guard := _background_review_read_before_write_guard(name, target, "patch", target_label):
         return read_guard
     content = target.read_text(encoding="utf-8-sig")
@@ -617,7 +621,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> dict[str, Any]:
     if guard:
         return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
-    if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
+    if guard := (err or _read_only_skill_guard(name, skill_dir, "write_file", target)
+                 or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content)):
         return guard
     result = {"success": True, "message": f"File '{file_path}' written to skill '{name}'.", "path": str(target)}
     # references/ is where per-session hoarding shows up; surface the sprawl finding on the write
@@ -641,8 +646,9 @@ def _remove_file(name: str, file_path: str) -> dict[str, Any]:
         available = [str(f.relative_to(skill_dir)) for subdir in ALLOWED_SUBDIRS
                      if (skill_dir / subdir).exists() for f in (skill_dir / subdir).rglob("*") if f.is_file()]
         return _err(f"File '{file_path}' not found in skill '{name}'.", available_files=available or None)
-    if read_guard := _background_review_read_before_write_guard(name, target, "remove_file", file_path):
-        return read_guard
+    if guard := (_read_only_skill_guard(name, skill_dir, "remove_file", target)
+                 or _background_review_read_before_write_guard(name, target, "remove_file", file_path)):
+        return guard
     target.unlink()
     _rmdir_if_empty(target.parent, skill_dir)
     return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}

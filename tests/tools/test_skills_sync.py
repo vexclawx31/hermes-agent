@@ -19,6 +19,9 @@ from tools.skills_sync import (
 )
 from tools.skills_sync_bundled_ops import reset_bundled_skill
 
+_POSIX_NON_ROOT = pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs POSIX permissions and a non-root user")
+
 
 class TestReadWriteManifest:
     def test_write_and_read_roundtrip_v2(self, tmp_path):
@@ -390,48 +393,148 @@ class TestRenamedBundledSkillRecovery:
         assert "moved-skill" not in result["copied"]
         assert "moved-skill" not in result.get("relocated", [])
 
-    @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
-                        reason="needs POSIX permissions and a non-root user")
-    def test_read_only_copies_are_skipped_quietly_and_writable_ones_still_sync(self, tmp_path, caplog, capsys):
-        """A sealed (read-only) copy must not raise PermissionError out of _move_dir /
-        _replace_skill_dir at every gateway start, nor log a warning each time. Writable
-        copies in the same run still relocate."""
+    @staticmethod
+    def _seal(d):
+        """The sealed-release shape: dirs 0555, files 0444."""
+        for dp, _dn, fn in os.walk(d, topdown=False):
+            for f in fn:
+                os.chmod(os.path.join(dp, f), 0o444)
+            os.chmod(dp, 0o555)
+
+    @staticmethod
+    def _owner_writable(d):
+        return all(os.stat(os.path.join(dp, n)).st_mode & stat.S_IWUSR
+                   for dp, dn, fn in os.walk(d) for n in [".", *dn, *fn])
+
+    @pytest.fixture
+    def unseal(self, tmp_path):
+        yield
+        for dp, _dn, _fn in os.walk(tmp_path):
+            os.chmod(dp, 0o755)
+
+    @_POSIX_NON_ROOT
+    def test_sealed_mode_copy_is_healed_then_moved(self, tmp_path, unseal):
+        """exnox/opix live shape: research/x is 0555 (SKILL.md 0444), parents 0755, dest absent."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        old = self._skill(skills_dir, "research/moved-skill")
+        manifest_file.write_text(f"moved-skill:{_dir_hash(old)}\n")
+        self._seal(old)
+        self._skill(bundled, "web/moved-skill", body="# Updated upstream\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        new = skills_dir / "web" / "moved-skill"
+        assert result["relocated"] == ["moved-skill"] and "moved-skill" in result["updated"]
+        assert not old.exists()
+        assert "Updated upstream" in (new / "SKILL.md").read_text()
+        assert self._owner_writable(new)
+        assert result["read_only"] == []
+
+    @_POSIX_NON_ROOT
+    def test_sealed_orphan_backup_is_recovered(self, tmp_path, unseal):
+        """cat/foo.bak -> cat/foo is a same-parent rename: a 0555 .bak must not block it."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        bak = self._skill(skills_dir, "cat/foo.bak", name="foo")
+        manifest_file.write_text(f"foo:{_dir_hash(bak)}\n")
+        self._seal(bak)
+        self._skill(bundled, "cat/foo", name="foo")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert (skills_dir / "cat" / "foo" / "SKILL.md").exists()
+        assert not bak.exists()
+        assert result["read_only"] == []
+
+    @_POSIX_NON_ROOT
+    def test_fresh_install_from_sealed_release_is_owner_writable(self, tmp_path, unseal):
+        """Root cause: copytree kept the release's 0555/0444 modes, so every profile copy was
+        read-only and skill_manage refused (or crashed on) it forever."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        skills_dir.mkdir()
+        manifest_file = skills_dir / ".bundled_manifest"
+        src = self._skill(bundled, "autonomous-ai-agents/hermes-agent", name="hermes-agent")
+        (src / "references").mkdir()
+        (src / "references" / "notes.md").write_text("notes\n")
+        self._seal(src)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        dest = skills_dir / "autonomous-ai-agents" / "hermes-agent"
+        assert result["copied"] == ["hermes-agent"]
+        assert self._owner_writable(dest)
+
+    @_POSIX_NON_ROOT
+    def test_existing_sealed_copy_is_healed_and_updated(self, tmp_path, unseal):
+        """Live profiles heal at their first start: an unchanged sealed copy becomes writable,
+        and a pristine one whose bundled version changed is updated."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        stable = self._skill(skills_dir, "cat/stable", name="stable")
+        changed = self._skill(skills_dir, "cat/changed", name="changed")
+        manifest_file.write_text(f"stable:{_dir_hash(stable)}\nchanged:{_dir_hash(changed)}\n")
+        self._seal(stable)
+        self._seal(changed)
+        self._skill(bundled, "cat/stable", name="stable")
+        self._skill(bundled, "cat/changed", body="# Updated upstream\n", name="changed")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert result["updated"] == ["changed"]
+        assert "Updated upstream" in (changed / "SKILL.md").read_text()
+        assert self._owner_writable(stable) and self._owner_writable(changed)
+
+    @_POSIX_NON_ROOT
+    def test_unwritable_trees_are_skipped_and_reported_once(self, tmp_path, caplog, capsys, unseal):
+        """A tree chmod cannot heal (here: a 0555 category dir, which sync does not own) is
+        skipped without a warning or traceback, listed in ``read_only`` and in ONE info line;
+        a modified copy keeps its "kept" note; writable copies in the same run still sync."""
         bundled = tmp_path / "bundled"
         skills_dir = tmp_path / "user_skills"
         manifest_file = skills_dir / ".bundled_manifest"
 
         moved = self._skill(skills_dir, "oldcat/moved-skill")
-        sealed_move = self._skill(skills_dir, "sealed/ro-moved", name="ro-moved")
-        sealed_update = self._skill(skills_dir, "sealedcat/ro-updated", name="ro-updated")
+        stuck_move = self._skill(skills_dir, "sealed/ro-moved", name="ro-moved")
+        stuck_update = self._skill(skills_dir, "sealedcat/ro-updated", name="ro-updated")
+        edited = self._skill(skills_dir, "sealed/edited", name="edited")
         manifest_file.write_text(
-            f"moved-skill:{_dir_hash(moved)}\nro-moved:{_dir_hash(sealed_move)}\n"
-            f"ro-updated:{_dir_hash(sealed_update)}\n")
+            f"moved-skill:{_dir_hash(moved)}\nro-moved:{_dir_hash(stuck_move)}\n"
+            f"ro-updated:{_dir_hash(stuck_update)}\nedited:{_dir_hash(edited)}\n")
+        (edited / "SKILL.md").write_text("---\nname: edited\n---\n# MY EDITS\n")
 
-        # Upstream renamed two of them and changed the third in place.
         self._skill(bundled, "newcat/moved-skill", body="# Updated upstream\n")
         self._skill(bundled, "newcat/ro-moved", body="# Updated upstream\n", name="ro-moved")
         self._skill(bundled, "sealedcat/ro-updated", body="# Updated upstream\n", name="ro-updated")
-
-        sealed_dirs = [sealed_move, sealed_move.parent, sealed_update.parent]
-        for d in sealed_dirs:
+        self._skill(bundled, "newcat/edited", body="# Updated upstream\n", name="edited")
+        for d in (stuck_move.parent, stuck_update.parent):
             d.chmod(0o555)
-        try:
-            with self._patches(bundled, skills_dir, manifest_file), \
-                 caplog.at_level("DEBUG", logger="tools.skills_sync"):
-                result = sync_skills(quiet=False)
-        finally:
-            for d in sealed_dirs:
-                d.chmod(0o755)
 
+        with self._patches(bundled, skills_dir, manifest_file), \
+             caplog.at_level("DEBUG", logger="tools.skills_sync"):
+            result = sync_skills(quiet=False)
+
+        out = capsys.readouterr().out
         assert result["relocated"] == ["moved-skill"]
         assert (skills_dir / "newcat" / "moved-skill" / "SKILL.md").exists()
-        assert (sealed_move / "SKILL.md").exists()
-        assert not (skills_dir / "newcat" / "ro-moved").exists()
-        assert "ro-updated" not in result["updated"]
-        assert "# Body" in (sealed_update / "SKILL.md").read_text()
+        assert result["read_only"] == ["ro-moved", "ro-updated"]
+        assert (stuck_move / "SKILL.md").exists() and not (skills_dir / "newcat" / "ro-moved").exists()
+        assert "# Body" in (stuck_update / "SKILL.md").read_text()
+        assert "your modified copy at sealed/edited was kept" in out
+        assert "Failed" not in out
         assert not [r for r in caplog.records if r.levelno >= 30], caplog.text
         assert not any(r.exc_info for r in caplog.records)
-        assert "Failed" not in capsys.readouterr().out
+        info = [r.getMessage() for r in caplog.records if r.levelno == 20 and "cannot write" in r.getMessage()]
+        assert info == ["Skills sync skipped 2 skill(s) in directories this agent cannot write: "
+                        "ro-moved, ro-updated"]
 
     def test_external_copy_is_never_movable(self, tmp_path):
         """A copy under skills.external_dirs is externally owned even when writable."""

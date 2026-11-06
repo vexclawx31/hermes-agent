@@ -219,14 +219,48 @@ def _nearest_existing(path: Path) -> Path:
     return path
 
 
+_OWNER_RW = stat.S_IWUSR | stat.S_IRUSR
+
+
+def _make_owner_writable(path: Path) -> None:
+    """Give the owner write access (u+w, plus u+x on dirs) across a skill tree under the active
+    skills root. Bundled skills in a sealed release are 0555/0444 and copytree keeps those modes,
+    so every profile copy came out read-only and skill_manage / rename recovery failed on it.
+    Only strict children of the local skills root are touched, never anything under
+    skills.external_dirs, never through a symlink; a chmod the agent may not make (not the owner)
+    is left alone — the read-only checks then skip or refuse that tree cleanly."""
+    try:
+        root = _skills_dir().resolve()
+        target = path.resolve()
+    except OSError:
+        return
+    if root not in target.parents or path.is_symlink() or is_external_skill_path(target):
+        return
+    for dirpath, dirnames, filenames in os.walk(target):
+        for entry, extra in [(dirpath, stat.S_IXUSR)] + [
+                (os.path.join(dirpath, n), stat.S_IXUSR) for n in dirnames] + [
+                (os.path.join(dirpath, n), 0) for n in filenames]:
+            with suppress(OSError):
+                st = os.lstat(entry)
+                if stat.S_ISLNK(st.st_mode):
+                    continue
+                want = st.st_mode | _OWNER_RW | extra
+                if stat.S_IMODE(want) != stat.S_IMODE(st.st_mode):
+                    os.chmod(entry, stat.S_IMODE(want))
+
+
 def _movable_dir(src: Path, dest: Path) -> bool:
-    """Can ``src`` be moved to ``dest`` here? Not when it lives in a read-only place (a sealed
-    release dir, a read-only skills.external_dirs collection) or either parent is not writable:
-    the move would fail with PermissionError at every sync, so callers skip it up front. ``src``
-    itself must be writable too: moving a directory to a new parent rewrites its ``..`` entry."""
+    """Can ``src`` be moved to ``dest`` here? Not when it lives in skills.external_dirs or a parent
+    is not writable (a tree the agent does not own): the move would fail with PermissionError at
+    every sync, so callers skip it up front. Moving a directory to a NEW parent also needs ``src``
+    itself writable (its ``..`` entry is rewritten); a same-parent rename (``foo.bak`` -> ``foo``)
+    does not."""
     if is_external_skill_path(src):
         return False
-    return all(is_writable_skill_dir(d) for d in (src, src.parent, _nearest_existing(dest.parent)))
+    dirs = [src.parent, _nearest_existing(dest.parent)]
+    if src.parent != dest.parent:
+        dirs.append(src)
+    return all(is_writable_skill_dir(d) for d in dirs)
 
 
 def _move_dir(src: Path, dest: Path) -> None:
@@ -237,6 +271,7 @@ def _move_dir(src: Path, dest: Path) -> None:
 def _copy_dir(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dest, ignore=_ignore_runtime_cache)
+    _make_owner_writable(dest)  # the release tree is sealed 0555/0444: the copy must not be
 
 
 def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Optional[str]:
@@ -260,14 +295,15 @@ def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Opt
             continue
         if rel in st.hub_paths:  # the hub owns its install paths
             continue
-        if not _movable_dir(candidate, dest):  # read-only (sealed / external) copy: not ours to move
-            logger.debug("Not relocating read-only skill copy %s -> %s", candidate, dest)
-            continue
         if not _matches_origin_hash(candidate, origin_hash):  # moving a customized copy would edit user work
             st.say(
                 f"  ⚠ {skill_name}: upstream moved this skill to {_rel_skills_posix(dest)}, but your "
                 f"modified copy at {rel} was kept — it will not receive updates. "
                 f"Run `hermes skills reset {skill_name} --restore` to move to the new location.")
+            continue
+        _make_owner_writable(candidate)  # heal a sealed-mode copy an earlier sync made
+        if not _movable_dir(candidate, dest):  # not ours to move (external / unowned read-only tree)
+            st.read_only.append(skill_name)
             continue
         try:
             _move_dir(candidate, dest)
@@ -292,6 +328,7 @@ class _SyncState:
     suppressed: list[str] = field(default_factory=list)
     relocated: list[str] = field(default_factory=list)
     shadowed_by_external: list[str] = field(default_factory=list)
+    read_only: list[str] = field(default_factory=list)  # skipped: in a tree the agent cannot write
     active_index: Optional[dict[str, list[Path]]] = None  # rename-recovery indexes are expensive on
     hub_paths: set[str] = field(default_factory=set)  # bind mounts: built lazily, only when needed
 
@@ -300,13 +337,14 @@ class _SyncState:
             print(msg)
 
 
-def _recover_orphan_backup(dest: Path) -> None:
+def _recover_orphan_backup(st: "_SyncState", skill_name: str, dest: Path) -> None:
     """If an interrupted update left the user's only copy in ``dest.bak`` with dest gone, move it
     back so the skill isn't misread as user-deleted."""
     orphan = dest.with_suffix(".bak")
     if orphan.exists() and not dest.exists():
+        _make_owner_writable(orphan)
         if not _movable_dir(orphan, dest):
-            logger.debug("Not recovering read-only skill backup %s", orphan)
+            st.read_only.append(skill_name)
             return
         try:
             _move_dir(orphan, dest)
@@ -324,7 +362,7 @@ def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash
     st.say(f"  ⇢ {skill_name} (deferred to external_dirs, not written to local tree)")
     if dest.exists() and _dir_hash(dest) == bundled_hash:
         if not is_writable_skill_dir(dest.parent):
-            logger.debug("Not removing stale shadow %s: parent is read-only", dest)
+            st.read_only.append(skill_name)
             return
         try:
             _rmtree_writable(dest)
@@ -366,6 +404,7 @@ def _replace_skill_dir(skill_src: Path, dest: Path) -> None:
     shutil.move(str(dest), str(backup))
     try:
         shutil.copytree(skill_src, dest, ignore=_ignore_runtime_cache)
+        _make_owner_writable(dest)
     except OSError:
         if backup.exists():  # clear a partially-written dest so it can't shadow/block the restore
             if dest.exists():
@@ -398,10 +437,10 @@ def _update_existing_skill(st: _SyncState, skill_name: str, skill_src: Path, des
         st.user_modified.append(skill_name)
         st.say(f"  ~ {skill_name} (user-modified, skipping)")
         return
-    # bundled changed and the user copy is pristine -> update. A read-only parent (sealed tree)
-    # cannot take the .bak swap: skip quietly rather than fail the same way at every sync.
+    # bundled changed and the user copy is pristine -> update. A parent the agent cannot write
+    # cannot take the .bak swap: skip (reported once per run) rather than fail at every sync.
     if not is_writable_skill_dir(dest.parent):
-        logger.debug("Not updating %s: %s is read-only", skill_name, dest.parent)
+        st.read_only.append(skill_name)
         st.skipped += 1
         return
     try:
@@ -455,7 +494,9 @@ def sync_skills(quiet: bool = False) -> dict:
         dest = _compute_relative_dest(skill_src, bundled_dir)
         bundled_hash = _dir_hash(skill_src)
         # Recoveries run BEFORE classification so a missing dest isn't misread as user-deleted.
-        _recover_orphan_backup(dest)
+        _recover_orphan_backup(st, skill_name, dest)
+        if dest.exists():  # heal copies an earlier sync made with the release's sealed modes
+            _make_owner_writable(dest)
         if not dest.exists() and skill_name in st.manifest and _recover_renamed_skill(st, skill_name, dest):
             st.relocated.append(skill_name)
         if skill_name in external_index:
@@ -483,12 +524,16 @@ def sync_skills(quiet: bool = False) -> dict:
         bundled_dir,
         {_compute_relative_dest(src, bundled_dir).parent for _, src in bundled_skills} if essential_only else None)
     _write_manifest(st.manifest)
+    if st.read_only:
+        logger.info("Skills sync skipped %d skill(s) in directories this agent cannot write: %s",
+                    len(st.read_only), ", ".join(sorted(set(st.read_only))))
     return {
         "copied": st.copied, "updated": st.updated, "skipped": st.skipped, "user_modified": st.user_modified,
         "cleaned": cleaned, "suppressed": st.suppressed, "relocated": st.relocated,
         "total_bundled": len(bundled_skills),
         "optional_provenance_backfilled": _backfill_optional_provenance(quiet=quiet),
         "shadowed_by_external": st.shadowed_by_external,
+        "read_only": sorted(set(st.read_only)),
         "skipped_opt_out": essential_only}  # lets callers report "opted out", not a normal sync
 
 
