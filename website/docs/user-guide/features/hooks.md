@@ -392,9 +392,10 @@ def register(ctx):
 **General rules for all hooks:**
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
+- Callbacks run in **priority order**: `ctx.register_hook(name, cb, priority=N)` (an `int`, default `0`); higher runs first, ties keep registration order, so plugins that never pass `priority` behave as before. A guard that must see the final text of a chained transform registers with a very low priority (e.g. `-1000`).
 - Callback exceptions are logged and skipped; later callbacks continue. A callback that fails the same way on every call (typically a signature naming a field the hook does not send, e.g. `tool_data` instead of `tool_name`/`args`) is reported **once** at WARNING — the message lists the fields the hook provides — and identical repeats go to DEBUG, so a mis-declared plugin cannot flood the log.
 - If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
-- The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
+- The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement (`transform_llm_output` chains every callback instead), and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
 - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
 - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
 
@@ -455,7 +456,8 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
-| `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
+| `transform_llm_output` | Transform (chained) | Before `post_llm_call` and final delivery; callbacks run as a chain in priority order, each receiving the previous stage's text; a non-empty string replaces it. | `response_text`, `session_id`, `model`, `platform`, `turn_id`, `chain_position`, `chain_length` | Full final assistant text. |
+| [`filter_builtin_memory`](#filter_builtin_memory) | Directive/control (fail closed) | When the system prompt is built (session start, compression rebuild) and on every `memory` tool call; any `"omit"` keeps MEMORY.md/USER.md out of that chat. | `session_id`, `platform`, `chat_id`, `chat_type`, `sender_id`, `thread_id`, `session_key`, `surface` | Transport identity only. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
 | `pre_api_request` | Observer | Per provider attempt, immediately before the request; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `user_message`, `conversation_history`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `retry_count`, `request_messages`, `message_count`, `tool_count`, `approx_input_tokens`, `request_char_count`, `max_tokens`, `started_at`, `middleware_trace`, `request` | High sensitivity: legacy `user_message`, `conversation_history`, and `request_messages` are intentionally raw; prefer sanitized `request`. |
 | `post_api_request` | Observer | After normalized provider success; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `finish_reason`, `message_count`, `response_model`, `response`, `usage`, `assistant_message`, `assistant_content_chars`, `assistant_tool_call_count` | Sanitized `response` is available, but raw normalized `assistant_message` may contain model/user content; `usage` is accounting data. |
@@ -1709,7 +1711,11 @@ def my_callback(
 | `model` | `str` | Model name that produced the response (e.g. `anthropic/claude-sonnet-4.6`). |
 | `platform` | `str` | Delivery platform (`cli`, `telegram`, `discord`, …; empty when unset). |
 
-**Return value:** Non-empty `str` to replace the response text, `None` or empty string to leave it unchanged. **First non-empty string wins** when multiple plugins register. Unlike the tool and terminal transforms, an empty string is not accepted as a replacement.
+**Return value:** Non-empty `str` to replace the response text, `None` or empty string to leave it unchanged. Unlike the tool and terminal transforms, an empty string is not accepted as a replacement.
+
+**Chain:** when several plugins register, every callback runs, in priority order (`register_hook(..., priority=N)`, higher first, ties in registration order), and each receives the previous stage's output as `response_text`, plus `chain_position` (0-based) and `chain_length`. A callback that raises or times out is skipped (its stage leaves the text unchanged) and later callbacks still run. The timeout is per callback (`plugins.hook_callback_timeout`); there is no deadline for the whole chain, and by default a timed-out stage is fail-open. A guard that must check the text the user will actually receive registers with a very low priority (e.g. `-1000`) so it runs last.
+
+**Fail-closed stages:** `register_hook("transform_llm_output", guard, priority=-1000, fail_closed_text="I can't share that here.")` makes that stage fail closed: whenever it raises, times out, or cannot run (its worker for this turn is still running, or it has hit the abandoned-worker cap), `fail_closed_text` becomes the stage's output and the incoming text is discarded. A fail-closed stage is never put in the 60-second post-timeout suppression window, so it is retried on every call. `fail_closed_text` must be a non-empty string and is accepted only for chained hooks (`transform_llm_output`); the default `None` keeps the fail-open behaviour.
 
 **Use cases:** Apply a personality/vocabulary transform (pirate-speak, Spongebob), redact user-specific identifiers from the final text, append a project-specific signature footer, enforce a house style guide without burning tokens on SOUL instructions.
 
@@ -1731,6 +1737,26 @@ def register(ctx):
 ```
 
 The hook is guarded on a non-empty, non-interrupted response — it will not fire on stop-button interrupts or empty turns. Exceptions are logged as warnings and do not break agent execution.
+
+### `filter_builtin_memory`
+
+Gates the built-in memory store (MEMORY.md / USER.md) per chat, for plugins that know a chat's audience (for example a household privacy plugin). With no callback registered nothing changes and the hook is not invoked.
+
+```python
+def filter_builtin_memory(session_id, platform, chat_id, chat_type, sender_id, **kwargs) -> str | None:
+    return "omit"  # or "allow" / None (no opinion)
+```
+
+| Parameter | Description |
+|---|---|
+| `session_id`, `platform`, `chat_id`, `chat_type`, `sender_id`, `thread_id`, `session_key` | The trusted transport identity the agent was created for (empty strings when unset, e.g. CLI). |
+| `surface` | `"system_prompt"` or `"memory_tool"`. |
+
+**Decision:** any callback returning `"omit"` omits; `"allow"` and `None` allow. **Fail closed:** a callback that raises, times out (`plugins.hook_callback_timeout`) or returns anything else counts as `"omit"`.
+
+**Where it applies:** the system prompt is built once per session and cached (prompt-cache invariant), so the prompt decision is per session, re-evaluated whenever the prompt is rebuilt (context compression); a resumed session reuses its stored prompt. On omit the memory blocks are replaced by the line `Curated notes are not shown in this chat.` The `memory` tool asks the hook on every call and, on omit, refuses without touching the store (its results echo stored entries). Files read through other tools (`read_file`, `terminal`) are not gated. The background-review fork carries the parent chat's identity, so its `memory` tool calls are judged by the same audience.
+
+**Allow only stable audiences.** Because the prompt decision is taken per system-prompt build, an `"allow"` stays in the prompt until the next rebuild even if the chat's membership changes (someone joins a group mid-session). A plugin should therefore return `"allow"` only for audiences that cannot change mid-session, such as 1:1 DMs with a known person, and `"omit"` for groups and channels.
 
 ### API-request observer hooks
 

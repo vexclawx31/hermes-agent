@@ -16,6 +16,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from agent.agent_init_params import _GATEWAY_IDENTITY_PARAMS
 from agent.i18n import t
 from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
 from agent.thread_scoped_output import thread_scoped_silence
@@ -926,6 +927,9 @@ def _fork_init_kwargs(agent: Any, rt: dict[str, Any], routed: bool, max_iteratio
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
         "disabled_toolsets": getattr(agent, "disabled_toolsets", None), "skip_memory": True,
     }
+    # The parent chat's audience: the fork's memory tool calls go through filter_builtin_memory
+    # (agent/builtin_memory_gate.py), which must judge them by the chat that triggered the review.
+    kwargs.update({name: getattr(agent, f"_{name}", None) for name in _GATEWAY_IDENTITY_PARAMS})
     if isinstance(rt.get("max_tokens"), int):
         kwargs["max_tokens"] = rt["max_tokens"]
     if isinstance(rt.get("command"), str) and rt["command"]:
