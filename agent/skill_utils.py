@@ -704,6 +704,17 @@ def is_external_skill_path(path) -> bool:
     return any(candidate.is_relative_to(_resolve_for_skill_ownership(root)) for root in roots)
 
 
+def is_writable_skill_dir(path) -> bool:
+    """True when this process may create, replace and remove entries in directory ``path``
+    (write + search permission). Sealed read-only release dirs and read-only
+    ``skills.external_dirs`` collections are not: callers refuse or skip those up front
+    instead of failing mid-write with a PermissionError."""
+    try:
+        return os.access(path, os.W_OK | os.X_OK)
+    except (OSError, ValueError):
+        return False
+
+
 def _hermes_metadata(frontmatter: dict[str, Any]) -> dict[str, Any]:
     """``metadata.hermes`` mapping from frontmatter, or ``{}`` when malformed."""
     metadata = frontmatter.get("metadata")

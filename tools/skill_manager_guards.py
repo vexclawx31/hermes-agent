@@ -130,6 +130,31 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
     return f"Refusing to delete '{skill_dir}': path does not resolve inside any known skills root."
 
 
+def _read_only_skill_message(name: str, skill_dir: Path) -> str:
+    """Refusal text for a skill whose files this agent cannot write."""
+    try:
+        from agent.skill_utils import is_external_skill_path
+        external = is_external_skill_path(skill_dir)
+    except Exception:
+        logger.debug("external skill lookup failed for %s", name, exc_info=True)
+        external = False
+    where = (f"it lives in skills.external_dirs ({skill_dir}), which this agent cannot write"
+             if external else f"its directory {skill_dir} is not writable by this agent")
+    return (f"Skill '{name}' is read-only: {where}. To change it, create a local copy under a "
+            f"new name with skill_manage(action='create') instead.")
+
+
+def _read_only_skill_guard(name: str, skill_dir: Path, action: str) -> Optional[dict[str, Any]]:
+    """Refuse a mutation of a skill in a directory this process cannot write (a sealed release
+    dir, a read-only skills.external_dirs collection) before any write starts. A delete also
+    needs the parent: rmtree would otherwise empty the skill and then fail on its own rmdir."""
+    from agent.skill_utils import is_writable_skill_dir
+    dirs = (skill_dir, skill_dir.parent) if action == "delete" else (skill_dir,)
+    if all(is_writable_skill_dir(d) for d in dirs):
+        return None
+    return _refusal(_read_only_skill_message(name, skill_dir))
+
+
 def _is_pinned(name: str, what: str) -> Optional[bool]:
     """skill_usage pinned flag; None (logged at debug) when the record is unreadable."""
     try:

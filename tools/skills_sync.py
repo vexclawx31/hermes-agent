@@ -24,7 +24,8 @@ for _stream in (sys.stdout, sys.stderr):
         with suppress(ValueError, TypeError):
             _stream.reconfigure(encoding="utf-8", errors="replace")
 from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_optional_skills_dir
-from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
+from agent.skill_utils import (
+    ESSENTIAL_SKILLS, is_excluded_skill_path, is_external_skill_path, is_writable_skill_dir)
 from tools.skill_usage import _read_skill_name
 from tools.skills_sync_optional import (
     _backfill_optional_provenance, _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
@@ -212,6 +213,22 @@ def _matches_origin_hash(directory: Path, origin_hash: str, user_hash: Optional[
     return current == origin_hash or _dir_hash(directory, include_runtime_cache=True) == origin_hash
 
 
+def _nearest_existing(path: Path) -> Path:
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def _movable_dir(src: Path, dest: Path) -> bool:
+    """Can ``src`` be moved to ``dest`` here? Not when it lives in a read-only place (a sealed
+    release dir, a read-only skills.external_dirs collection) or either parent is not writable:
+    the move would fail with PermissionError at every sync, so callers skip it up front. ``src``
+    itself must be writable too: moving a directory to a new parent rewrites its ``..`` entry."""
+    if is_external_skill_path(src):
+        return False
+    return all(is_writable_skill_dir(d) for d in (src, src.parent, _nearest_existing(dest.parent)))
+
+
 def _move_dir(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dest))
@@ -242,6 +259,9 @@ def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Opt
         except ValueError:
             continue
         if rel in st.hub_paths:  # the hub owns its install paths
+            continue
+        if not _movable_dir(candidate, dest):  # read-only (sealed / external) copy: not ours to move
+            logger.debug("Not relocating read-only skill copy %s -> %s", candidate, dest)
             continue
         if not _matches_origin_hash(candidate, origin_hash):  # moving a customized copy would edit user work
             st.say(
@@ -285,6 +305,9 @@ def _recover_orphan_backup(dest: Path) -> None:
     back so the skill isn't misread as user-deleted."""
     orphan = dest.with_suffix(".bak")
     if orphan.exists() and not dest.exists():
+        if not _movable_dir(orphan, dest):
+            logger.debug("Not recovering read-only skill backup %s", orphan)
+            return
         try:
             _move_dir(orphan, dest)
             logger.info("Recovered orphaned skill backup: %s", orphan)
@@ -300,7 +323,14 @@ def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash
     st.skipped += 1
     st.say(f"  ⇢ {skill_name} (deferred to external_dirs, not written to local tree)")
     if dest.exists() and _dir_hash(dest) == bundled_hash:
-        _rmtree_writable(dest)
+        if not is_writable_skill_dir(dest.parent):
+            logger.debug("Not removing stale shadow %s: parent is read-only", dest)
+            return
+        try:
+            _rmtree_writable(dest)
+        except (OSError, ValueError):
+            logger.debug("Could not remove stale shadow %s", dest, exc_info=True)
+            return
         st.say(f"  ✓ removed stale shadow of {skill_name}")
         st.manifest.pop(skill_name, None)
 
@@ -368,7 +398,12 @@ def _update_existing_skill(st: _SyncState, skill_name: str, skill_src: Path, des
         st.user_modified.append(skill_name)
         st.say(f"  ~ {skill_name} (user-modified, skipping)")
         return
-    # bundled changed and the user copy is pristine -> update
+    # bundled changed and the user copy is pristine -> update. A read-only parent (sealed tree)
+    # cannot take the .bak swap: skip quietly rather than fail the same way at every sync.
+    if not is_writable_skill_dir(dest.parent):
+        logger.debug("Not updating %s: %s is read-only", skill_name, dest.parent)
+        st.skipped += 1
+        return
     try:
         _replace_skill_dir(skill_src, dest)
     except OSError as e:

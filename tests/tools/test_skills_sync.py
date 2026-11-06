@@ -390,6 +390,62 @@ class TestRenamedBundledSkillRecovery:
         assert "moved-skill" not in result["copied"]
         assert "moved-skill" not in result.get("relocated", [])
 
+    @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
+                        reason="needs POSIX permissions and a non-root user")
+    def test_read_only_copies_are_skipped_quietly_and_writable_ones_still_sync(self, tmp_path, caplog, capsys):
+        """A sealed (read-only) copy must not raise PermissionError out of _move_dir /
+        _replace_skill_dir at every gateway start, nor log a warning each time. Writable
+        copies in the same run still relocate."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        moved = self._skill(skills_dir, "oldcat/moved-skill")
+        sealed_move = self._skill(skills_dir, "sealed/ro-moved", name="ro-moved")
+        sealed_update = self._skill(skills_dir, "sealedcat/ro-updated", name="ro-updated")
+        manifest_file.write_text(
+            f"moved-skill:{_dir_hash(moved)}\nro-moved:{_dir_hash(sealed_move)}\n"
+            f"ro-updated:{_dir_hash(sealed_update)}\n")
+
+        # Upstream renamed two of them and changed the third in place.
+        self._skill(bundled, "newcat/moved-skill", body="# Updated upstream\n")
+        self._skill(bundled, "newcat/ro-moved", body="# Updated upstream\n", name="ro-moved")
+        self._skill(bundled, "sealedcat/ro-updated", body="# Updated upstream\n", name="ro-updated")
+
+        sealed_dirs = [sealed_move, sealed_move.parent, sealed_update.parent]
+        for d in sealed_dirs:
+            d.chmod(0o555)
+        try:
+            with self._patches(bundled, skills_dir, manifest_file), \
+                 caplog.at_level("DEBUG", logger="tools.skills_sync"):
+                result = sync_skills(quiet=False)
+        finally:
+            for d in sealed_dirs:
+                d.chmod(0o755)
+
+        assert result["relocated"] == ["moved-skill"]
+        assert (skills_dir / "newcat" / "moved-skill" / "SKILL.md").exists()
+        assert (sealed_move / "SKILL.md").exists()
+        assert not (skills_dir / "newcat" / "ro-moved").exists()
+        assert "ro-updated" not in result["updated"]
+        assert "# Body" in (sealed_update / "SKILL.md").read_text()
+        assert not [r for r in caplog.records if r.levelno >= 30], caplog.text
+        assert not any(r.exc_info for r in caplog.records)
+        assert "Failed" not in capsys.readouterr().out
+
+    def test_external_copy_is_never_movable(self, tmp_path):
+        """A copy under skills.external_dirs is externally owned even when writable."""
+        from tools.skills_sync import _movable_dir
+
+        external = tmp_path / "vault"
+        copy = self._skill(external, "cat/moved-skill")
+        dest = tmp_path / "user_skills" / "newcat" / "moved-skill"
+
+        with patch("agent.skill_utils.get_external_skills_dirs", return_value=[external]):
+            assert _movable_dir(copy, dest) is False
+        with patch("agent.skill_utils.get_external_skills_dirs", return_value=[]):
+            assert _movable_dir(copy, dest) is True
+
 
 class TestSyncSkills:
     def _setup_bundled(self, tmp_path):
