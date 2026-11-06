@@ -6,6 +6,7 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 """
 
 import os
+import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
@@ -56,12 +57,23 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
 
-# The current turn's trusted sender for tool hooks: ``(sender_role, sender_id)``. The role is the
-# adapter-verified ``SessionSource.sender_role`` ("owner"/"member" in a trusted group, else ""), never
-# message text; ``pre_tool_call``/``post_tool_call`` carry it so a plugin can restrict one turn of a
-# shared group session. Not in _VAR_MAP: no env fallback, no export to child processes.
+# The current turn's trusted sender for tool hooks. The role is the adapter-verified
+# ``SessionSource.sender_role`` ("owner"/"member" in a trusted group, else ""), never message text;
+# ``pre_tool_call``/``post_tool_call`` carry it so a plugin can restrict one turn of a shared group
+# session. The ContextVar holds a mutable holder shared with the turn's worker threads (copied
+# contexts keep the same object), so a sender folded into the running turn (steer, redirect) can
+# downgrade it mid-run. Not in _VAR_MAP: no env fallback, no export to child processes.
+class _TurnSender:
+    __slots__ = ("__weakref__", "role", "sender_id")
+
+    def __init__(self, role: str, sender_id: str):
+        self.role, self.sender_id = role, sender_id
+
+
 _TURN_SENDER: ContextVar[Any] = ContextVar("HERMES_TURN_SENDER", default=_UNSET)
 _SENDER_ROLES = frozenset({"owner", "member"})
+# session_key -> the live turn-sender holders bound for it (busy-path folds downgrade them all).
+_TURN_SENDERS_BY_SESSION: dict[str, "weakref.WeakSet[_TurnSender]"] = {}
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -154,8 +166,11 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
-    tokens.append(_TURN_SENDER.set((sender_role if sender_role in _SENDER_ROLES else "",
-                                    str(user_id if sender_id is None else sender_id or ""))))
+    holder = _TurnSender(sender_role if sender_role in _SENDER_ROLES else "",
+                         str(user_id if sender_id is None else sender_id or ""))
+    tokens.append(_TURN_SENDER.set(holder))
+    if session_key:
+        _TURN_SENDERS_BY_SESSION.setdefault(session_key, weakref.WeakSet()).add(holder)
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -174,7 +189,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
-    _TURN_SENDER.set(_UNSET)
+    _forget_turn_sender()
     _runtime_cwd("clear_session_cwd")
 
 
@@ -192,16 +207,70 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
-    _TURN_SENDER.set(_UNSET)
+    _forget_turn_sender()
     _runtime_cwd("clear_session_cwd")
 
 
-def turn_sender_vars(context: Any, event: Any = None) -> dict[str, str]:
+def _forget_turn_sender() -> None:
+    """Unbind this context's turn sender and drop it from the per-session registry."""
+    holder = _TURN_SENDER.get()
+    _TURN_SENDER.set(_UNSET)
+    if not isinstance(holder, _TurnSender):
+        return
+    for key, holders in list(_TURN_SENDERS_BY_SESSION.items()):
+        holders.discard(holder)
+        if not holders:
+            _TURN_SENDERS_BY_SESSION.pop(key, None)
+
+
+def rebind_turn_sender(sender_role: str = "", sender_id: str = "") -> None:
+    """A queued follow-up runs as the next turn in this same context: bind its own sender."""
+    holder = _TURN_SENDER.get()
+    if isinstance(holder, _TurnSender):
+        holder.role = sender_role if sender_role in _SENDER_ROLES else ""
+        holder.sender_id = str(sender_id or "")
+
+
+def _downgrade(holder: "_TurnSender") -> None:
+    holder.role, holder.sender_id = ("member" if holder.role else ""), ""
+
+
+def downgrade_turn_sender() -> None:
+    """Text of unknown origin joined this context's turn: no id, and "member" in a trusted group."""
+    holder = _TURN_SENDER.get()
+    if isinstance(holder, _TurnSender):
+        _downgrade(holder)
+
+
+def bind_followup_turn_sender(pending_event: Any, source: Any, interrupted: bool) -> None:
+    """A queued follow-up runs as the next turn in this same context. With its own event it gets
+    that event's trusted sender; an event-less follow-up of an interrupted turn carries interrupt
+    text of unknown origin, so it is downgraded (fail closed); a leftover steer keeps the sender."""
+    if pending_event is not None:
+        rebind_turn_sender(**turn_sender_vars(None, pending_event, source=source))
+    elif interrupted:
+        downgrade_turn_sender()
+
+
+def fold_turn_sender(session_key: str, sender: dict[str, str]) -> None:
+    """*sender* (``turn_sender_vars`` of a steered/redirected message) was folded into the running
+    turn(s) of *session_key*. Fail closed: a turn now carrying another sender's text (different id or
+    role, or no id) keeps no id and, in a trusted group, runs as "member" for the rest of the turn."""
+    role, sender_id = sender.get("sender_role", ""), sender.get("sender_id", "")
+    for holder in list(_TURN_SENDERS_BY_SESSION.get(session_key) or ()):
+        if not sender_id or (holder.role, holder.sender_id) != (role, sender_id):
+            if role and not holder.role:
+                holder.role = "member"
+            _downgrade(holder)
+
+
+def turn_sender_vars(context: Any, event: Any = None, source: Any = None) -> dict[str, str]:
     """``set_session_vars`` kwargs for a gateway turn's trusted sender: the adapter-verified
     ``source.sender_role`` (trusted groups), never message text. Merged senders count as "member"
-    with no id; a plugin-authored event has no human sender, so no role and no id."""
+    with no id; a plugin-authored event has no human sender, so no role and no id. *source*
+    defaults to ``context.source``; *event* to the context's ingress event."""
     from agent.plugin_author import event_plugin_author
-    source = context.source
+    source = source if source is not None else context.source
     event = event if event is not None else getattr(context, "_ingress_event", None)
     role = str(getattr(source, "sender_role", None) or "")
     sender_id = str(source.user_id) if getattr(source, "user_id", None) else ""
@@ -216,9 +285,10 @@ def turn_sender_hook_kwargs() -> dict[str, str]:
     """``{"sender_role", "sender_id"}`` of the turn bound in THIS context, for tool hooks: the
     adapter-verified role ("owner"/"member", "" outside a trusted group or when unknown) and the
     sender id from the transport. Both "" when no gateway turn is bound (CLI, cron)."""
-    value = _TURN_SENDER.get()
-    role, sender_id = value if isinstance(value, tuple) else ("", "")
-    return {"sender_role": role, "sender_id": sender_id}
+    holder = _TURN_SENDER.get()
+    if not isinstance(holder, _TurnSender):
+        return {"sender_role": "", "sender_id": ""}
+    return {"sender_role": holder.role, "sender_id": holder.sender_id}
 
 
 def get_session_env(name: str, default: str = "") -> str:

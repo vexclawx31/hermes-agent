@@ -686,7 +686,11 @@ class GatewayBusySessionMixin:
         """The running turn now answers *event* too (steer, redirect): if *event* was addressed to
         the bot, a bare silence marker must not end the turn. Returns the turn, or None when a newer
         turn already owns the slot."""
+        from gateway.session_context import fold_turn_sender, turn_sender_vars
         turn = self._session_state(session_key).turn
+        # The folded text is now part of the running turn: its tool hooks must not keep the first
+        # sender's role if someone else wrote it (fail closed, even when a newer turn owns the slot).
+        fold_turn_sender(session_key, turn_sender_vars(event, event))
         if turn.agent is not running_agent:
             return None
         if turn.event is not None and turn.event is not event:
