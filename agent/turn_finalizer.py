@@ -506,7 +506,9 @@ def apply_llm_output_transform(
     if platform is None:
         platform = getattr(agent, "platform", None) or ""
     transformed, pre_transform = False, None
-    # First hook to return a string wins; None/empty leaves the text unchanged.
+    # Plugin hooks run as one priority-ordered chain and come back as at most one result (the
+    # chain's final text, see plugins_dispatch._HOOK_CHAINED_HOOKS); ``pre_transform`` is the text
+    # before the whole chain. None/empty leaves the text unchanged.
     for _hook_result in _invoke_hook_safely(
         "transform_llm_output", logger,
         response_text=final_response,

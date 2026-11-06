@@ -132,6 +132,8 @@ class PluginLedgerMixin:
         if callbacks is None:
             return
         self._remove_identity(callbacks, callback)
+        if mapping is self._hooks and not any(cb is callback for cb in callbacks):
+            self._hook_priorities.pop((key, id(callback)), None)  # id() is reusable once released
         if not callbacks:
             mapping.pop(key, None)
 
@@ -286,7 +288,7 @@ class PluginLedgerMixin:
         carryover_ids = {id(r) for r in self._persistent_carryover}
         self._persistent_carryover.extend(r for r in self._active_persistent() if id(r) not in carryover_ids)
         for container in (
-            self._ownership_ledger, self._plugins, self._hooks, self._middleware,
+            self._ownership_ledger, self._plugins, self._hooks, self._hook_priorities, self._middleware,
             self._plugin_tool_names, self._plugin_platform_names, self._cli_commands,
             self._plugin_commands, self._plugin_skills, self._automation_blueprints, self._portable_mcp_servers,
             self._portable_mcp_server_plugins, self._aux_tasks, self._system_prompt_sections, self._approval_transports,

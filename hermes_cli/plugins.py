@@ -108,8 +108,8 @@ _install_plugin_debug_handler()
 
 VALID_HOOKS: set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
-    # transform_llm_output: return a replacement string (first non-None wins) or None.
-    "transform_llm_output", "pre_llm_call", "post_llm_call",
+    # transform_llm_output: a chain (plugins_dispatch._HOOK_CHAINED_HOOKS); filter_builtin_memory: agent/builtin_memory_gate.py.
+    "transform_llm_output", "pre_llm_call", "post_llm_call", "filter_builtin_memory",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
@@ -178,14 +178,6 @@ VALID_HOOKS: set[str] = {
     # gateway_platform_event: normalized envelopes only, never raw SDK objects or adapter handles.
     # Kwargs: platform, event_type, payload (event_type-local; see hooks.md). New event types land
     # only together with real fire-sites.
-    # on_kanban_dispatch_tick fires once per dispatcher tick in dispatch_once, strictly AFTER the board's
-    # single-writer dispatch lock has been released (the #56066 original fired inside the lock — the #64231
-    # disposition mandates the post-lock re-port), so a slow subscriber can never extend the writer critical
-    # section. Kwargs: board: str | None, profile_name: str, dry_run: bool, outcome: "ok" | "skipped_locked"
-    # | "idle", result: hermes_cli.kanban_db.DispatchResult (spawned, reclaimed, promoted,
-    # reconciled_orphans, crashed, stale, timed_out, auto_blocked, rate_limited, auto_assigned_default,
-    # respawn_guarded, skipped_per_profile_capped, skipped_unassigned, skipped_nonspawnable,
-    # skipped_locked). Privacy: result carries task ids, assignees, and workspace paths.
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each callback isolated by
     # invoke_hook. This surface grants no adapter handles or platform actions. Fired today: Telegram
     # "reaction" + "message_edited"; Discord "message_edited", "message_deleted", "thread_created",
@@ -982,8 +974,10 @@ class PluginContext:
                 logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
-    def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
-        """Register a lifecycle hook callback (unknown names warn but are still stored)."""
+    def register_hook(self, hook_name: str, callback: Callable, *, priority: int = 0) -> PluginRegistration:
+        """Register a lifecycle hook callback (unknown names warn but are still stored). Higher
+        ``priority`` dispatches earlier; the default 0 keeps registration order (a final guard: < 0)."""
+        self._manager._set_hook_priority(hook_name, callback, priority)
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
@@ -1230,6 +1224,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # (matcher, callback, plugin_name), platform handler factories (lowercase platform -> list).
         self._plugins: dict[str, LoadedPlugin] = {}
         self._hooks: dict[str, list[Callable]] = {}
+        self._hook_priorities: dict[tuple[str, int], int] = {}  # (hook, id(callback)) -> non-zero priority
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: dict[tuple[str, str], list[PluginRegistration]] = {}
         self._middleware: dict[str, list[Callable]] = {}

@@ -144,6 +144,12 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
 
 
 def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
+    # Same filter_builtin_memory gate as the prompt block: results echo stored entries, and writes
+    # would carry this chat's content into the curated notes. Evaluated per call; never touches the store.
+    from agent.builtin_memory_gate import OMITTED_NOTE, builtin_memory_allowed
+    if agent._memory_store is not None and not builtin_memory_allowed(agent, "memory_tool"):
+        from tools.registry import tool_error
+        return tool_error(f"{OMITTED_NOTE} The memory tool is unavailable here.", success=False)
     result = _call_tool(
         "tools.memory_tool", "memory_tool", args,
         (
