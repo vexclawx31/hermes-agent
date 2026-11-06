@@ -207,8 +207,8 @@ platforms:
       owners: ["15550000001"]        # owner callers keep the platform toolsets
       groups:
         "*": {allow_from: ["15550000001"]}          # any group: owner only
-        "120363001234567890@g.us": {allow_from: ["*"]}  # this group: any participant
-      guest_toolsets: [web, vision]  # exact toolsets for every non-owner caller
+        "120363001234567890@g.us": {allow_from: ["*"], guest_toolsets: [web, vision, todo]}  # this group: any participant, its own guest kit
+      guest_toolsets: [web, vision]  # exact toolsets for every other non-owner caller
 ```
 
 - `groups.<group JID | "*">.allow_from` restricts **senders** per group on top of `group_policy` (exact
@@ -223,6 +223,12 @@ platforms:
   - `guest_toolsets` replaces the platform toolsets for guests. The list is exact: only the named concrete
     toolsets — no composites, default-on plugin toolsets or MCP servers. With `owners` set and no
     `guest_toolsets`, guests get no tools; if the WhatsApp adapter cannot be resolved, nobody gets tools.
+  - `groups.<group JID | "*">.guest_toolsets` replaces `guest_toolsets` for guests in that group only (same
+    key lookup as `allow_from`; an empty list means no tools).
+  - A group with `trust: trusted` is one shared session with a verified sender role per turn (`owner` or
+    `member`, from the sender id). Its tool schema stays the owner's for every turn and `guest_toolsets`
+    is not applied there. Members are restricted per turn at the tool boundary by a `pre_tool_call`
+    plugin, which receives the turn's `sender_role`; without one, members can call the owner's tools.
   - Guest turns run without profile memory (MEMORY.md / USER.md) and without the external memory provider
     (no recall, no retain), unless `memory` is in `guest_toolsets`.
   - Owners administer slash commands in DMs and groups unless `allow_admin_from` / `group_allow_admin_from`
