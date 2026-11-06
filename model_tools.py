@@ -698,11 +698,12 @@ def _emit_post_tool_call_hook(
             return
         if status is None:
             status, error_type, error_message = _tool_result_observer_fields(function_name, result)
+        from gateway.session_context import turn_sender_hook_kwargs
         invoke_hook(
             "post_tool_call", tool_name=function_name, args=function_args, result=result,
             **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs(),
             duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
-            middleware_trace=list(middleware_trace or []),
+            middleware_trace=list(middleware_trace or []), **turn_sender_hook_kwargs(),
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)

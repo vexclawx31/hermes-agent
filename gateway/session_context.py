@@ -56,6 +56,13 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
 
+# The current turn's trusted sender for tool hooks: ``(sender_role, sender_id)``. The role is the
+# adapter-verified ``SessionSource.sender_role`` ("owner"/"member" in a trusted group, else ""), never
+# message text; ``pre_tool_call``/``post_tool_call`` carry it so a plugin can restrict one turn of a
+# shared group session. Not in _VAR_MAP: no env fallback, no export to child processes.
+_TURN_SENDER: ContextVar[Any] = ContextVar("HERMES_TURN_SENDER", default=_UNSET)
+_SENDER_ROLES = frozenset({"owner", "member"})
+
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
@@ -119,7 +126,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
-    session_history_delivery: str | None = None,
+    session_history_delivery: str | None = None, sender_role: str = "", sender_id: str | None = None,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -129,7 +136,10 @@ def set_session_vars(
     ``"1"`` (audited producers — explicit session-id header, native API sessions, /v1/runs) or
     ``""`` / omitted (default-deny, #98619).  ``None`` leaves the var at ``_UNSET`` ("never
     declared"), which ``session_history_delivery_supported()`` treats as NOT capable — an omitted declaration
-    cannot grant wake authority."""
+    cannot grant wake authority.
+
+    ``sender_role`` / ``sender_id`` bind the turn's trusted sender for tool hooks
+    (:func:`turn_sender_hook_kwargs`); ``sender_id`` defaults to ``user_id``."""
     from gateway.ingress_identity import clear_trusted_ingress
     from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
@@ -144,6 +154,8 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_TURN_SENDER.set((sender_role if sender_role in _SENDER_ROLES else "",
+                                    str(user_id if sender_id is None else sender_id or ""))))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -162,6 +174,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TURN_SENDER.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -179,7 +192,33 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TURN_SENDER.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
+
+
+def turn_sender_vars(context: Any, event: Any = None) -> dict[str, str]:
+    """``set_session_vars`` kwargs for a gateway turn's trusted sender: the adapter-verified
+    ``source.sender_role`` (trusted groups), never message text. Merged senders count as "member"
+    with no id; a plugin-authored event has no human sender, so no role and no id."""
+    from agent.plugin_author import event_plugin_author
+    source = context.source
+    event = event if event is not None else getattr(context, "_ingress_event", None)
+    role = str(getattr(source, "sender_role", None) or "")
+    sender_id = str(source.user_id) if getattr(source, "user_id", None) else ""
+    if event is not None and event_plugin_author(event) is not None:
+        role = sender_id = ""
+    elif event is not None and getattr(event, "_mixed_senders", False):
+        role, sender_id = ("member" if role else ""), ""
+    return {"sender_role": role, "sender_id": sender_id}
+
+
+def turn_sender_hook_kwargs() -> dict[str, str]:
+    """``{"sender_role", "sender_id"}`` of the turn bound in THIS context, for tool hooks: the
+    adapter-verified role ("owner"/"member", "" outside a trusted group or when unknown) and the
+    sender id from the transport. Both "" when no gateway turn is bound (CLI, cron)."""
+    value = _TURN_SENDER.get()
+    role, sender_id = value if isinstance(value, tuple) else ("", "")
+    return {"sender_role": role, "sender_id": sender_id}
 
 
 def get_session_env(name: str, default: str = "") -> str:

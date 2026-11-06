@@ -2024,21 +2024,21 @@ def _get_pre_tool_call_directive_details(
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes
-    the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
-    human-approval gate; ``rule_key`` picks the ``[a]lways`` allowlist grain). Precedence is
-    ``block`` > ``approve`` > none, not registration order: any plugin's valid veto wins over an
-    earlier plugin's request for human confirmation (#87420); among approves the first valid one
-    wins. Irrelevant returns are ignored."""
+    """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes the tool
+    result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the human-approval gate;
+    ``rule_key`` picks the ``[a]lways`` allowlist grain). Precedence is ``block`` > ``approve`` > none, not
+    registration order: any plugin's valid veto wins over an earlier plugin's request for human confirmation
+    (#87420); among approves the first valid one wins. Irrelevant returns are ignored."""
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
         return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
+    from gateway.session_context import turn_sender_hook_kwargs  # the issuing turn's trusted sender_role/_id
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
     hook_results = invoke_lifecycle_hook(
         "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
-        task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
+        task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id, api_request_id=api_request_id,
+        middleware_trace=list(middleware_trace or []), **turn_sender_hook_kwargs(),
     )
     modified_args: Optional[dict[str, Any]] = None
     first_approve: Optional[tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
