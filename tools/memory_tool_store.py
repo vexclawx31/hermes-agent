@@ -69,6 +69,17 @@ def entry_view(keep: Optional[Callable[[str], bool]]) -> Iterator[None]:
         _ENTRY_VIEW.reset(token)
 
 
+def _delimiter_error(content: str) -> Optional[str]:
+    """Error when *content* would split into several entries: it holds the entry delimiter or a
+    line that is just "§". Always refused: the next load would read a second entry with a
+    model-chosen first line (e.g. a forged circle marker)."""
+    text = str(content or "")
+    if ENTRY_DELIMITER in text or any(line.strip() == "§" for line in text.splitlines()):
+        return ("Content can't contain a line that is just '§': that separates memory entries. "
+                "Write one entry per add, or use another symbol.")
+    return None
+
+
 def _entry_visible(entry: str) -> bool:
     view = _ENTRY_VIEW.get()
     if view is None:
@@ -214,16 +225,20 @@ def _span_occurrences(text: str, span: str) -> int:
     return sum(text.startswith(span, i) for i in range(len(text) - len(span) + 1))
 
 
-def _patch_entry(entry: str, old_text: str, new_text: str) -> tuple[Optional[str], str, str]:
+def _patch_entry(entry: str, old_text: str, new_text: str,
+                 pinned: bool = False) -> tuple[Optional[str], str, str]:
     """``(patched entry, "", "none")``, or ``(None, error, failure class)`` when the span occurs more
-    than once in the entry, the edit changes nothing, or the patched entry fails the threat scan.
-    Single and batch patches both go through here, so they share one rule."""
+    than once in the entry, the edit changes nothing, the result would split into several entries,
+    its circle marker changes (under an entry view, or for a *pinned* staged/approved patch), or the
+    patched entry fails the threat scan. Single and batch patches both go through here."""
     if (count := _span_occurrences(entry, old_text)) > 1:
         return None, _repeated_span_message(old_text, count), "ambiguous"
     patched = entry.replace(old_text, new_text, 1)
     if patched == entry:
         return None, f"Patch is a no-op: '{old_text}' -> '{new_text}' leaves the entry unchanged.", "invalid_args"
-    if _ENTRY_VIEW.get() is not None and entry_circles(patched) != entry_circles(entry):
+    if (delimiter_error := _delimiter_error(patched)) is not None:
+        return None, delimiter_error, "invalid_args"
+    if (pinned or _ENTRY_VIEW.get() is not None) and entry_circles(patched) != entry_circles(entry):
         return None, "A patch can't change an entry's [circle: ...] marker; edit the text after it.", "invalid_args"
     if scan_error := _scan_memory_content(patched):
         return None, scan_error, "scan_blocked"
@@ -480,6 +495,11 @@ class MemoryStore:
             if isinstance(result, dict):
                 return result
             new_entries = _merge_hidden(entries, visible_mask, result[0]) if hidden else result[0]
+            # The file must read back as exactly these entries (same count, same first lines and
+            # markers); anything else would let written text forge another entry on the next load.
+            if self._parse_entries(ENTRY_DELIMITER.join(new_entries)) != [e.strip() for e in new_entries]:
+                return _error("Refusing to write: the result would not read back as the same entries "
+                              "(an entry contains the '§' separator). Nothing was changed.", "invalid_args")
             self._set_entries(target, new_entries)
             from hermes_constants import mkdir_under_hermes_home
 
@@ -493,6 +513,8 @@ class MemoryStore:
         content = content.strip()
         if not content:
             return _error("Content cannot be empty.", "missing_content")
+        if (delimiter_error := _delimiter_error(content)) is not None:
+            return _error(delimiter_error, "invalid_args")
         if scan_error := _scan_memory_content(content):
             return _error(scan_error, "scan_blocked")
 
@@ -521,6 +543,8 @@ class MemoryStore:
             return _error("old_text cannot be empty.", "missing_old_text")
         if not new_content:
             return _error("new_content cannot be empty. Use 'remove' to delete entries.", "missing_content")
+        if (delimiter_error := _delimiter_error(new_content)) is not None:
+            return _error(delimiter_error, "invalid_args")
         if scan_error := _scan_memory_content(new_content):
             return _error(scan_error, "scan_blocked")
         return self._edit(target, old_text.strip(), new_content, matched_entry)
@@ -546,7 +570,7 @@ class MemoryStore:
             if isinstance(idx, dict):
                 return idx
             before = entries[idx]
-            after, message, failure_class = _patch_entry(before, old_text, new_text)
+            after, message, failure_class = _patch_entry(before, old_text, new_text, matched_entry is not None)
             if after is None:
                 return _error(message, failure_class)
             patched = entries[:idx] + [after] + entries[idx + 1:]
@@ -620,6 +644,8 @@ class MemoryStore:
         It is published only after the entire batch has been validated and persisted.
         A staged op's *matched_entry* selects exactly that entry, as in ``_locate``.
         """
+        if act in ("add", "replace") and (delimiter_error := _delimiter_error(content)) is not None:
+            return f"{pos}: {delimiter_error}", None, "invalid_args", None
         if act == "add":
             if not content:
                 return f"{pos}: content is required.", None, "missing_content", None
@@ -652,7 +678,7 @@ class MemoryStore:
         if act != "patch":
             working[idx:idx + 1] = [content] if act == "replace" else []
             return None, previous_content, "none", None
-        patched, message, failure_class = _patch_entry(previous_content, old_text, content)
+        patched, message, failure_class = _patch_entry(previous_content, old_text, content, matched_entry is not None)
         if patched is None:
             return f"{pos}: {message}", None, failure_class, None
         working[idx:idx + 1] = [patched]
