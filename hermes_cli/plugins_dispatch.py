@@ -60,6 +60,9 @@ _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call", "filter_builtin_me
 # or a timeout leaves it unchanged and the chain goes on. ``invoke_hook`` returns ``[final]`` when any
 # stage replaced the text, else ``[]``, so "first result wins" callers see the whole chain's output.
 # Timeouts stay per callback (``plugins.hook_callback_timeout``); there is no whole-chain deadline.
+# A stage registered with ``fail_closed_text`` (a guard) fails closed instead: when it raises, times
+# out or cannot start (still running for this turn, abandoned-worker cap), that text replaces the
+# incoming text. Such a stage is never put in the post-timeout suppression window; it runs every call.
 _HOOK_CHAINED_HOOKS: dict[str, str] = {"transform_llm_output": "response_text"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
@@ -265,24 +268,39 @@ class PluginDispatchMixin:
         value, replaced = kwargs.get(field), False
         for position, cb in enumerate(callbacks):
             payload = {**kwargs, field: value, "chain_position": position, "chain_length": len(callbacks)}
+            fallback = self._hook_fail_closed_texts.get((hook_name, id(cb)))
             try:
-                ret = (self._run_hook_callback_bounded(hook_name, cb, payload, timeout) if timeout is not None
-                       else self._invoke_hook_callback(cb, payload))
+                ret = (self._run_hook_callback_bounded(hook_name, cb, payload, timeout, suppress=fallback is None)
+                       if timeout is not None else self._invoke_hook_callback(cb, payload))
             except (Exception, SystemExit) as exc:  # health: allow BLE001 -- per-callback isolation, same contract as invoke_hook
                 self._report_hook_failure(hook_name, cb, payload, exc)
-                continue
+                ret = _HOOK_SKIPPED
+            if ret is _HOOK_SKIPPED and fallback is not None:
+                logger.warning("Hook '%s' fail-closed stage %s gave no verdict; using its fail_closed_text",
+                               hook_name, getattr(cb, "__name__", repr(cb)))
+                ret = fallback
             if isinstance(ret, str) and ret:
                 value, replaced = ret, True
         return [value] if replaced else []
 
-    def _set_hook_priority(self, hook_name: str, callback: Callable, priority: int) -> None:
-        """Record *callback*'s dispatch priority for *hook_name* (higher runs first; 0 = default)."""
+    def _set_hook_options(
+        self, hook_name: str, callback: Callable, priority: int, fail_closed_text: Optional[str] = None,
+    ) -> None:
+        """Record *callback*'s dispatch priority (higher runs first; 0 = default) and, for a chained
+        hook, its ``fail_closed_text`` (contract on ``_HOOK_CHAINED_HOOKS``)."""
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise TypeError("hook priority must be an int")
-        if priority:
-            self._hook_priorities[(hook_name, id(callback))] = priority
-        else:
-            self._hook_priorities.pop((hook_name, id(callback)), None)
+        if fail_closed_text is not None:
+            if not isinstance(fail_closed_text, str) or not fail_closed_text:
+                raise TypeError("fail_closed_text must be a non-empty str or None")
+            if hook_name not in _HOOK_CHAINED_HOOKS:
+                raise ValueError(f"fail_closed_text applies only to chained hooks ({', '.join(_HOOK_CHAINED_HOOKS)})")
+        key = (hook_name, id(callback))
+        for table, setting in ((self._hook_priorities, priority), (self._hook_fail_closed_texts, fail_closed_text)):
+            if setting:
+                table[key] = setting
+            else:
+                table.pop(key, None)
 
     def _report_hook_failure(
         self, hook_name: str, cb: Callable, kwargs: dict[str, Any], exc: BaseException, *, surface: str = "Hook"
@@ -309,12 +327,14 @@ class PluginDispatchMixin:
             surface, hook_name, callback_name, exc, surface.lower(), ", ".join(sorted(kwargs)) or "no fields")
 
     def _run_hook_callback_bounded(
-        self, hook_name: str, cb: Callable, kwargs: dict[str, Any], timeout: float
+        self, hook_name: str, cb: Callable, kwargs: dict[str, Any], timeout: float, *, suppress: bool = True,
     ) -> Any:
         """Run one callback on a daemon worker with a wall-clock cap; ``_HOOK_SKIPPED`` when
         suppressed, still running for this call id, over the abandoned-worker cap, timed out
         (worker abandoned, never joined), or the worker could not be started. Exceptions
-        propagate."""
+        propagate. ``suppress=False`` (fail-closed chain stages) never opens the post-timeout
+        suppression window, so the callback is retried on every call; the abandoned-worker cap
+        still bounds its threads."""
         callback_name = getattr(cb, "__name__", repr(cb))
         # Suppression is a fact about the CALLBACK — a hung one must keep its back-off —
         # so that key stays coarse. The gate must instead tell CONCURRENT CALLS apart.
@@ -382,8 +402,9 @@ class PluginDispatchMixin:
         if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
             with self._hook_timeout_lock:
                 # See #6622.
-                self._hook_timeout_suppressed_until[suppression_key] = (
-                    time.monotonic() + self._hook_timeout_suppression_seconds)
+                if suppress:
+                    self._hook_timeout_suppressed_until[suppression_key] = (
+                        time.monotonic() + self._hook_timeout_suppression_seconds)
                 # The worker may have finished (and released its token) between the wait
                 # expiring and this lock; recording it as abandoned then would block the
                 # callback for that call id until reload with no thread behind it.

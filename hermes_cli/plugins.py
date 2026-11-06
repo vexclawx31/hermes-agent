@@ -974,10 +974,13 @@ class PluginContext:
                 logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
-    def register_hook(self, hook_name: str, callback: Callable, *, priority: int = 0) -> PluginRegistration:
+    def register_hook(
+        self, hook_name: str, callback: Callable, *, priority: int = 0, fail_closed_text: Optional[str] = None,
+    ) -> PluginRegistration:
         """Register a lifecycle hook callback (unknown names warn but are still stored). Higher
-        ``priority`` dispatches earlier; the default 0 keeps registration order (a final guard: < 0)."""
-        self._manager._set_hook_priority(hook_name, callback, priority)
+        ``priority`` dispatches earlier; the default 0 keeps registration order (a final guard: < 0).
+        ``fail_closed_text``: chained hooks only, see ``plugins_dispatch._HOOK_CHAINED_HOOKS``."""
+        self._manager._set_hook_options(hook_name, callback, priority, fail_closed_text)
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
@@ -1225,6 +1228,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._plugins: dict[str, LoadedPlugin] = {}
         self._hooks: dict[str, list[Callable]] = {}
         self._hook_priorities: dict[tuple[str, int], int] = {}  # (hook, id(callback)) -> non-zero priority
+        self._hook_fail_closed_texts: dict[tuple[str, int], str] = {}  # (hook, id(callback)) -> fallback
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: dict[tuple[str, str], list[PluginRegistration]] = {}
         self._middleware: dict[str, list[Callable]] = {}

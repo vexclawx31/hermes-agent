@@ -138,6 +138,91 @@ def test_unregistering_drops_the_priority(manager):
     assert manager.iter_hook_callbacks("transform_llm_output") == ()
 
 
+WITHHELD = "[reply withheld]"
+
+
+def _register_guard(manager, callback, **options):
+    _ctx(manager, "guard").register_hook("transform_llm_output", callback, priority=-1000, **options)
+
+
+def test_fail_closed_stage_that_raises_replaces_the_text(manager):
+    def guard(response_text, **_):
+        raise RuntimeError("judge unavailable")
+
+    _ctx(manager, "style").register_hook("transform_llm_output", _appender("a"))
+    _register_guard(manager, guard, fail_closed_text=WITHHELD)
+    assert manager.invoke_hook("transform_llm_output", response_text="secret") == [WITHHELD]
+
+
+def test_fail_closed_stage_that_times_out_replaces_the_text(manager, monkeypatch):
+    monkeypatch.setattr(plugins_module, "_resolve_hook_callback_timeout", lambda: 0.2)
+    release = threading.Event()
+
+    def guard(response_text, **_):
+        release.wait(30)
+        return response_text
+
+    _register_guard(manager, guard, fail_closed_text=WITHHELD)
+    try:
+        assert manager.invoke_hook("transform_llm_output", response_text="secret", turn_id="t1") == [WITHHELD]
+    finally:
+        release.set()
+
+
+def test_fail_closed_stage_is_retried_on_the_next_call_after_a_timeout(manager, monkeypatch):
+    monkeypatch.setattr(plugins_module, "_resolve_hook_callback_timeout", lambda: 0.2)
+    release = threading.Event()
+    calls = []
+
+    def guard(response_text, **_):
+        calls.append(response_text)
+        if len(calls) == 1:
+            release.wait(30)  # first call hangs past the timeout
+        return f"checked:{response_text}"
+
+    _register_guard(manager, guard, fail_closed_text=WITHHELD)
+    try:
+        assert manager.invoke_hook("transform_llm_output", response_text="one", turn_id="t1") == [WITHHELD]
+        # Well inside the 60 s suppression window: a fail-closed stage still runs.
+        assert manager.invoke_hook("transform_llm_output", response_text="two", turn_id="t2") == ["checked:two"]
+    finally:
+        release.set()
+    assert calls == ["one", "two"]
+
+
+def test_non_fail_closed_stage_keeps_the_suppression_window(manager, monkeypatch):
+    monkeypatch.setattr(plugins_module, "_resolve_hook_callback_timeout", lambda: 0.2)
+    release = threading.Event()
+    calls = []
+
+    def stage(response_text, **_):
+        calls.append(response_text)
+        if len(calls) == 1:
+            release.wait(30)
+        return f"styled:{response_text}"
+
+    _ctx(manager).register_hook("transform_llm_output", stage)
+    try:
+        assert manager.invoke_hook("transform_llm_output", response_text="one", turn_id="t1") == []
+        assert manager.invoke_hook("transform_llm_output", response_text="two", turn_id="t2") == []
+    finally:
+        release.set()
+    assert calls == ["one"]  # suppressed: the second call never reached the callback
+
+
+def test_fail_closed_text_is_validated(manager):
+    with pytest.raises(ValueError):
+        _ctx(manager).register_hook("post_llm_call", lambda **_: None, fail_closed_text=WITHHELD)
+    with pytest.raises(TypeError):
+        _register_guard(manager, _appender("g"), fail_closed_text="")
+
+
+def test_unregistering_drops_the_fail_closed_text(manager):
+    handle = _ctx(manager).register_hook("transform_llm_output", _appender("g"), fail_closed_text=WITHHELD)
+    handle.dispose()
+    assert manager._hook_fail_closed_texts == {}
+
+
 def test_module_level_dispatch_uses_the_chain(manager):
     ctx = _ctx(manager)
     ctx.register_hook("transform_llm_output", _appender("a"))
