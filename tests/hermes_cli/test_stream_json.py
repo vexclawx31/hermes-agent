@@ -43,11 +43,14 @@ def test_emitter_event_stream_is_valid_jsonl(capsys):
     assert all("timestamp" in e for e in events)
 
 
-def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=True, launch_skills=None):
+def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=True, launch_skills=None,
+                          preload_result=None):
     """parser → cmd_chat → cli.main → quiet single-query path with a deterministic fake agent."""
     import cli
     import hermes_cli.main as cli_entry
     from hermes_cli._parser import build_top_level_parser
+
+    real_finalize = cli.HermesCLI.__dict__["finalize_preloaded_skills"]
 
     class FakeAgent:
         model = "test-model"
@@ -76,6 +79,12 @@ def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=
             return {"signature": "r", "model": None, "runtime": None, "request_overrides": None}
 
         def _init_agent(self, **_kwargs):
+            if preload_result is not None:
+                # The real finalize, as HermesCLI._init_agent runs it before building the agent.
+                self.system_prompt = ""
+                self._preload_skills_thread = _FinishedThread()
+                self._preload_skills_result = preload_result
+                real_finalize(self)
             self.agent = FakeAgent()
             return True
 
@@ -101,6 +110,16 @@ def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=
     with pytest.raises(SystemExit) as exc_info:
         cli_entry.cmd_chat(args)
     return exc_info.value.code, _events(capsys)
+
+
+class _FinishedThread:
+    """A preload thread that has already finished."""
+
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return False
 
 
 def _ok_turn(agent):
@@ -138,6 +157,26 @@ def test_chat_stream_json_reports_loaded_and_missing_skills(monkeypatch, capsys)
     assert skills["loaded"] == ["switchboard-intake"] and skills["missing"] == ["typo-skill"]
     assert skills["session_id"] == "session-123"
     assert [e for e in events if e.get("subtype") == "skills"] == [skills]
+
+
+def test_chat_stream_json_real_finalize_partial_miss(monkeypatch, capsys):
+    """Through the real finalize_preloaded_skills: the event reflects the preload result."""
+    code, events = _run_stream_json_chat(
+        monkeypatch, capsys, _ok_turn, preload_result=("skill prompt", ["tenant-desk"], ["typo-skill"]))
+    assert code == 0
+    assert events[1]["subtype"] == "skills"
+    assert events[1]["loaded"] == ["tenant-desk"] and events[1]["missing"] == ["typo-skill"]
+
+
+def test_chat_stream_json_all_skills_missing_closes_protocol(monkeypatch, capsys):
+    """Every -s skill unknown: stdout stays JSONL-only, init → skills (nothing loaded) → failing result."""
+    code, events = _run_stream_json_chat(
+        monkeypatch, capsys, _ok_turn, preload_result=("", [], ["switchboard-intake"]))
+    assert code == 1
+    assert [(e["type"], e.get("subtype")) for e in events] == [("system", "init"), ("system", "skills"),
+                                                               ("result", None)]
+    assert events[1]["loaded"] == [] and events[1]["missing"] == ["switchboard-intake"]
+    assert events[2]["exit_code"] == 1 and "switchboard-intake" in events[2]["error"]
 
 
 def test_chat_stream_json_skills_event_is_empty_without_skills(monkeypatch, capsys):

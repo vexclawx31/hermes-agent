@@ -1014,6 +1014,9 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         thread.join(timeout=120)
         self._preload_skills_finalized = True
         err = getattr(self, "_preload_skills_error", None)
+        if err is not None or thread.is_alive():
+            # The preload failed or overran its join: no requested -s skill reached the prompt.
+            self.launch_skills = {"loaded": [], "missing": list(getattr(self, "_launch_skills_requested", None) or [])}
         if err is not None:
             raise err
         auto_result = getattr(self, "_auto_load_skills_result", None)
@@ -1580,6 +1583,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
                 cli._preload_skills_error = exc
 
         cli._preload_skills_requested = [*auto_load_names, *(s for s in parsed_skills if s not in auto_load_names)]
+        cli._launch_skills_requested = list(parsed_skills)  # -s only: reported missing if the preload never lands
         cli._preload_skills_thread = threading.Thread(target=_load_preloaded_skills, name="skills-preload", daemon=True)
         cli._preload_skills_thread.start()
     return cli

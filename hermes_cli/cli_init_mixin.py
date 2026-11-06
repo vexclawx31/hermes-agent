@@ -423,6 +423,7 @@ class CLIInitMixin:
         self._preload_skills_result: Optional[tuple] = None
         self._preload_skills_error: Optional[BaseException] = None
         self._preload_skills_requested: list = []
+        self._launch_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
 

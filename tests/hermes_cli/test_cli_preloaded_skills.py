@@ -107,3 +107,39 @@ def test_finalize_records_launch_skills_on_partial_miss(monkeypatch):
     _real_finalize(created["cli"])
     assert created["cli"].launch_skills == {"loaded": ["tenant-desk"], "missing": ["typo-skill"]}
     assert created["cli"].preloaded_skills == ["tenant-desk"]
+
+
+class _StuckThread:
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return True
+
+
+class _DoneThread(_StuckThread):
+    def is_alive(self):
+        return False
+
+
+def _bare_cli(thread, error=None):
+    cli_obj = _DummyCLI()
+    cli_obj._preload_skills_thread = thread
+    cli_obj._preload_skills_error = error
+    cli_obj._preload_skills_result = None
+    cli_obj._launch_skills_requested = ["switchboard-intake"]
+    return cli_obj
+
+
+def test_finalize_reports_requested_skills_missing_when_preload_overruns():
+    """A preload still running after the join timeout loaded nothing: say so, not 'no -s given'."""
+    cli_obj = _bare_cli(_StuckThread())
+    _real_finalize(cli_obj)
+    assert cli_obj.launch_skills == {"loaded": [], "missing": ["switchboard-intake"]}
+
+
+def test_finalize_reports_requested_skills_missing_when_preload_raises():
+    cli_obj = _bare_cli(_DoneThread(), error=RuntimeError("skills tree unreadable"))
+    with pytest.raises(RuntimeError, match="skills tree unreadable"):
+        _real_finalize(cli_obj)
+    assert cli_obj.launch_skills == {"loaded": [], "missing": ["switchboard-intake"]}
