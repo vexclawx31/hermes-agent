@@ -5,6 +5,7 @@ so test patches keep working."""
 
 import contextvars as _ctxvars
 import logging
+import os
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -128,6 +129,46 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
         if resolved.is_relative_to(root):
             return None
     return f"Refusing to delete '{skill_dir}': path does not resolve inside any known skills root."
+
+
+def _read_only_skill_message(name: str, skill_dir: Path, blocked: Path) -> str:
+    """Refusal text for a skill whose files this agent cannot write (``blocked`` is the
+    directory that refused)."""
+    try:
+        from agent.skill_utils import is_external_skill_path
+        external = is_external_skill_path(skill_dir)
+    except Exception:
+        logger.debug("external skill lookup failed for %s", name, exc_info=True)
+        external = False
+    where = (f"it lives in skills.external_dirs ({skill_dir}), which this agent cannot write"
+             if external else f"its directory {blocked} is not writable by this agent")
+    return (f"Skill '{name}' is read-only: {where}. To change it, create a local copy under a "
+            f"new name with skill_manage(action='create') instead.")
+
+
+def _nearest_existing_dir(path: Path) -> Path:
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def _read_only_skill_guard(name: str, skill_dir: Path, action: str,
+                           target: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """Refuse a mutation that would hit a directory this process cannot write (a sealed release
+    dir, a read-only skills.external_dirs collection) before any write starts.
+
+    A write checks the directory that actually receives ``target`` (default SKILL.md), or its
+    nearest existing ancestor when the subdirectory is new. A delete checks the parent and EVERY
+    directory of the tree: rmtree would otherwise remove part of the skill and then fail."""
+    from agent.skill_utils import is_writable_skill_dir
+    if action == "delete":
+        dirs = [skill_dir.parent, skill_dir] + [
+            Path(dp) / d for dp, dns, _ in os.walk(skill_dir) for d in dns
+            if not (Path(dp) / d).is_symlink()]
+    else:
+        dirs = [_nearest_existing_dir((target or skill_dir / "SKILL.md").parent)]
+    blocked = next((d for d in dirs if not is_writable_skill_dir(d)), None)
+    return None if blocked is None else _refusal(_read_only_skill_message(name, skill_dir, blocked))
 
 
 def _is_pinned(name: str, what: str) -> Optional[bool]:

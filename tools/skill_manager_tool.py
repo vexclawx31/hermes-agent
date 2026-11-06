@@ -30,7 +30,7 @@ from agent.skill_utils import (
 from tools.skill_manager_guards import (
     _background_review_delete_guard, _background_review_preflight, _background_review_read_before_write_guard,
     _containing_skills_root, _curator_consolidation_delete_guard, _is_path_redirect, _pinned_guard,
-    _validate_delete_target, _is_background_review, _refusal as _err)
+    _read_only_skill_guard, _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
@@ -382,13 +382,16 @@ def _resolve_supporting_file(skill_dir: Path, file_path: str):
 
 
 def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
-    """Find the skill; a delete also runs the background-review delete guard -> ``(skill_dir, None)``
-    | ``(None, error_dict)``."""
+    """Find the skill; a delete also runs the background-review delete guard; delete and edit (whose
+    target is SKILL.md) are refused up front when the agent cannot write the directories they touch
+    (patch/write_file/remove_file check their resolved target) -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
     existing = _find_skill(name)
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
     guard = _background_review_delete_guard(name, skill_dir) if action == "delete" else None
+    if not guard and action in ("delete", "edit"):
+        guard = _read_only_skill_guard(name, skill_dir, action)
     return (None, guard) if guard else (skill_dir, None)
 
 
@@ -526,6 +529,8 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
         target = skill_dir / "SKILL.md"
     if not target.exists():
         return _err(f"File not found: {target.relative_to(skill_dir)}")
+    if ro_guard := _read_only_skill_guard(name, skill_dir, "patch", target):
+        return ro_guard
     if read_guard := _background_review_read_before_write_guard(name, target, "patch", target_label):
         return read_guard
     content = target.read_text(encoding="utf-8-sig")
@@ -616,7 +621,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> dict[str, Any]:
     if guard:
         return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
-    if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
+    if guard := (err or _read_only_skill_guard(name, skill_dir, "write_file", target)
+                 or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content)):
         return guard
     result = {"success": True, "message": f"File '{file_path}' written to skill '{name}'.", "path": str(target)}
     # references/ is where per-session hoarding shows up; surface the sprawl finding on the write
@@ -640,8 +646,9 @@ def _remove_file(name: str, file_path: str) -> dict[str, Any]:
         available = [str(f.relative_to(skill_dir)) for subdir in ALLOWED_SUBDIRS
                      if (skill_dir / subdir).exists() for f in (skill_dir / subdir).rglob("*") if f.is_file()]
         return _err(f"File '{file_path}' not found in skill '{name}'.", available_files=available or None)
-    if read_guard := _background_review_read_before_write_guard(name, target, "remove_file", file_path):
-        return read_guard
+    if guard := (_read_only_skill_guard(name, skill_dir, "remove_file", target)
+                 or _background_review_read_before_write_guard(name, target, "remove_file", file_path)):
+        return guard
     target.unlink()
     _rmdir_if_empty(target.parent, skill_dir)
     return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
@@ -765,6 +772,17 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
             forget(name)
 
 
+def _permission_denied_message(action: str, name: str, exc: PermissionError) -> str:
+    """Clean tool result for a write the up-front read-only guard could not foresee (a read-only
+    subdirectory or file, a non-writable skills.create_dir): no traceback reaches the model."""
+    where = exc.filename or "the skill directory"
+    logger.info("skill_manage %s '%s' refused: permission denied (%s)", action, name, where)
+    hint = ("Check that the skills directory (or skills.create_dir) is writable." if action == "create"
+            else "The skill's files are read-only; create a local copy under a new name with "
+                 "skill_manage(action='create') instead.")
+    return f"Cannot {action} skill '{name}': permission denied writing {where}. {hint}"
+
+
 def skill_manage(
     action: str, name: str, content: str | None = None, category: str | None = None, file_path: str | None = None,
     file_content: str | None = None, old_string: str | None = None, new_string: str | None = None,
@@ -807,7 +825,10 @@ def skill_manage(
                 _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
             f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
-        result = handler({"name": name, **args})
+        try:
+            result = handler({"name": name, **args})
+        except PermissionError as exc:
+            result = _err(_permission_denied_message(action, name, exc))
         if isinstance(result, str):
             return result  # tool_error JSON for argument-shape problems (patch)
         if result.get("success"):

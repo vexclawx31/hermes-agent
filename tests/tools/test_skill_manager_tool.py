@@ -993,6 +993,192 @@ class TestExternalSkillMutations:
             tmp_path / "manual-skill" / "SKILL.md"
         ).read_text(encoding="utf-8")
 
+
+@contextmanager
+def _read_only(*paths: Path):
+    """chmod ``paths`` to r-x for the block, then restore so tmp_path teardown works."""
+    for p in paths:
+        p.chmod(0o555)
+    try:
+        yield
+    finally:
+        for p in paths:
+            p.chmod(0o755)
+
+
+@pytest.mark.skipif(not _can_make_unreadable_dir(), reason="needs POSIX permissions and a non-root user")
+class TestReadOnlySkillDirs:
+    """A skill the agent cannot write (sealed release dir, read-only skills.external_dirs
+    collection) is refused with a clean tool result up front — never a PermissionError
+    traceback out of utils._atomic_write / mkstemp."""
+
+    @pytest.mark.parametrize("op", [
+        {"action": "patch", "old_string": "OLD_MARKER", "new_string": "NEW_MARKER"},
+        {"action": "edit", "content": VALID_SKILL_CONTENT_2},
+        {"action": "write_file", "file_path": "references/new.md", "file_content": "# new\n"},
+        {"action": "remove_file", "file_path": "references/keep.md"},
+        {"action": "delete"},
+    ])
+    def test_read_only_local_skill_is_refused_cleanly(self, tmp_path, op):
+        skill_dir = _write_external_skill(tmp_path, "sealed-skill")
+        (skill_dir / "references").mkdir()
+        (skill_dir / "references" / "keep.md").write_text("# keep\n")
+        before = (skill_dir / "SKILL.md").read_text()
+
+        with _skill_dir(tmp_path), _read_only(skill_dir / "references", skill_dir):
+            result = json.loads(skill_manage(name="sealed-skill", **op))
+
+        # The refusal names the directory that actually receives the write.
+        blocked = skill_dir / "references" if op.get("file_path") else skill_dir
+        assert result["success"] is False
+        assert result["error"] == (
+            f"Skill 'sealed-skill' is read-only: its directory {blocked} is not writable by "
+            "this agent. To change it, create a local copy under a new name with "
+            "skill_manage(action='create') instead.")
+        assert (skill_dir / "SKILL.md").read_text() == before
+        assert (skill_dir / "references" / "keep.md").exists()
+        assert not (skill_dir / "references" / "new.md").exists()
+
+    def test_read_only_external_skill_names_external_dirs(self, tmp_path):
+        local = tmp_path / "local"
+        external = tmp_path / "vault"
+        local.mkdir(); external.mkdir()
+        skill_dir = _write_external_skill(external)
+
+        with _two_roots(local, external), \
+             patch("agent.skill_utils.get_external_skills_dirs", return_value=[external]), \
+             _read_only(skill_dir):
+            result = json.loads(skill_manage(
+                action="patch", name="ext-skill", old_string="OLD_MARKER", new_string="NEW_MARKER"))
+
+        assert result["success"] is False
+        assert "Skill 'ext-skill' is read-only: it lives in skills.external_dirs" in result["error"]
+        assert "create a local copy under a new name" in result["error"]
+        assert "OLD_MARKER" in (skill_dir / "SKILL.md").read_text()
+        assert not (local / "ext-skill").exists()
+
+    def test_writable_external_skill_still_edits_in_place(self, tmp_path):
+        """The guard is about permissions, not ownership: #4759/#4381 stay fixed."""
+        local = tmp_path / "local"
+        external = tmp_path / "vault"
+        local.mkdir(); external.mkdir()
+        skill_dir = _write_external_skill(external)
+
+        with _two_roots(local, external), \
+             patch("agent.skill_utils.get_external_skills_dirs", return_value=[external]):
+            result = json.loads(skill_manage(
+                action="patch", name="ext-skill", old_string="OLD_MARKER", new_string="NEW_MARKER"))
+
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text()
+
+    def test_delete_refused_when_parent_is_read_only(self, tmp_path):
+        """rmtree would empty the skill and then fail on its own rmdir: refuse before it starts."""
+        category = tmp_path / "cat"
+        skill_dir = _write_external_skill(category, "nested-skill")
+
+        with _skill_dir(tmp_path), _read_only(category):
+            result = json.loads(skill_manage(action="delete", name="nested-skill"))
+
+        assert result["success"] is False
+        assert "is read-only" in result["error"]
+        assert (skill_dir / "SKILL.md").exists()
+
+    def test_delete_refused_up_front_when_a_subdir_is_read_only(self, tmp_path):
+        """rmtree would remove the writable parts and then stop: nothing may go."""
+        skill_dir = _write_external_skill(tmp_path / "cat", "half-skill")
+        (skill_dir / "references").mkdir()
+        (skill_dir / "references" / "notes.md").write_text("x\n")
+        (skill_dir / "scripts").mkdir()
+        (skill_dir / "scripts" / "run.sh").write_text("x\n")
+
+        with _skill_dir(tmp_path), _read_only(skill_dir / "references"):
+            result = json.loads(skill_manage(action="delete", name="half-skill"))
+
+        assert result["success"] is False
+        assert f"its directory {skill_dir / 'references'} is not writable" in result["error"]
+        assert (skill_dir / "SKILL.md").exists()
+        assert (skill_dir / "scripts" / "run.sh").exists()
+        assert (skill_dir / "references" / "notes.md").exists()
+
+    def test_target_dir_decides_not_the_skill_root(self, tmp_path):
+        """A 0555 root with a writable references/ takes a references/ write; a writable root
+        with a 0555 references/ refuses it up front, naming references/."""
+        sealed_root = _write_external_skill(tmp_path, "sealed-root")
+        (sealed_root / "references").mkdir()
+        open_root = _write_external_skill(tmp_path, "open-root")
+        (open_root / "references").mkdir()
+        (open_root / "references" / "notes.md").write_text("OLD_MARKER\n")
+
+        with _skill_dir(tmp_path), _read_only(sealed_root, open_root / "references"):
+            allowed = json.loads(skill_manage(
+                action="write_file", name="sealed-root",
+                file_path="references/new.md", file_content="# new\n"))
+            refused = json.loads(skill_manage(
+                action="patch", name="open-root", file_path="references/notes.md",
+                old_string="OLD_MARKER", new_string="NEW_MARKER"))
+
+        assert allowed["success"] is True, allowed
+        assert (sealed_root / "references" / "new.md").read_text() == "# new\n"
+        assert refused["success"] is False
+        assert f"its directory {open_root / 'references'} is not writable" in refused["error"]
+        assert "OLD_MARKER" in (open_root / "references" / "notes.md").read_text()
+
+    def test_read_only_file_in_writable_dir_patches(self, tmp_path):
+        """A 0444 SKILL.md in a writable dir is replaced atomically (and keeps its mode)."""
+        skill_dir = _write_external_skill(tmp_path, "ro-file")
+        (skill_dir / "SKILL.md").chmod(0o444)
+
+        with _skill_dir(tmp_path):
+            result = json.loads(skill_manage(
+                action="patch", name="ro-file", old_string="OLD_MARKER", new_string="NEW_MARKER"))
+
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text()
+
+    def test_permission_error_past_the_guard_is_a_clean_result(self, tmp_path):
+        """Whatever the up-front check cannot foresee comes back as a result, not a traceback."""
+        skill_dir = _write_external_skill(tmp_path, "mixed-skill")
+        denied = PermissionError(13, "Permission denied", str(skill_dir / "references" / "new.md"))
+
+        with _skill_dir(tmp_path), \
+             patch("tools.skill_manager_tool.atomic_write_text", side_effect=denied):
+            result = json.loads(skill_manage(
+                action="write_file", name="mixed-skill",
+                file_path="references/new.md", file_content="# new\n"))
+
+        assert result["success"] is False
+        assert result["error"] == (
+            f"Cannot write_file skill 'mixed-skill': permission denied writing "
+            f"{skill_dir / 'references' / 'new.md'}. The skill's files are read-only; create a "
+            "local copy under a new name with skill_manage(action='create') instead.")
+
+    def test_create_into_read_only_create_dir_is_a_clean_result(self, tmp_path):
+        create_dir = tmp_path / "shared"
+        create_dir.mkdir()
+
+        with _skill_dir(tmp_path), \
+             patch("agent.skill_utils.get_skill_create_dir", return_value=create_dir), \
+             _read_only(create_dir):
+            result = json.loads(skill_manage(action="create", name="new-skill", content=VALID_SKILL_CONTENT))
+
+        assert result["success"] is False
+        assert "Cannot create skill 'new-skill': permission denied" in result["error"]
+        assert "skills.create_dir" in result["error"]
+
+    def test_batch_on_read_only_skill_aborts_cleanly(self, tmp_path):
+        skill_dir = _write_external_skill(tmp_path, "sealed-skill")
+
+        with _skill_dir(tmp_path), _read_only(skill_dir):
+            result = json.loads(skill_manage(action="", name="", operations=[
+                {"name": "sealed-skill", "action": "patch",
+                 "old_string": "OLD_MARKER", "new_string": "NEW_MARKER"}]))
+
+        assert result["success"] is False
+        assert "Skill 'sealed-skill' is read-only" in result["error"]
+        assert "OLD_MARKER" in (skill_dir / "SKILL.md").read_text()
+
+
 class TestBackgroundOwnershipPolicyConsistency:
     """The autonomous delete policy must not depend on its own side effects.
 

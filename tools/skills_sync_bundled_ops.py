@@ -116,6 +116,7 @@ def ensure_bundled_skill(name: str) -> dict:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(src, dest, ignore=_ignore_runtime_cache, dirs_exist_ok=True,
                         copy_function=lambda s, d: d if os.path.lexists(d) else shutil.copy2(s, d))
+        ss._make_owner_writable(dest)  # the release tree is sealed 0555/0444: the copy must not be
     except (OSError, ValueError) as e:
         return {"ok": False, "action": "not_restored", "path": dest,
                 "message": f"Could not copy the built-in skill '{name}' to {dest}: {e}"}
