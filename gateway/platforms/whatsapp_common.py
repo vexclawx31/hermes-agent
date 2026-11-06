@@ -334,7 +334,9 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         if getattr(source, "chat_type", "") == "group":
             group_cfg = self._resolve_group_cfg(str(getattr(source, "chat_id", "") or ""))
             if "guest_toolsets" in group_cfg:
-                guest = group_cfg["guest_toolsets"]
+                # Present means this group's kit: a null/blank value is an empty kit (no tools), never
+                # "unset", which with no owners configured would widen to the platform toolsets.
+                guest = group_cfg["guest_toolsets"] if group_cfg["guest_toolsets"] is not None else []
         if guest is None and not getattr(self, "_owners", None):
             return None
         if self._is_whatsapp_owner(getattr(source, "user_id", None)):

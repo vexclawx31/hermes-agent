@@ -170,6 +170,17 @@ def test_group_guest_toolsets_case_insensitive_key_and_empty_list_fail_closed():
     assert adapter.toolsets_for_source(_source(GUEST)) == []
 
 
+@pytest.mark.parametrize("kit", [None, "", []])
+def test_null_or_blank_group_kit_without_owners_fails_closed(kit):
+    """Review fix: a present-but-null/blank group kit must not fall back to "unset", which with no
+    owners configured would hand guests the full platform toolsets."""
+    extra = {**_kit_extra(kit), "owners": []}
+    adapter = _make_adapter(extra)
+    assert adapter.toolsets_for_source(_source(GUEST)) == []
+    assert adapter.toolsets_for_source(_source(OWNER)) == []  # no owners: nobody is an owner here
+    assert sorted(adapter.toolsets_for_source(_source(GUEST, chat_id=ORDINARY_GROUP))) == ["vision", "web"]
+
+
 def test_runner_group_kit_stays_exact(monkeypatch):
     import hermes_cli.tools_config as tc
 
