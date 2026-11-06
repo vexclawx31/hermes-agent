@@ -39,6 +39,13 @@ Contract:
   first, because the model can't choose its own circle. Several callbacks' write circles are united
   (more tags only narrow who may see the entry). Without a dict verdict (an old plugin) adds are
   stored exactly as today.
+- Gateway ``/memory`` command (``surface="memory_command"``): reviews and applies pending memory
+  writes, echoing staged entry text that carries no circle yet, so it runs only when every callback
+  answers ``"allow"`` (or ``None``) or no callback is registered. A dict verdict, ``"omit"`` or any
+  failure refuses it with :data:`COMMAND_REFUSED_NOTE`. The payload is the command event's trusted
+  source (``session_id`` is empty: a slash command has no agent session).
+
+Surfaces: ``"system_prompt"``, ``"memory_tool"``, ``"memory_tool_write"``, ``"memory_command"``.
 """
 
 from __future__ import annotations
@@ -55,15 +62,18 @@ HOOK_NAME = "filter_builtin_memory"
 ALLOW = "allow"
 OMIT = "omit"
 OMITTED_NOTE = "Curated notes are not shown in this chat."
+COMMAND_REFUSED_NOTE = "/memory is not available in this chat."
 SURFACE_SYSTEM_PROMPT = "system_prompt"
 SURFACE_MEMORY_TOOL = "memory_tool"
 SURFACE_MEMORY_TOOL_WRITE = "memory_tool_write"
+SURFACE_MEMORY_COMMAND = "memory_command"
 # Characters that would break the marker's one-line ``[circle: a, b]`` syntax.
 _BAD_TAG_CHARS = frozenset("[],\n\r")
 
 __all__ = [
-    "ALLOW", "OMIT", "OMITTED_NOTE", "BuiltinMemoryVerdict", "builtin_memory_allowed",
-    "builtin_memory_verdict", "circle_marker", "entry_circles", "strip_circle_markers",
+    "ALLOW", "COMMAND_REFUSED_NOTE", "OMIT", "OMITTED_NOTE", "BuiltinMemoryVerdict", "builtin_memory_allowed",
+    "builtin_memory_command_allowed", "builtin_memory_verdict", "circle_marker", "entry_circles",
+    "strip_circle_markers",
 ]
 
 
@@ -190,3 +200,33 @@ def builtin_memory_allowed(agent: Any, surface: str) -> bool:
     callback omits it or filters it per entry; callers that can filter use :func:`builtin_memory_verdict`."""
     verdict = builtin_memory_verdict(agent, surface)
     return verdict.allowed and not verdict.keeps
+
+
+def builtin_memory_command_allowed(source: Any, session_key: Any = "") -> bool:
+    """Whether the gateway ``/memory`` command may run for *source*'s chat (contract above): only a
+    plain allow (or no callback at all); dict verdicts, omit and every failure refuse. *session_key*
+    may be a zero-argument callable, resolved only when a callback is registered."""
+    try:
+        from hermes_cli import plugins
+
+        if not plugins.has_hook(HOOK_NAME):
+            return True
+
+        def _text(value: Any) -> str:
+            return str(getattr(value, "value", value) or "")
+
+        payload = {
+            "session_id": "", "platform": _text(getattr(source, "platform", None)),
+            "chat_id": _text(getattr(source, "chat_id", None)), "chat_type": _text(getattr(source, "chat_type", None)),
+            "sender_id": _text(getattr(source, "user_id", None)), "thread_id": _text(getattr(source, "thread_id", None)),
+            "session_key": str((session_key() if callable(session_key) else session_key) or ""),
+            "surface": SURFACE_MEMORY_COMMAND,
+        }
+        results = plugins.invoke_hook(HOOK_NAME, **payload)
+    except Exception:
+        logger.warning("%s dispatch failed; refusing /memory (fail closed)", HOOK_NAME, exc_info=True)
+        return False
+    refused = [result for result in results if not (isinstance(result, str) and result == ALLOW)]
+    if refused:
+        logger.info("%s refused /memory in this chat (%d non-allow verdicts)", HOOK_NAME, len(refused))
+    return not refused
