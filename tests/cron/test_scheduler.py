@@ -766,7 +766,9 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         fake_db.close.assert_called_once()
 
-    def test_run_job_preserves_slack_origin_thread_for_same_explicit_channel(self, tmp_path, monkeypatch):
+    def test_run_job_explicit_slack_channel_targets_root_even_in_origin_channel(self, tmp_path, monkeypatch):
+        """An explicit ``slack:<chat>`` target posts at the channel root, even when it equals the
+        origin chat and the origin carries a thread: only ``deliver=origin`` replays the thread."""
         job = {
             "id": "slack-thread-job",
             "name": "slack-thread",
@@ -819,7 +821,7 @@ class TestRunJobSessionPersistence:
         assert seen == {
             "platform": "slack",
             "chat_id": "C0B3KEP3SD6",
-            "thread_id": "1778485067.844139",
+            "thread_id": None,
         }
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
