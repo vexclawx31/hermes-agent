@@ -680,7 +680,10 @@ class GatewayAgent:
             if isinstance(persist_user_message, list):
                 persist_user_message = user_message
         text = persist_user_message if isinstance(persist_user_message, str) else user_message
-        params = {"session_id": self.session_id, "submission_id": uuid.uuid4().hex, "text": text}
+        # Fork (launch adapter): HERMES_CHAT_RUN_ID names a spawner's first submit, so a retried run is the
+        # same admission, never a second turn (gateway_chat_view.run_request_id); otherwise a fresh id.
+        from hermes_cli.gateway_chat_view import run_request_id
+        params = {"session_id": self.session_id, "submission_id": run_request_id("submit"), "text": text}
         if attachments:
             params["attachments"] = attachments
         if isinstance(user_message, str) and user_message != text:
@@ -798,11 +801,17 @@ class GatewayAgent:
                 return self._voice_stopped(history)
         self._epoch = getattr(self.connection, "epoch", None)
         turn.admission = self._admission = (receipt or {}).get("admission_id")
+        if adopted is None and (receipt or {}).get("status") == "unknown":
+            # Fork (launch adapter): a retried run whose first attempt was lost in an owner restart: that
+            # admission is fenced and sends nothing; it needs `hermes sessions discard`, not a wait.
+            return self._failed(history, user_message, "This run's earlier attempt was lost in a gateway restart "
+                                "(unknown admission); acknowledge it with `hermes sessions discard`.",
+                                failure_reason="gateway_connection")
         if receipt and receipt.get("execution_generation") is not None:
             self._generation = receipt["execution_generation"]
         starts: dict = {}
         try:
-            settled = (adopted or {}).get("receipt")
+            settled = (adopted or {}).get("receipt") or (None if adopted else self._replayed_receipt(turn, receipt))
             outcome = {"_receipt": settled} if settled else self._pump(stream_callback, starts, turn)
         finally:
             if self._owns(turn):
@@ -816,6 +825,20 @@ class GatewayAgent:
         if turn.gapped:
             self._paint_owed(turn, result, outcome, stream_callback)
         return result
+
+    def _replayed_receipt(self, turn, receipt):
+        """Fork (launch adapter): a repeated ``HERMES_CHAT_RUN_ID`` submit answers with the admission it already
+        made. A settled one sends no more frames, so it settles from its receipt (with its result), never by
+        waiting on a stream that won't come. A queued or running one streams as usual."""
+        from hermes_cli.gateway_replay_gap import settled
+        if (receipt or {}).get("status") in (None, "queued", "started") or not turn.admission:
+            return None
+        try:
+            full = self.connection.call("prompt.receipt", session_id=turn.session_id, admission_id=turn.admission,
+                                        include_result=True, abandon=self._lost(turn))
+        except (CallStopped, GatewayClientError):
+            return None
+        return full if settled(full or {}) else None
 
     def _drain_stale(self):
         """Frames left from an earlier turn of this viewer (a late settlement) are not this turn's. A
