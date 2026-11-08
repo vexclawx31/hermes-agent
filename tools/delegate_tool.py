@@ -269,7 +269,10 @@ def _build_child_agent(
         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
-    with delegated_child_context():
+    from hermes_cli.toolset_scope import inherited_ceiling_platform
+    from toolsets import ceiling_platform_of
+    # The child keeps its parent's plugin toolset ceiling (its own platform is "subagent").
+    with delegated_child_context(), inherited_ceiling_platform(ceiling_platform_of(parent_agent)):
         try:
             child = AIAgent(
                 **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),

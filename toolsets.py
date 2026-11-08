@@ -449,26 +449,68 @@ def get_toolset_names() -> list[str]:
     return sorted(set(TOOLSETS.keys()) | set(_plugin_display_names()))
 
 
-def session_platform_tool_drops(platform: Optional[str]) -> frozenset:
-    """Tools of every platform-gated toolset that a session on *platform* does not get."""
-    return frozenset(tool for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms
-                     for tool in resolve_toolset(name))
+_SAME = object()
 
 
-def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[str]) -> Optional[list[str]]:
-    """*disabled* plus every platform-gated toolset a session on *platform* does not get. An agent stores
-    this as its ``disabled_toolsets``, so the tool list, the tool_search listing and bridge, MCP refreshes
-    and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
+def ceiling_platform_of(agent: Any) -> Optional[str]:
+    """The platform whose plugin toolset ceiling *agent* obeys (a delegated child keeps its parent's)."""
+    return getattr(agent, "_plugin_ceiling_platform", getattr(agent, "platform", None))
+
+
+def _ceiling_blocked(platform: Optional[str]) -> list[str]:
+    """Plugin toolsets outside the active profile's ``plugin_toolset_platforms`` ceiling for *platform*
+    (hermes_cli.toolset_scope); [] when no ceiling is configured."""
+    try:
+        from hermes_cli.toolset_scope import ceiling_blocked_toolsets
+    except ImportError:
+        return []
+    return ceiling_blocked_toolsets(platform)
+
+
+def session_platform_tool_drops(platform: Optional[str], ceiling_platform: Any = _SAME) -> frozenset:
+    """Tools of every platform-gated toolset that a session on *platform* does not get: the static
+    session-platform gates plus plugin toolsets outside the config ceiling (computed fresh on every call,
+    so a plugin registered after the agent was built is dropped at the next refresh too)."""
+    gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms]
+    blocked = _ceiling_blocked(platform if ceiling_platform is _SAME else ceiling_platform)
+    return frozenset(tool for name in (*gated, *blocked) for tool in resolve_toolset(name))
+
+
+def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[str],
+                              ceiling_platform: Any = _SAME) -> Optional[list[str]]:
+    """*disabled* plus every platform-gated toolset a session on *platform* does not get (static gates and
+    plugin toolsets outside the config ceiling). An agent stores this as its ``disabled_toolsets``, so the tool
+    list, the tool_search listing and bridge, MCP refreshes and delegate children (which inherit it) all subtract
+    the gated tools in ``_select_tool_names``."""
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items()
              if platform not in platforms and name not in (disabled or ())]
+    blocked = _ceiling_blocked(platform if ceiling_platform is _SAME else ceiling_platform)
+    gated += [name for name in blocked if name not in (disabled or ()) and name not in gated]
     return [*(disabled or ()), *gated] if gated else disabled
+
+
+def new_agent_disabled_toolsets(agent: Any, disabled: Optional[list[str]]) -> Optional[list[str]]:
+    """At agent build: record the platform whose plugin toolset ceiling *agent* obeys (a delegated child keeps
+    its parent's, see hermes_cli.toolset_scope.inherited_ceiling_platform) and return *disabled* gated for it."""
+    from hermes_cli.toolset_scope import ceiling_platform_for_new_agent
+    agent._plugin_ceiling_platform = ceiling_platform_for_new_agent(getattr(agent, "platform", None))
+    return session_disabled_toolsets(disabled, getattr(agent, "platform", None), agent._plugin_ceiling_platform)
+
+
+def agent_disabled_toolsets(agent: Any) -> Optional[list[str]]:
+    """*agent*'s disabled_toolsets with the session gates re-applied NOW (idempotent), for every reader that
+    scopes tools after build (tool_search bridge, tool dispatch, delegate inheritance): a plugin registered
+    after the agent was built cannot slip in between refreshes."""
+    return session_disabled_toolsets(getattr(agent, "disabled_toolsets", None), getattr(agent, "platform", None),
+                                     ceiling_platform_of(agent))
 
 
 def agent_tool_drops(agent: Any) -> frozenset:
     """Tool names *agent* never carries, whatever its toolsets resolved to: the side-agent drops and
     the toolsets its session platform does not get. Applied at load, MCP refresh and prefix restore."""
     from tools.connectors.turn import side_agent_tool_drops
-    return side_agent_tool_drops(agent) | session_platform_tool_drops(getattr(agent, "platform", None))
+    return side_agent_tool_drops(agent) | session_platform_tool_drops(getattr(agent, "platform", None),
+                                                                       ceiling_platform_of(agent))
 
 
 def validate_toolset(name: str) -> bool:

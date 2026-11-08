@@ -169,9 +169,20 @@ def _get_plugin_toolset_keys() -> set:
 def _checklist_toolset_keys(platform: str) -> set[str]:
     """Toolset keys the ``hermes tools`` checklist offers for ``platform`` (mirrors ``_prompt_toolset_checklist``);
     read-time-resolved toolsets (recovered composites, MCP names) are NOT here."""
+    blocked = _ceiling_blocked_here(platform)
     return {
         ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()
-        if _toolset_allowed_for_platform(ts_key, platform) and ts_key not in _CONFIG_ONLY_TOOLSETS}
+        if _toolset_allowed_for_platform(ts_key, platform) and ts_key not in _CONFIG_ONLY_TOOLSETS
+        and ts_key not in blocked}
+
+
+def _ceiling_blocked_here(platform: str, config: Optional[dict] = None) -> set[str]:
+    """Plugin toolsets the config ceiling (``plugin_toolset_platforms``) keeps off ``platform``."""
+    from hermes_cli.toolset_scope import ceiling_blocked_toolsets, parse_plugin_toolset_ceiling
+    ceiling = parse_plugin_toolset_ceiling(load_config() if config is None else config)
+    if ceiling is None:
+        return set()
+    return set(ceiling_blocked_toolsets(platform, ceiling=ceiling, plugin_keys=_get_plugin_toolset_keys()))
 
 
 def _platform_default_toolset(platform: str) -> str:
@@ -626,6 +637,14 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
     if not explicitly_configured and "kanban" in (config.get("toolsets") or []):
         enabled_toolsets.add("kanban")
 
+    # The plugin toolset ceiling (config ``plugin_toolset_platforms``) only removes, so a saved list or a
+    # composite can never widen a plugin toolset past it; sessions enforce the same rule at agent build.
+    if plugin_ts_keys:
+        from hermes_cli.toolset_scope import ceiling_blocked_toolsets, parse_plugin_toolset_ceiling
+        ceiling = parse_plugin_toolset_ceiling(config)
+        if ceiling is not None:
+            enabled_toolsets -= set(ceiling_blocked_toolsets(platform, ceiling=ceiling, plugin_keys=plugin_ts_keys))
+
     # agent.disabled_toolsets is a global suppression list (#86661) and runs LAST so it overrides everything
     # above. It may arrive as a JSON-array string ("['memory']") from `hermes config set` or a JSON-mode editor.
     disabled_toolsets = (config.get("agent") or {}).get("disabled_toolsets")
@@ -719,6 +738,10 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: set[
     # hand-edited config.yaml) can't turn on `discord` for Telegram.
     enabled_toolset_keys = {ts for ts in enabled_toolset_keys if _toolset_allowed_for_platform(ts, platform)}
     plugin_keys = _get_plugin_toolset_keys()
+    # Plugin toolsets the ceiling (plugin_toolset_platforms) keeps off this platform are not offered, so this save
+    # says nothing about them: keep their saved entries and "known" records exactly as they were.
+    ceiling_hidden = _ceiling_blocked_here(platform, config) & set(plugin_keys)
+    enabled_toolset_keys -= ceiling_hidden
     # Preserve only existing entries that are neither configurable nor platform defaults (i.e. MCP server
     # names): platform defaults (hermes-cli, ...) resolve to ALL tools and would silently override the user's
     # unchecked selections on the next read. Saving from the picker is consent to clear the "no_mcp" sentinel
@@ -728,12 +751,14 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: set[
         cfg_get(config, "platform_toolsets", platform, default=[]), platform
     )
     preserved_entries = {str(e) for e in (existing_toolsets if isinstance(existing_toolsets, list) else [])
-                         if str(e) not in drop}
+                         if str(e) not in drop or str(e) in ceiling_hidden}
     config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries)
     # Record which plugin toolsets this platform "knows" (distinguishes "new plugin, default enabled" from
     # "user disabled it"). _cfg_section normalizes a present-but-null key that setdefault alone would not replace.
     if plugin_keys:
-        _cfg_section(config, "known_plugin_toolsets")[platform] = sorted(plugin_keys)
+        known = _cfg_section(config, "known_plugin_toolsets")
+        previously_known = {str(k) for k in (known.get(platform) or []) if isinstance(known.get(platform), list)}
+        known[platform] = sorted((set(plugin_keys) - ceiling_hidden) | (previously_known & ceiling_hidden))
     # Same record for builtin toolsets the checklist offered; without it an unchecked toolset is
     # indistinguishable from one shipped after the save and _enable_recently_shipped_toolsets re-enables it.
     _cfg_section(config, "known_builtin_toolsets")[platform] = sorted(_configurable_keys())
@@ -831,10 +856,15 @@ def _prompt_toolset_checklist(platform_label: str, enabled: set[str], platform: 
     from toolsets import resolve_toolset
 
     tool_tokens = _estimate_tool_tokens()
-    # Drop platform-scoped toolsets that don't apply here and config-only capabilities (stt).
+    # Drop platform-scoped toolsets that don't apply here, plugin toolsets outside the config ceiling
+    # (plugin_toolset_platforms) and config-only capabilities (stt).
+    blocked = _ceiling_blocked_here(platform)
     effective = [
         (k, l, d) for (k, l, d) in _get_effective_configurable_toolsets()
-        if _toolset_allowed_for_platform(k, platform) and k not in _CONFIG_ONLY_TOOLSETS]
+        if _toolset_allowed_for_platform(k, platform) and k not in _CONFIG_ONLY_TOOLSETS and k not in blocked]
+    if blocked:
+        _print_info(f"  Plugin toolsets outside plugin_toolset_platforms for {platform} are not offered: "
+                    + ", ".join(sorted(blocked)))
     labels = [
         f"{ts_label}  ({ts_desc})"
         + ("  [no API key]" if not _toolset_has_keys(ts_key, force_fresh=force_fresh) and _is_configurable(ts_key) else "")

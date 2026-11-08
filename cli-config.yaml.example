@@ -1437,6 +1437,20 @@ platform_toolsets:
   teams: [hermes-teams]
   google_chat: [hermes-google_chat]
 
+# Optional ceiling for PLUGIN toolsets: where each one may exist at all.
+# Unset (default): plugin toolsets follow the lists above (and are on wherever a
+# platform has no record of them). Set: a plugin toolset is available only on the
+# platforms its list names; a plugin toolset not listed here, an empty list, or a
+# malformed value is OFF everywhere. The lists above can still turn a toolset off
+# inside the ceiling, never on outside it. Cron job, delegate and request toolset
+# lists obey it too. Delegated subagents inherit their parent's ceiling.
+# Careful: the key with no entries (e.g. all lines commented out) is null, which
+# also turns every plugin toolset OFF. Remove the key itself to go back to unset.
+#
+# plugin_toolset_platforms:
+#   slack_joined_history: [slack, whatsapp]
+#   whatsapp_archive: [whatsapp, slack, cron]
+
 # =============================================================================
 # Gateway Platform Settings
 # =============================================================================

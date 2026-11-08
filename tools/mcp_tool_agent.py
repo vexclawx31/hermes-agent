@@ -33,14 +33,17 @@ def _resolve_refresh_toolsets(agent, enabled_override, disabled_override):
     """Explicit reloads pass freshly-resolved toolsets (so a server just ENABLED in config is
     picked up) and the agent's selection is updated to match; automatic paths pass nothing
     and reuse the build-time selection."""
+    from toolsets import ceiling_platform_of, session_disabled_toolsets
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
-    if enabled_override is not None or disabled_override is not None:
-        enabled = enabled_override if enabled_override is not None else enabled
-        if disabled_override is not None:
-            from toolsets import session_disabled_toolsets
-            disabled = session_disabled_toolsets(disabled_override, getattr(agent, "platform", None))
-        agent.enabled_toolsets, agent.disabled_toolsets = enabled, disabled
+    if enabled_override is not None:
+        enabled = enabled_override
+    if disabled_override is not None:
+        disabled = disabled_override
+    # Re-apply the session gates on EVERY refresh (idempotent): a plugin toolset registered after the build
+    # and outside the ceiling is added here, so the tool_search scope and delegate children see it too.
+    disabled = session_disabled_toolsets(disabled, getattr(agent, "platform", None), ceiling_platform_of(agent))
+    agent.enabled_toolsets, agent.disabled_toolsets = enabled, disabled
     return enabled, disabled
 
 

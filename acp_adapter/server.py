@@ -449,6 +449,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         try:
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
+            from toolsets import agent_disabled_toolsets
 
             agent = state.agent
             agent.enabled_toolsets = _expand_acp_enabled_toolsets(
@@ -457,7 +458,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             )
             agent.tools = get_tool_definitions(
                 enabled_toolsets=agent.enabled_toolsets,
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None), quiet_mode=True,
+                disabled_toolsets=agent_disabled_toolsets(agent), quiet_mode=True,
             )
             agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools or []}
             inject_memory_provider_tools(agent)
