@@ -322,3 +322,135 @@ def test_real_config_file_is_read(plugin_env, tmp_path, monkeypatch):
     blocked = toolsets_mod.session_disabled_toolsets(None, "local") or []
     assert PLUGIN_TS in blocked and OTHER_TS in blocked
     assert PLUGIN_TS not in (toolsets_mod.session_disabled_toolsets(None, "slack") or [])
+
+
+# --- background review fork: keeps the ceiling platform of the session it reviews -------------------------
+
+
+def _build_review_fork(monkeypatch, parent):
+    """agent.background_review.build_cache_parity_fork with AIAgent replaced by a stand-in that runs the real
+    build-time gate (agent/agent_init.py: ``new_agent_disabled_toolsets``) on its constructor kwargs."""
+    from types import SimpleNamespace
+
+    import agent.background_review as br
+    import run_agent
+
+    class _ForkAgent(SimpleNamespace):
+        def __init__(self, **kwargs):
+            super().__init__(platform=kwargs["platform"], _oneshot_session=False)
+            self.disabled_toolsets = toolsets_mod.new_agent_disabled_toolsets(self, kwargs["disabled_toolsets"])
+
+    monkeypatch.setattr(run_agent, "AIAgent", _ForkAgent)
+    monkeypatch.setattr(br, "_resolve_review_runtime", lambda agent, task_cfg=None: {"routed": True})
+    fork, _rt, _routed = br.build_cache_parity_fork(parent, {}, max_iterations=1)
+    return fork
+
+
+def _parent(platform, ceiling_platform, disabled):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        platform=platform, _plugin_ceiling_platform=ceiling_platform, model="m", provider="p", session_id="s",
+        enabled_toolsets=None, disabled_toolsets=disabled, _memory_store=None, _memory_enabled=False,
+        _user_profile_enabled=False, _oneshot_session=False)
+
+
+def test_review_fork_of_delegated_child_keeps_parent_ceiling(plugin_env, monkeypatch):
+    """A delegated child (platform "subagent", ceiling platform of its slack parent): its review fork is judged
+    by slack, at build and for plugin toolsets registered after the fork was built, never by "subagent"."""
+    reg, keys = plugin_env
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {
+        PLUGIN_TS: ["slack"], OTHER_TS: ["subagent"], "ceillate": ["slack"], "ceilsub": ["subagent"]}})
+    child = _parent("subagent", "slack", toolsets_mod.session_disabled_toolsets(None, "subagent", "slack"))
+    fork = _build_review_fork(monkeypatch, child)
+    assert toolsets_mod.ceiling_platform_of(fork) == "slack"
+    assert PLUGIN_TS not in fork.disabled_toolsets  # was wrongly OFF (judged by "subagent")
+    assert OTHER_TS in fork.disabled_toolsets
+    for name, toolset in (("late_tool", "ceillate"), ("late_sub", "ceilsub")):
+        reg.register(name=name, toolset=toolset, schema=_schema(name), handler=_handler)
+        keys.add(toolset)
+    fresh = toolsets_mod.agent_disabled_toolsets(fork)
+    assert "ceillate" not in fresh  # late plugin allowed for slack: ON, as in the reviewed session
+    assert "ceilsub" in fresh  # late plugin allowed only for "subagent": OFF (was wrongly ON)
+    names = model_tools._select_tool_names(None, fresh, quiet_mode=True)
+    assert "late_tool" in names and "late_sub" not in names
+
+
+def test_review_fork_of_parent_keeps_own_platform(plugin_env, monkeypatch):
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"]}})
+    fork = _build_review_fork(monkeypatch, _parent("slack", "slack", toolsets_mod.session_disabled_toolsets(None, "slack")))
+    assert toolsets_mod.ceiling_platform_of(fork) == "slack"
+    assert PLUGIN_TS not in fork.disabled_toolsets and OTHER_TS in fork.disabled_toolsets
+
+
+def test_review_fork_without_ceiling_is_unchanged(plugin_env, monkeypatch):
+    _use_config(monkeypatch, {})
+    fork = _build_review_fork(monkeypatch, _parent("subagent", "slack", ["memory"]))
+    assert fork.disabled_toolsets == toolsets_mod.session_disabled_toolsets(["memory"], "subagent")
+    assert PLUGIN_TS not in fork.disabled_toolsets and OTHER_TS not in fork.disabled_toolsets
+
+
+# --- CLI banner: counts tools with the same ceiling gate as the agent ----------------------------------------
+
+
+class _BannerStop(Exception):
+    pass
+
+
+def _banner_cli(disabled):
+    from types import SimpleNamespace
+
+    from hermes_cli.cli_info_mixin import CLIInfoMixin
+
+    class _Cli(CLIInfoMixin):
+        pass
+
+    cli = _Cli()
+    cli.console = SimpleNamespace(clear=lambda: None)
+    cli.enabled_toolsets, cli.disabled_toolsets = None, disabled
+    return cli
+
+
+def _banner_tool_names(monkeypatch, cli):
+    """The tool names show_banner's cold path counts (get_tool_definitions' selection)."""
+    import cli as cli_mod
+    import hermes_cli.banner as banner_mod
+    import hermes_cli.cli_info_mixin as info_mod
+
+    captured = {}
+
+    def _defs(enabled_toolsets=None, disabled_toolsets=None, **kwargs):
+        captured["names"] = model_tools._select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True)
+        raise _BannerStop
+
+    monkeypatch.setattr(info_mod, "banner_plan", lambda cli, console: info_mod.BannerPlan(None, None, None, {}))
+    monkeypatch.setattr(banner_mod, "load_banner_snapshot", lambda enabled_toolsets=None: None)
+    monkeypatch.setattr(cli_mod, "get_tool_definitions", _defs)
+    with pytest.raises(_BannerStop):
+        cli.show_banner()
+    return captured["names"]
+
+
+def test_banner_count_drops_plugin_toolsets_outside_ceiling(plugin_env, monkeypatch):
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["cli"]}})
+    names = _banner_tool_names(monkeypatch, _banner_cli(None))
+    assert PLUGIN_TOOL in names and OTHER_TOOL not in names
+
+
+def test_banner_count_without_ceiling_is_unchanged(plugin_env, monkeypatch):
+    from hermes_cli.cli_info_mixin import banner_disabled_toolsets
+
+    _use_config(monkeypatch, {})
+    names = _banner_tool_names(monkeypatch, _banner_cli(None))
+    assert PLUGIN_TOOL in names and OTHER_TOOL in names
+    configured = [OTHER_TS]
+    assert banner_disabled_toolsets(_banner_cli(configured)) is configured
+
+
+def test_banner_gate_keeps_configured_disables(plugin_env, monkeypatch):
+    from hermes_cli.cli_info_mixin import banner_disabled_toolsets
+
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["cli"], OTHER_TS: ["cli"]}})
+    assert banner_disabled_toolsets(_banner_cli(["memory"])) == ["memory"]
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"], OTHER_TS: ["cli"]}})
+    assert banner_disabled_toolsets(_banner_cli(["memory"])) == ["memory", PLUGIN_TS]

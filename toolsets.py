@@ -489,6 +489,14 @@ def session_disabled_toolsets(
     return [*(disabled or ()), *gated] if gated else disabled
 
 
+def ceiling_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[str]) -> Optional[list[str]]:
+    """*disabled* plus the plugin toolsets outside the config ceiling for *platform* (the ceiling part of
+    :func:`session_disabled_toolsets`), for surfaces that count tools without building an agent (the CLI
+    banner). *disabled* itself, unchanged, when no ceiling is configured."""
+    blocked = [name for name in _ceiling_blocked(platform) if name not in (disabled or ())]
+    return [*(disabled or ()), *blocked] if blocked else disabled
+
+
 def _agent_oneshot(agent: Any) -> bool:
     from agent.oneshot_footprint import agent_is_oneshot
     return agent_is_oneshot(agent)

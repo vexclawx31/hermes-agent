@@ -127,7 +127,7 @@ class CLILoopsMixin:
         # The banner plan startup uses (show_banner): a gateway session's banner is the new
         # session's snapshot (its tools, MCP included, and main's short label), never this
         # process's registry.
-        from hermes_cli.cli_info_mixin import banner_plan
+        from hermes_cli.cli_info_mixin import banner_disabled_toolsets, banner_plan
         plan = banner_plan(self, cc)
         if plan.banner_kw is None:
             cc.print(_build_compact_banner())
@@ -135,7 +135,7 @@ class CLILoopsMixin:
             self._show_gateway_banner(build_welcome_banner, plan.inventory, plan.banner_kw)
         else:
             tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets,
-                                         disabled_toolsets=self.disabled_toolsets, quiet_mode=True)
+                                         disabled_toolsets=banner_disabled_toolsets(self), quiet_mode=True)
             build_welcome_banner(tools=tools, **plan.banner_kw)
         _cprint(_fresh_start())
         self._print_random_tip()
