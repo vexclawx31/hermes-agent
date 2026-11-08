@@ -498,11 +498,12 @@ google = [
   # The Google SDKs permit older vulnerable transitives, so unlocked installs
   # must carry the same fixed floors as uv.lock and the runtime installers:
   # httplib2 0.32.0 (GHSA-j5g9-f88f-gfj3 decompression bomb DoS),
-  # pyasn1 0.6.5, google-auth 2.55.1, oauthlib >=4.0.0 (fork r20: GHSA-7984-qgvg-3j9c,
-  # GHSA-xpv3-w29h-x7cv, GHSA-hj66-6f7g-4r5v; requests-oauthlib only asks >=3.0.0).
+  # pyasn1 0.6.5, google-auth 2.55.1, oauthlib 4.0.1 (fork r20: GHSA-7984-qgvg-3j9c,
+  # GHSA-xpv3-w29h-x7cv, GHSA-hj66-6f7g-4r5v; fork r23: CVE-2026-49272; requests-oauthlib
+  # only asks >=3.0.0). Upstream v0.23 asks >=4.0.0 and locks 4.0.0: keep the 4.0.1 pin.
   "httplib2==0.32.0",
   "pyasn1==0.6.5",
-  "oauthlib>=4.0.0",
+  "oauthlib==4.0.1",
 ]
 # PyYAML for plugins (fork). Core parses YAML with ruamel.yaml (hermes_yaml.py), but
 # plugins have always run inside this venv and some import `yaml` directly.
