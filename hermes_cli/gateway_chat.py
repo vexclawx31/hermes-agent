@@ -315,7 +315,13 @@ async def _stop_run_on_owner(client, snapshot):
     import time
     stored = snapshot["stored_session_id"]
     try:
-        await client.rpc("session.interrupt", session_id=snapshot.get("session_id") or stored)
+        # The owner stops only the generation it is running (anything else is stale_generation), and the
+        # launch snapshot predates this run's claim: read the current one first.
+        state = await client.rpc("session.resume", session_id=stored) or {}
+        if not state.get("running"):
+            return True
+        await client.rpc("session.interrupt", session_id=state.get("session_id") or snapshot.get("session_id") or stored,
+                         execution_generation=state.get("execution_generation"))
         deadline = time.monotonic() + RUN_STOP_WAIT_SECONDS
         while time.monotonic() < deadline:
             state = await client.rpc("session.resume", session_id=stored)

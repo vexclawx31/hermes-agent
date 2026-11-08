@@ -146,13 +146,20 @@ async def test_a_stopped_run_is_interrupted_on_the_owner_until_it_stops():
             self.calls.append((method, params))
             if method == "session.resume":
                 self.polls += 1
-                return {"running": self.polls < 2}
+                return {"session_id": "rt-1", "running": self.polls < 3, "execution_generation": 4}
             return {"status": "interrupted"}
 
     client = Client()
+    # The launch snapshot predates the run's claim (no generation yet): the current one is read first.
     assert await _stop_run_on_owner(client, {"session_id": "rt-1", "stored_session_id": "local-abc"}) is True
-    assert client.calls[0] == ("session.interrupt", {"session_id": "rt-1"})
+    assert client.calls[0] == ("session.resume", {"session_id": "local-abc"})
+    assert client.calls[1] == ("session.interrupt", {"session_id": "rt-1", "execution_generation": 4})
     assert client.calls[-1] == ("session.resume", {"session_id": "local-abc"})
+
+    idle = Client()
+    idle.polls = 5  # already settled: nothing to interrupt
+    assert await _stop_run_on_owner(idle, {"session_id": "rt-1", "stored_session_id": "local-abc"}) is True
+    assert [method for method, _ in idle.calls] == ["session.resume"]
 
 
 def test_a_stopped_run_reports_interrupted_130(monkeypatch, capsys):
@@ -194,7 +201,7 @@ async def test_sessions_state_reports_and_interrupts_on_the_owner(monkeypatch, c
     def snapshot():
         pending = [{"admission_id": "adm-1", "status": "started", "outcome": None, "execution_generation": 3}]
         return {"session_id": "rt-1", "stored_session_id": "local-abc", "running": state["running"],
-                "pending": pending if state["running"] else []}
+                "execution_generation": 3, "pending": pending if state["running"] else []}
 
     async def peer(ws):
         async for raw in ws:
@@ -208,7 +215,10 @@ async def test_sessions_state_reports_and_interrupts_on_the_owner(monkeypatch, c
                     state["running"] = False  # the owner settled the interrupt
                 reply = {"result": snapshot()}
             else:
-                reply = {"result": {"status": "interrupted", "interrupted": True}}
+                # The owner's real answer: the session handle (no status field), as on both execution paths.
+                reply = {"result": {"ref": {"profile_id": "/p", "session_id": "rt-1"}, "instance_id": "i-1",
+                                    "authority_epoch": 1, "revision": 9, "execution_generation": 3,
+                                    "execution_state": "running"}}
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": request["id"], **reply}))
 
     parser = argparse.ArgumentParser()
@@ -229,4 +239,5 @@ async def test_sessions_state_reports_and_interrupts_on_the_owner(monkeypatch, c
         assert await asyncio.to_thread(run, "--interrupt", "--wait", "5") == 0
         shown = json.loads(capsys.readouterr().out)
         assert shown == {"session_id": "local-abc", "running": False, "pending": [], "interrupted": True}
-    assert ("session.interrupt", {"session_id": "rt-1"}) in calls  # the runtime id the owner answered with
+    # The runtime id the owner answered with, and the generation it is running (else stale_generation).
+    assert ("session.interrupt", {"session_id": "rt-1", "execution_generation": 3}) in calls
