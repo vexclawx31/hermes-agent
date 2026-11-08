@@ -315,9 +315,13 @@ async def test_configured_toolchain_names_a_local_client_omitted_never_leak_from
     from tools.code_execution_env import _build_child_env
     from tools.environments.local import _make_run_env
     from tools.process_registry import ProcessRegistry
+    from tools.environments import local
     home = _home(tmp_path, _CONFIG + 'terminal: {client_env_passthrough: [GEM_HOME]}\n')
     monkeypatch.setenv('GEM_HOME', '/alpha')
     monkeypatch.setenv('PATH', '/daemon/bin:/usr/bin:/bin')
+    # No resolvable `hermes` shim to prepend (#92998): a runner whose venv installs the project puts
+    # its bin dir first, ahead of the session's PATH this test is about.
+    monkeypatch.setattr(local, '_HERMES_BIN_DIR', None)
     owner, connection = await _owner(home, monkeypatch)
 
     def seen(policy):
@@ -362,6 +366,9 @@ async def test_host_values_apply_only_over_a_gateway_proven_local_attach(tmp_pat
         (home / f'{name}.json').write_text(json.dumps([{'role': 'user', 'content': name}]))
     monkeypatch.setenv('HERMES_PREFILL_MESSAGES_FILE', str(home / 'gateway.json'))
     monkeypatch.setenv('PATH', '/daemon/bin:/usr/bin:/bin')
+    # As above: no `hermes` shim dir prepended ahead of the PATH under test.
+    from tools.environments import local as local_env
+    monkeypatch.setattr(local_env, '_HERMES_BIN_DIR', None)
     monkeypatch.delenv('NVM_DIR', raising=False)
     owner, remote = await _owner(home, monkeypatch)  # an attach without the gateway's own ticket
     local = AuthorityConnection(owner, object(), {'user_id': 'owner', 'native_bootstrap': True})
@@ -423,7 +430,14 @@ def test_auto_started_gateway_does_not_inherit_client_behaviour_env(tmp_path, mo
     def popen(command, **kwargs):
         captured.update(kwargs['env'])
         return SimpleNamespace(pid=1)
+
+    def launchd_job(command, *, env, **kwargs):
+        # macOS launches through a one-off launchd job first; never bootstrap a real one here.
+        # Capture its env too, then decline so the plain-child path runs as well.
+        captured.update(env)
+        return None
     monkeypatch.setattr(gateway_runtime_start.subprocess, 'Popen', popen)
+    monkeypatch.setattr(gateway_runtime_start, 'start_gateway_job', launchd_job)
     for name in ('HERMES_EPHEMERAL_SYSTEM_PROMPT', 'HERMES_PREFILL_MESSAGES_FILE', 'HERMES_INFERENCE_PROVIDER',
                  'HERMES_ENABLE_PROJECT_PLUGINS', 'HERMES_TUI_CLIENT_ENV'):
         monkeypatch.setenv(name, 'from-the-first-client')
