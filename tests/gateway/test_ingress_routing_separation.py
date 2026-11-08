@@ -29,7 +29,7 @@ def test_routing_equivalence_without_live_authority(profile):
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     tokens = runner._set_session_env(
-        SimpleNamespace(source=source, session_key="fixture")
+        SimpleNamespace(source=source, session_key="fixture", session_id="")
     )
     try:
         assert get_session_env("HERMES_SESSION_PROFILE") == (profile or "")
