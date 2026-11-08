@@ -115,6 +115,23 @@ def test_descriptions_stay_on_the_human_required_floor():
     assert COMBINED in floor
 
 
+@pytest.mark.parametrize("cmd", [
+    's""u\\do -S id',      # quotes and escapes inside the word
+    "$(echo s)udo -S id",  # literal command substitution
+    "${x:-sudo} -i",       # parameter default
+    "S\\UDO -l",           # case-insensitive filesystem
+])
+def test_obfuscated_sudo_words_still_parse(cmd):
+    # The no-sudo prefilter keys on s-u-d-o in order, which every deobfuscated spelling keeps.
+    assert PRIVILEGE in detect_dangerous_keys(cmd), cmd
+
+
+def test_commands_without_sudo_letters_skip_the_parse():
+    from tools.approval_detection import _may_spell_sudo
+    assert not _may_spell_sudo("; ssh -x" * 3000)
+    assert _may_spell_sudo("s;u;d;o")  # conservative: any in-order spelling is parsed
+
+
 def test_legacy_regex_key_still_resolves():
     # Approvals stored under the old regex-derived key ("sudo") keep matching.
     assert "sudo" in _approval_key_aliases(PRIVILEGE)

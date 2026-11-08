@@ -14,12 +14,9 @@ _HERMES_CORE_TOOLS = [
     "read_file", "write_file", "patch", "search_files",
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
-    "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_get_images",
-    "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    "browser_exec",  # THE browser: Python over CDP (browser-harness)
+    "browser_cdp", "browser_dialog",
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
-    "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "text_to_speech",
     "todo_list", "memory",
     "session_search",
@@ -110,8 +107,8 @@ TOOLSETS = {
     # web_search from every session, because disabled toolsets are a strict
     # end-of-pipeline subtraction (#17309, #64503).
     "browser": _ts(
-        "Browser automation for web interaction (navigate, click, type, scroll, "
-        "iframes, hold-click)",
+        "Browser automation: drive a real browser with Python over CDP (navigate, "
+        "click, type, extract, screenshots), raw CDP, dialogs and vault logins",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("browser_")],
     ),
     "cronjob": _ts(
@@ -476,17 +473,25 @@ def session_platform_tool_drops(platform: Optional[str], ceiling_platform: Any =
     return frozenset(tool for name in (*gated, *blocked) for tool in resolve_toolset(name))
 
 
-def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[str],
-                              ceiling_platform: Any = _SAME) -> Optional[list[str]]:
+def session_disabled_toolsets(
+    disabled: Optional[list[str]], platform: Optional[str], ceiling_platform: Any = _SAME, *, oneshot: bool = False,
+) -> Optional[list[str]]:
     """*disabled* plus every platform-gated toolset a session on *platform* does not get (static gates and
-    plugin toolsets outside the config ceiling). An agent stores this as its ``disabled_toolsets``, so the tool
-    list, the tool_search listing and bridge, MCP refreshes and delegate children (which inherit it) all subtract
-    the gated tools in ``_select_tool_names``."""
-    gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items()
-             if platform not in platforms and name not in (disabled or ())]
-    blocked = _ceiling_blocked(platform if ceiling_platform is _SAME else ceiling_platform)
-    gated += [name for name in blocked if name not in (disabled or ()) and name not in gated]
+    plugin toolsets outside the config ceiling), and for a *oneshot* session the toolsets nobody is there to use
+    (``agent.oneshot_footprint.ONESHOT_DISABLED_TOOLSETS``). An agent stores this as its ``disabled_toolsets``, so
+    the tool list, the tool_search listing and bridge, MCP refreshes and delegate children (which inherit it) all
+    subtract the gated tools in ``_select_tool_names``."""
+    from agent.oneshot_footprint import ONESHOT_DISABLED_TOOLSETS
+    gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms]
+    gated += _ceiling_blocked(platform if ceiling_platform is _SAME else ceiling_platform)
+    gated += ONESHOT_DISABLED_TOOLSETS if oneshot else ()
+    gated = list(dict.fromkeys(name for name in gated if name not in (disabled or ())))
     return [*(disabled or ()), *gated] if gated else disabled
+
+
+def _agent_oneshot(agent: Any) -> bool:
+    from agent.oneshot_footprint import agent_is_oneshot
+    return agent_is_oneshot(agent)
 
 
 def new_agent_disabled_toolsets(agent: Any, disabled: Optional[list[str]]) -> Optional[list[str]]:
@@ -494,7 +499,8 @@ def new_agent_disabled_toolsets(agent: Any, disabled: Optional[list[str]]) -> Op
     its parent's, see hermes_cli.toolset_scope.inherited_ceiling_platform) and return *disabled* gated for it."""
     from hermes_cli.toolset_scope import ceiling_platform_for_new_agent
     agent._plugin_ceiling_platform = ceiling_platform_for_new_agent(getattr(agent, "platform", None))
-    return session_disabled_toolsets(disabled, getattr(agent, "platform", None), agent._plugin_ceiling_platform)
+    return session_disabled_toolsets(disabled, getattr(agent, "platform", None), agent._plugin_ceiling_platform,
+                                     oneshot=_agent_oneshot(agent))
 
 
 def agent_disabled_toolsets(agent: Any) -> Optional[list[str]]:
@@ -502,7 +508,13 @@ def agent_disabled_toolsets(agent: Any) -> Optional[list[str]]:
     scopes tools after build (tool_search bridge, tool dispatch, delegate inheritance): a plugin registered
     after the agent was built cannot slip in between refreshes."""
     return session_disabled_toolsets(getattr(agent, "disabled_toolsets", None), getattr(agent, "platform", None),
-                                     ceiling_platform_of(agent))
+                                     ceiling_platform_of(agent), oneshot=_agent_oneshot(agent))
+
+
+def tool_selection_key(enabled: Optional[list[str]], disabled: Optional[list[str]]) -> tuple:
+    """The toolset selection a tools[] snapshot was built from, order-free. Recorded next to the registry
+    generation: the tools[] freeze (``tools.mcp_tool_agent``) holds new tools back only while neither moved."""
+    return frozenset(enabled) if enabled is not None else None, frozenset(disabled or ())
 
 
 def agent_tool_drops(agent: Any) -> frozenset:
@@ -511,6 +523,18 @@ def agent_tool_drops(agent: Any) -> frozenset:
     from tools.connectors.turn import side_agent_tool_drops
     return side_agent_tool_drops(agent) | session_platform_tool_drops(getattr(agent, "platform", None),
                                                                        ceiling_platform_of(agent))
+
+
+def agent_tool_surface(agent: Any, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """*tools* as *agent* carries them: :func:`agent_tool_drops` removed and, in a one-shot session or a gateway
+    session that joins its delegations in the turn (``delegation.gateway_mode``), the joined ``delegate_task``
+    variant (``agent.oneshot_footprint.oneshot_tool_schemas``). Applied to FRESH definitions (load, MCP refresh)
+    before any merge: a pinned or carried entry keeps the bytes already sent."""
+    from agent.oneshot_footprint import agent_is_oneshot, oneshot_tool_schemas
+    from tools.delegate_tool_config import agent_joins_delegation
+    drops = agent_tool_drops(agent)
+    tools = [tool for tool in tools if (tool.get("function") or {}).get("name") not in drops] if drops else list(tools)
+    return oneshot_tool_schemas(tools) if agent_is_oneshot(agent) or agent_joins_delegation(agent) else tools
 
 
 def validate_toolset(name: str) -> bool:

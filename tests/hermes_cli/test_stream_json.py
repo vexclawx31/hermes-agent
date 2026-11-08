@@ -1,7 +1,6 @@
 """``hermes chat -q … --format stream-json`` emits a parseable JSONL event stream and nothing else on stdout."""
 
 import json
-import signal
 
 import pytest
 
@@ -43,64 +42,45 @@ def test_emitter_event_stream_is_valid_jsonl(capsys):
     assert all("timestamp" in e for e in events)
 
 
-def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=True, launch_skills=None,
-                          preload_result=None):
-    """parser → cmd_chat → cli.main → quiet single-query path with a deterministic fake agent."""
-    import cli
+def _run_stream_json_chat(monkeypatch, capsys, run_turn, credentials_ok=True):
+    """parser → cmd_chat → gateway transport with a deterministic fake authority peer.
+
+    ``run_turn(peer)`` plays the authority: it queues the execution events a turn would publish and
+    returns the terminal ``message.complete`` payload (or raises ``KeyboardInterrupt`` for Ctrl-C).
+    """
+    import asyncio
+    from contextlib import asynccontextmanager
+
     import hermes_cli.main as cli_entry
+    from hermes_cli import gateway_chat, gateway_chat_startup
     from hermes_cli._parser import build_top_level_parser
 
-    real_finalize = cli.HermesCLI.__dict__["finalize_preloaded_skills"]
+    class Peer:
+        def __init__(self):
+            self.events = asyncio.Queue()
 
-    class FakeAgent:
-        model = "test-model"
-        session_id = "session-123"
+        def emit(self, kind, payload, admission="adm-1"):
+            self.events.put_nowait({"method": "event", "params": {
+                "type": kind, "session_id": "session-123", "admission_id": admission, "payload": payload}})
 
-        def run_conversation(self, **_kwargs):
-            return run_conversation(self)
+        async def rpc(self, method, **params):
+            if method == "runtime.describe":
+                return {"session_create": {"sources": ["cli"], "parameters": ["cwd", "model", "request_id", "source"]}}
+            if method == "session.create":
+                return {"stored_session_id": "session-123", "info": {"model": "test-model"}}
+            if method == "prompt.receipt":  # the settled result the exit code is judged from
+                return {"status": "terminal", "result": {"completed": True, "final_response": "hello"}}
+            assert method == "prompt.submit"
+            self.emit("message.complete", {**run_turn(self), "admission_id": "adm-1"})
+            return {"admission_id": "adm-1"}
 
-    class FakeCLI:
-        def __init__(self, **_kwargs):
-            self.session_id = "session-123"
-            self.conversation_history = []
-            self.agent = None
-            self._active_agent_route_signature = None
-            self.tool_progress_mode = None
-            if launch_skills is not None:
-                self.launch_skills = launch_skills
+    @asynccontextmanager
+    async def connected():
+        yield Peer()
 
-        def _claim_active_session(self, *_a, **_k):
-            return True
-
-        def _ensure_runtime_credentials(self):
-            return credentials_ok
-
-        def _resolve_turn_agent_config(self, _query):
-            return {"signature": "r", "model": None, "runtime": None, "request_overrides": None}
-
-        def _init_agent(self, **_kwargs):
-            if preload_result is not None:
-                # The real finalize, as HermesCLI._init_agent runs it before building the agent.
-                self.system_prompt = ""
-                self._preload_skills_thread = _FinishedThread()
-                self._preload_skills_result = preload_result
-                real_finalize(self)
-            self.agent = FakeAgent()
-            return True
-
-        def chat(self, _query, images=None):
-            print("human output")  # must never reach stdout under stream-json
-
-    monkeypatch.setattr(cli, "HermesCLI", FakeCLI)
-    monkeypatch.setattr(cli, "_finalize_single_query", lambda _cli: None)
-    monkeypatch.setattr(cli, "_emit_interrupted_session_end", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli, "_start_worktree_setup", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli.atexit, "register", lambda *_a, **_k: None)
-    monkeypatch.setattr(signal, "signal", lambda *_a, **_k: None)
+    monkeypatch.setattr(gateway_chat, "connect_gateway", connected)
+    monkeypatch.setattr(gateway_chat_startup, "ensure_launch_provider", lambda _args: credentials_ok)
     monkeypatch.setattr(cli_entry, "_resolve_use_tui", lambda _args: pytest.fail("TUI resolution consulted"))
-    monkeypatch.setattr(cli_entry, "_has_any_provider_configured", lambda: True)
-    monkeypatch.setattr(cli_entry, "_start_chat_background_prefetch", lambda: None)
-    monkeypatch.setattr(cli_entry, "_pin_kanban_board_env", lambda: None)
     monkeypatch.setattr(cli_entry, "_confirm_startup_expensive_model_override", lambda _a: None)
     monkeypatch.setattr(cli_entry, "_warn_retired_xai_models", lambda: None)
     monkeypatch.setattr("hermes_cli.quiet_single_query.continue_quiet_notify_completions", lambda *_a, **_k: None)
@@ -112,31 +92,22 @@ def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=
     return exc_info.value.code, _events(capsys)
 
 
-class _FinishedThread:
-    """A preload thread that has already finished."""
-
-    def join(self, timeout=None):
-        return None
-
-    def is_alive(self):
-        return False
+def _ok_turn(peer):
+    peer.emit("message.delta", {"text": "hello"})
+    peer.emit("tool.start", {"tool_call_id": "c1", "tool_name": "read_file", "args": {"path": "f"}})
+    peer.emit("tool.complete", {"tool_call_id": "c1", "tool_name": "read_file", "args": {"path": "f"},
+                                "is_error": False, "result": "contents"})
+    return {"text": "hello", "outcome": "completed"}
 
 
-def _ok_turn(agent):
-    agent.stream_delta_callback("hello")
-    agent.tool_progress_callback("tool.started", "read_file", "p", {"path": "f"})
-    agent.tool_progress_callback("tool.completed", "read_file", None, None, duration=0.01, result="contents")
-    return {"final_response": "hello", "failed": False}
-
-
-def _interrupted_turn(_agent):
+def _interrupted_turn(_peer):
     raise KeyboardInterrupt
 
 
 @pytest.mark.parametrize("turn, credentials_ok, exit_code, types", [
-    (_ok_turn, True, 0, ["system", "system", "text", "tool_use", "tool_result", "result"]),
-    (_interrupted_turn, True, 130, ["system", "system", "result"]),
-    (_ok_turn, False, 1, ["system", "result"]),  # credentials fail before the agent exists: no skills event
+    (_ok_turn, True, 0, ["system", "text", "tool_use", "tool_result", "result"]),
+    (_interrupted_turn, True, 130, ["system", "result"]),
+    (_ok_turn, False, 1, ["system", "result"]),  # credentials fail before any session exists
 ])
 def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, capsys, turn, credentials_ok, exit_code,
                                                                 types):
@@ -144,45 +115,9 @@ def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, caps
     code, events = _run_stream_json_chat(monkeypatch, capsys, turn, credentials_ok=credentials_ok)
     assert code == exit_code
     assert [e["type"] for e in events] == types
-    assert events[-1]["exit_code"] == exit_code and events[-1]["session_id"] == "session-123"
-
-
-def test_chat_stream_json_reports_loaded_and_missing_skills(monkeypatch, capsys):
-    """``system/skills`` follows ``init`` once the agent exists and names what `-s` really loaded."""
-    _code, events = _run_stream_json_chat(
-        monkeypatch, capsys, _ok_turn,
-        launch_skills={"loaded": ["switchboard-intake"], "missing": ["typo-skill"]})
-    assert [(e["type"], e.get("subtype")) for e in events[:2]] == [("system", "init"), ("system", "skills")]
-    skills = events[1]
-    assert skills["loaded"] == ["switchboard-intake"] and skills["missing"] == ["typo-skill"]
-    assert skills["session_id"] == "session-123"
-    assert [e for e in events if e.get("subtype") == "skills"] == [skills]
-
-
-def test_chat_stream_json_real_finalize_partial_miss(monkeypatch, capsys):
-    """Through the real finalize_preloaded_skills: the event reflects the preload result."""
-    code, events = _run_stream_json_chat(
-        monkeypatch, capsys, _ok_turn, preload_result=("skill prompt", ["tenant-desk"], ["typo-skill"]))
-    assert code == 0
-    assert events[1]["subtype"] == "skills"
-    assert events[1]["loaded"] == ["tenant-desk"] and events[1]["missing"] == ["typo-skill"]
-
-
-def test_chat_stream_json_all_skills_missing_closes_protocol(monkeypatch, capsys):
-    """Every -s skill unknown: stdout stays JSONL-only, init → skills (nothing loaded) → failing result."""
-    code, events = _run_stream_json_chat(
-        monkeypatch, capsys, _ok_turn, preload_result=("", [], ["switchboard-intake"]))
-    assert code == 1
-    assert [(e["type"], e.get("subtype")) for e in events] == [("system", "init"), ("system", "skills"),
-                                                               ("result", None)]
-    assert events[1]["loaded"] == [] and events[1]["missing"] == ["switchboard-intake"]
-    assert events[2]["exit_code"] == 1 and "switchboard-intake" in events[2]["error"]
-
-
-def test_chat_stream_json_skills_event_is_empty_without_skills(monkeypatch, capsys):
-    """No `-s`: the event still comes, with empty lists, so a consumer never has to time out on it."""
-    _code, events = _run_stream_json_chat(monkeypatch, capsys, _ok_turn)
-    assert events[1]["subtype"] == "skills" and events[1]["loaded"] == [] and events[1]["missing"] == []
+    assert events[-1]["exit_code"] == exit_code
+    # A launch refused before the gateway created a session has none to report.
+    assert events[-1]["session_id"] == ("session-123" if credentials_ok else "")
 
 
 @pytest.mark.parametrize("argv, message", [

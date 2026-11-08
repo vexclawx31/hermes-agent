@@ -68,6 +68,7 @@ class _CronRunScope:
         self._cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
         self._cron_session_token = None
         self._non_dispatcher_token = None
+        self._spend_token = None
         self._refusals_token = None
 
     def enter(self) -> None:
@@ -79,6 +80,9 @@ class _CronRunScope:
         # ContextVar, NOT an os.environ clear (env is shared with the worker heartbeat and
         # concurrent jobs); copy_context() carries it into the agent thread.
         self._non_dispatcher_token = enter_non_dispatcher_owned_context()
+        # Each run is its own MCP spend "chat" (its approval session key is "" for every job).
+        from tools.mcp_tool_costs import bind_run
+        self._spend_token = bind_run(self.task_id)
         # Set BEFORE the agent's context is copied, so tool threads append to this run's list.
         self._refusals_token = tool_refusals.start()
 
@@ -92,6 +96,9 @@ class _CronRunScope:
             self._cron_session_var.reset(self._cron_session_token)
         if self._non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(self._non_dispatcher_token)
+        if self._spend_token is not None:
+            from tools.mcp_tool_costs import unbind_run
+            unbind_run(self._spend_token)
         if self._refusals_token is not None:
             self._job["_tool_refusals"] = tool_refusals.stop(self._refusals_token)
             self._refusals_token = None
