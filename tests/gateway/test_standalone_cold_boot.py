@@ -31,7 +31,7 @@ _CHILD = textwrap.dedent('''
     home = Path(os.environ["HERMES_HOME"])
     result = {"pid": os.getpid(), "home": str(home)}
 
-    from gateway import host_attach, run
+    from gateway import host_attach, run, run_bootstrap
 
     def wait_for(predicate, what):
         deadline = time.monotonic() + 30
@@ -44,7 +44,7 @@ _CHILD = textwrap.dedent('''
         # start_gateway's order: the attach question, then the per-home PID claim, which takes
         # the host lock (and on losing it asks again) before any control socket is bound.
         result["first_decide"] = host_attach.decide(home).outcome
-        if not run._start_gateway_claim_pid_file():
+        if not run_bootstrap._start_gateway_claim_pid_file():
             result["claim"] = "pid-lost"
         else:
             # Worst case, every time: each peer now holds its per-home PID and none answers
@@ -227,17 +227,65 @@ def test_refresh_host_gateway_record_keeps_multiplex_false(fleet, monkeypatch):
 
 # --- readers of the record ----------------------------------------------------------------------
 
-def _live_standalone_record(monkeypatch, home: Path):
-    record = SimpleNamespace(pid=os.getpid() + 1, home=str(home), multiplex=False)
-    monkeypatch.setattr(hr, "read_record", lambda role, **kw: record)
-    monkeypatch.setattr(hr, "liveness_is_proven", lambda rec: True)
-    monkeypatch.setattr(host_attach, "_identify", lambda h: None)  # its socket is not bound yet
+# The host owner is a REAL second process: it takes the host lock and publishes its record through
+# the claim path's own calls, so the readers below see upstream's whole liveness proof (record
+# incarnation, boot epoch, ``record.role`` and a held host lock). Its control socket is never bound,
+# exactly the cold-boot window, so ``identify`` gets no answer unless a test supplies one.
+_OWNER = textwrap.dedent('''
+    import os, time
+    from pathlib import Path
+
+    from gateway import host_rendezvous as hr
+
+    ready, done = (Path(p) for p in os.environ["R21_OWNER"].split(os.pathsep))
+    outcome, _error = hr.claim_host_lock(hr.ROLE_GATEWAY)
+    if outcome is not hr.HostLockOutcome.ACQUIRED:
+        raise SystemExit(f"owner could not take the host lock: {outcome}")
+    hr.publish_record(hr.ROLE_GATEWAY, profiles=(), home=os.environ["HERMES_HOME"])
+    ready.write_text(str(os.getpid()))
+    deadline = time.monotonic() + 120
+    while not done.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+''')
+
+
+@pytest.fixture
+def live_owner(tmp_path, fleet):
+    """Start a real host-lock owner launched from ``home``; returns its record as read back."""
+    started = []
+
+    def start(home: Path) -> hr.HostRecord:
+        script = tmp_path / "owner.py"
+        script.write_text(_OWNER)
+        ready, done = tmp_path / "owner.ready", tmp_path / "owner.done"
+        env = _isolated_env(tmp_path, home)
+        env["R21_OWNER"] = os.pathsep.join((str(ready), str(done)))
+        child = subprocess.Popen([sys.executable, str(script)], cwd=str(REPO_ROOT), env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        started.append((child, done))
+        deadline = time.monotonic() + 60
+        while not ready.exists():
+            assert child.poll() is None, _outputs([child])
+            assert time.monotonic() < deadline, "the owner never published its record"
+            time.sleep(0.02)
+        host_attach.invalidate_host_gateway_cache()
+        record = hr.read_record(hr.ROLE_GATEWAY)
+        assert record is not None and record.pid == child.pid and hr.record_names_live_owner(record)
+        return record
+
+    yield start
+    for child, done in started:
+        done.touch()
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
     host_attach.invalidate_host_gateway_cache()
-    return record
 
 
-def test_probe_trusts_a_live_standalone_record_without_waiting(fleet, monkeypatch):
-    _live_standalone_record(monkeypatch, fleet.solo)
+def test_probe_trusts_a_live_standalone_record_without_waiting(fleet, live_owner):
+    assert live_owner(fleet.solo).multiplex is False
     started = time.monotonic()
     owner = host_attach.host_gateway(wait_for_channel=host_attach.ATTACH_CHANNEL_WAIT_S)
     assert time.monotonic() - started < 1.0
@@ -245,29 +293,31 @@ def test_probe_trusts_a_live_standalone_record_without_waiting(fleet, monkeypatc
     assert not owner.served_known, "multiplex:false says who cannot be served, not who is"
 
 
-def test_probe_keeps_an_unflagged_record_unknown(fleet, monkeypatch):
-    record = _live_standalone_record(monkeypatch, fleet.solo)
-    record.multiplex = None
+def test_probe_keeps_an_unflagged_record_unknown(fleet, live_owner):
+    assert live_owner(fleet.member).multiplex is None  # not standalone by config: nothing published
     owner = host_attach.host_gateway()
     assert owner is not None and not owner.standalone and not owner.served_known
 
 
 @pytest.mark.parametrize("replace", [False, True])
-def test_member_profile_starts_beside_a_standalone_owner_without_rescan(fleet, monkeypatch, replace):
-    _live_standalone_record(monkeypatch, fleet.solo)
+def test_member_profile_starts_beside_a_standalone_owner_without_rescan(fleet, monkeypatch, live_owner,
+                                                                         replace):
+    live_owner(fleet.solo)
     monkeypatch.setattr(host_attach, "request_serve_profile",
                         lambda *a, **kw: pytest.fail("no rescan of a standalone owner"))
+    started = time.monotonic()
     decision = host_attach.decide(fleet.member, replace=replace)
     assert decision.outcome == host_attach.START, "never REPLACE_HOST another profile's standalone owner"
+    assert time.monotonic() - started < host_attach.ATTACH_CHANNEL_WAIT_S, "nobody waits for its socket"
 
 
-def test_a_live_multiplexer_answer_beats_a_stale_false_record(fleet, monkeypatch):
+def test_a_live_multiplexer_answer_beats_a_stale_false_record(fleet, monkeypatch, live_owner):
     """Record says multiplex:false, but the live owner answers that it multiplexes and serves member."""
-    record = _live_standalone_record(monkeypatch, fleet.solo)
+    record = live_owner(fleet.solo)
+    assert record.multiplex is False
     identity = {"pid": record.pid, "hermes_home": str(fleet.solo), "profile": "solo",
                 "multiplex": True, "served_profiles": ["solo", "member"]}
-    monkeypatch.setattr(host_attach, "_identify", lambda h: identity)
-    monkeypatch.setattr(host_attach, "_identity_matches", lambda ident, rec, home: ident is identity)
+    monkeypatch.setattr(host_attach, "_identify", lambda h: identity if Path(h) == fleet.solo else None)
     owner = host_attach.host_gateway()
     assert owner is not None and not owner.standalone and owner.serves("member")
     assert host_attach.decide(fleet.member).outcome == host_attach.ATTACH
@@ -286,10 +336,10 @@ def test_a_standalone_restart_is_not_refused_by_its_own_old_instance(fleet, monk
     assert host_attach.decide(fleet.solo, replace=True).outcome == host_attach.START
 
 
-def test_owner_is_standalone_answers_from_the_record_without_rescan(fleet, monkeypatch):
+def test_owner_is_standalone_answers_from_the_record_without_rescan(fleet, monkeypatch, live_owner):
     from gateway import run
 
-    _live_standalone_record(monkeypatch, fleet.solo)
+    live_owner(fleet.solo)
     monkeypatch.setattr(host_attach, "request_serve_profile",
                         lambda *a, **kw: pytest.fail("no rescan of a standalone owner"))
     assert run._owner_is_standalone() is True

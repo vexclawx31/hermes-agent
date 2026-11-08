@@ -45,14 +45,14 @@ SCOPES: list[str] = ["https://www.googleapis.com/auth/chat.messages.create"]
 # package pyproject excludes on this platform is not reported missing.
 _DEPENDENCY_EXTRAS = ["google", "google-chat"]
 _REQUIRED_PACKAGES = [
-    "google-cloud-pubsub==2.39.2; platform_machine != 'ARM64' or sys_platform != 'win32'",
-    "google-api-python-client==2.194.0",
-    "google-auth==2.55.1",
-    "google-auth-oauthlib==1.3.1",
-    "google-auth-httplib2==0.3.1",
+    "google-cloud-pubsub==2.43.0; platform_machine != 'ARM64' or sys_platform != 'win32'",
+    "google-api-python-client==2.201.0",
+    "google-auth==2.62.0",
+    "google-auth-oauthlib==1.5.0",
+    "google-auth-httplib2==0.4.4",
     "httplib2==0.32.0",
-    "pyasn1==0.6.4",
-    "oauthlib==4.0.1",
+    "pyasn1==0.6.5",
+    "oauthlib>=4.0.0",
 ]
 
 # Google deprecated the ``oob`` flow: use a localhost redirect that is expected

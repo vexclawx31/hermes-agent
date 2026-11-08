@@ -24,7 +24,7 @@ from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from gateway.run import _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 from hermes_state import SessionDB
 from tests.gateway.restart_test_helpers import make_restart_runner
-from tools import browser_tool_lifecycle as bt_lifecycle
+from tools import browser_session_lifecycle as bt_lifecycle
 
 # Safety net so a regression parks the executor thread forever instead of
 # hanging CI.  No assertion below depends on elapsed time.
@@ -129,11 +129,13 @@ class TestDrainWaitsForApiWork:
         allow_task = asyncio.Event()
 
         def delayed_create_task(coro, **kwargs):
-            # The patch replaces asyncio.create_task for every caller. aiohttp >= 3.14.5 starts
-            # its own request handler through it (eager_start=True); delaying that one would
-            # stall the request itself, so only the gateway's run task is held back.
-            frame = getattr(coro, "cr_frame", None)
-            if frame is None or not frame.f_globals.get("__name__", "").startswith("gateway."):
+            # The patch replaces asyncio.create_task process-wide, and aiohttp >= 3.14.4
+            # schedules its own client/connector tasks through it (with eager_start=True).
+            # Hold only the /v1/runs task; everything else runs unchanged.
+            if getattr(coro, "__name__", None) not in {
+                "_execute_run",
+                "_execute_run_via_live_owner",
+            }:
                 return original_create_task(coro, **kwargs)
 
             async def delayed():

@@ -48,7 +48,7 @@ async def test_background_routing_entrypoint(monkeypatch):
 
     r, a, e = await build()
     tokens = r._set_session_env(
-        SimpleNamespace(source=e.source, session_key="fixture"), event=e
+        SimpleNamespace(source=e.source, session_key="fixture", session_id=""), event=e
     )
     proc = SimpleNamespace(id="fixture", pid=1, watcher_platform=None)
 

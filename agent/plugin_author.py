@@ -140,6 +140,25 @@ def display_plugin_author(display_metadata: Any) -> Optional[PluginAuthor]:
     return plugin_author_from_record(meta.get(PLUGIN_AUTHOR_KEY))
 
 
+def plugin_author_from_turn_author(raw: Any) -> Optional[PluginAuthor]:
+    """The :class:`PluginAuthor` a gateway-built plugin turn_author names, or None. It must be exactly what
+    :meth:`PluginAuthor.turn_author` builds (``origin: "plugin"``, ``is_bot`` true, ``verified`` false, the
+    label of its own plugin). Only for the host's own durable admission row of that turn
+    (``gateway/session_automation.py``), never for a display record or any client-supplied value."""
+    if not isinstance(raw, Mapping):
+        return None
+    plugin, ident = raw.get("plugin"), raw.get("id")
+    if not isinstance(plugin, str) or not isinstance(ident, str) or not ident.startswith(f"{LABEL_PREFIX}{plugin}/"):
+        return None
+    if raw.get("is_bot") is not True or raw.get("verified") is not False:
+        return None
+    try:
+        author = PluginAuthor(plugin=plugin, id=ident[len(LABEL_PREFIX) + len(plugin) + 1:], name=raw.get("name"))
+    except ValueError:
+        return None
+    return author if dict(raw) == author.turn_author() else None
+
+
 def gateway_turn_author(raw: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     """Re-validate a gateway-built plugin turn_author (``origin: "plugin"``); exact dict or None."""
     plugin, ident = raw.get("plugin"), raw.get("id")

@@ -45,6 +45,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from agent.deadline import poll_until
+
 logger = logging.getLogger(__name__)
 
 #: How long a caller waits for the owner's control socket after seeing its record (see module doc).
@@ -142,10 +144,21 @@ def _identify(home: Path) -> Optional[dict]:
 
 def _served_from_identity(identity: dict) -> tuple[str, ...]:
     """Served set from a live ``identify``. A STANDALONE gateway publishes no ``served_profiles``;
-    it serves its own profile and nothing else, which is not the same as "unknown"."""
+    it serves its own profile and nothing else, which is not the same as "unknown".
+
+    The unified runtime publishes each served profile as ``{"profile_id", "home"}`` (what
+    ``hermes_cli.gateway_runtime`` matches homes against); older gateways published bare names.
+    Both spell the same roster, so a dict entry is reduced to its profile name here."""
     served = identity.get("served_profiles")
     if isinstance(served, list) and served:
-        return tuple(str(p) for p in served)
+        names = []
+        for entry in served:
+            if isinstance(entry, dict):
+                home = entry.get("home") or entry.get("profile_id")
+                names.append(profile_name_for_home(str(home)) if home else "default")
+            else:
+                names.append(str(entry))
+        return tuple(names)
     return (str(identity.get("profile") or "default"),)
 
 
@@ -214,24 +227,27 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
         return None
     # Liveness BEFORE the dial. A record we cannot prove live must not make us open a socket at an
     # address it chose; proving the PID first is also what keeps a stale record from naming a peer.
-    if not hr.liveness_is_proven(record):
+    # A free host lock falsifies a pid that merely looks alive: treating it as a silent-but-live
+    # gateway is the never-expiring transient refuse (#138343, #133744).
+    if not hr.record_names_live_owner(record):
         return None
     home = record_home(record)
     # A live record that says ``multiplex: false`` is a standalone owner: it can never serve another
-    # profile, so nobody needs to wait for its socket to know that. It still says nothing about WHO
-    # it serves, so the served set stays unknown until identify answers.
+    # profile, so nobody needs to wait for its socket to know that (one identify check, no polling).
+    # It still says nothing about WHO it serves, so the served set stays unknown until identify answers.
     recorded_standalone = getattr(record, "multiplex", None) is False
-    deadline = time.monotonic() + max(0.0, wait_for_channel)
-    while True:
+
+    def _matching_identity():
         identity = _identify(home)
-        if _identity_matches(identity, record, home):
-            # A live answer is the better evidence: its own mode wins over the record's flag.
-            live_mode = identity.get("multiplex")
-            standalone = live_mode is False if isinstance(live_mode, bool) else recorded_standalone
-            return HostGateway(record.pid, home, _served_from_identity(identity), standalone=standalone)
-        if recorded_standalone or time.monotonic() >= deadline:
-            break
-        time.sleep(_CHANNEL_POLL_S)
+        return identity if _identity_matches(identity, record, home) else None
+
+    wait = 0.0 if recorded_standalone else max(0.0, wait_for_channel)
+    identity = poll_until(_matching_identity, wait, _CHANNEL_POLL_S)
+    if identity is not None:
+        # A live answer is the better evidence: its own mode wins over the record's flag.
+        live_mode = identity.get("multiplex")
+        standalone = live_mode is False if isinstance(live_mode, bool) else recorded_standalone
+        return HostGateway(record.pid, home, _served_from_identity(identity), standalone=standalone)
     # An owner exists and has not answered: the served set is UNKNOWN, never the record's word.
     return HostGateway(record.pid, home, (), served_known=False, standalone=recorded_standalone)
 

@@ -12,7 +12,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
-from gateway.platforms.yuanbao import (
+from plugins.platforms.yuanbao.adapter import (
     GroupAtGuardMiddleware, GroupAttributionMiddleware, InboundContext, YuanbaoAdapter,
 )
 from gateway.relay.ws_transport import _render_relay_context

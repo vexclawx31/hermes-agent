@@ -949,14 +949,17 @@ async def test_h1_base_adapter_queue_path_takes_its_own_fifo_place(make_gateway)
 
 @pytest.mark.asyncio
 async def test_m1_depth_cap_requeue_never_gives_authored_text_human_control():
-    """At the interrupt-depth cap the follow-up is re-queued; into a slot holding a caption-less
-    human photo it must not merge (which would hand authored "/yolo" the photo's gateway control).
-    It takes its own FIFO place, still non-control."""
+    """At the interrupt-depth cap the follow-up is re-queued; with a caption-less human photo staged
+    in the slot it must not merge (which would hand authored "/yolo" the photo's gateway control).
+    v0.23 restores the refused follow-up at the FIFO head (it arrived before the staged photo, so
+    arrival order holds) and moves the photo, intact, to the front of overflow: two separate
+    events, the authored one still non-control."""
     runner = _followup_runner()
     adapter = SimpleNamespace(_pending_messages={})
     runner._delivery_adapter_for = MagicMock(return_value=adapter)
-    fifo = []
-    runner._enqueue_fifo = lambda key, event, adapter: fifo.append(event)
+    overflow = []
+    runner._session_state = MagicMock(return_value=SimpleNamespace(
+        conversation=SimpleNamespace(queued_events=overflow)))
     photo = MessageEvent(text="", message_type=MessageType.PHOTO, source=_human_source(),
                          media_urls=["/x.png"], media_types=["image/png"])
     adapter._pending_messages["k"] = photo
@@ -967,7 +970,9 @@ async def test_m1_depth_cap_requeue_never_gives_authored_text_human_control():
     await GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=adapter, pending="/yolo", pending_event=authored,
         response="r", result={"interrupted": True, "messages": []}, stream_task=None)
-    assert adapter._pending_messages["k"] is photo and photo.text == "" and photo.allow_gateway_control is True
-    assert fifo == [authored] and authored.text == "/yolo"
+    assert adapter._pending_messages["k"] is authored and authored.text == "/yolo"
     assert authored.allow_gateway_control is False and authored.is_command() is False
+    assert authored.media_urls == [] and event_plugin_author(authored) is not None
+    assert overflow == [photo] and photo.text == "" and photo.allow_gateway_control is True
+    assert photo.media_urls == ["/x.png"] and event_plugin_author(photo) is None
     runner._run_agent.assert_not_called()

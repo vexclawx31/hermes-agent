@@ -48,11 +48,12 @@ def test_author_reaches_the_gateway_as_a_frozen_host_object(tmp_path, monkeypatc
 
 
 def test_author_works_on_the_session_key_path_too(tmp_path, monkeypatch):
-    ctx, _, injector = _gateway(tmp_path, monkeypatch)
+    ctx, manager, injector = _gateway(tmp_path, monkeypatch)
     assert ctx.inject_message("result", session_key="agent:main:telegram:dm:1", author=AUTHOR) is True
+    # v0.23 passes the plugin's immutable profile home on every target (upstream ``plugin_home``).
     assert injector.call_args.kwargs == {"session_key": "agent:main:telegram:dm:1", "content": "result",
-                                         "plugin_id": PLUGIN, "author": PluginAuthor(PLUGIN, "research",
-                                                                                     "Research Agent")}
+                                         "plugin_id": PLUGIN, "plugin_home": manager.home_path,
+                                         "author": PluginAuthor(PLUGIN, "research", "Research Agent")}
 
 
 @pytest.mark.parametrize("target", [{"origin": ORIGIN}, {"session_key": "agent:main:telegram:dm:1"}])
@@ -62,9 +63,8 @@ def test_author_absent_sends_exactly_todays_gateway_kwargs(tmp_path, monkeypatch
     ctx, manager, injector = _gateway(tmp_path, monkeypatch, {"allow_gateway_injection": True})
     assert ctx.inject_message("hello", **target) is True
     assert ctx.inject_message("hello", **target, author=None) is True
-    expected = {**target, "content": "hello", "plugin_id": PLUGIN}
-    if "origin" in target:
-        expected["plugin_home"] = manager.home_path
+    # Today's keyword set on v0.23: the target, content, plugin id and the plugin's profile home.
+    expected = {**target, "content": "hello", "plugin_id": PLUGIN, "plugin_home": manager.home_path}
     assert [c.kwargs for c in injector.call_args_list] == [expected, expected]
 
 

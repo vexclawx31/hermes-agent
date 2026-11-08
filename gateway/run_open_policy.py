@@ -8,12 +8,6 @@ from typing import Optional
 from gateway.config import Platform, _getenv
 
 
-_OWN_POLICY_OPEN_ENV = {
-    Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
-    Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
-    Platform.YUANBAO: ("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY", "YUANBAO_ALLOW_ALL_USERS"),
-    Platform.QQBOT: (None, None, "QQ_ALLOW_ALL_USERS"),
-    Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS")}
 
 
 def _group_sender_rules_gate_all(platform, extra: dict) -> bool:
@@ -36,10 +30,17 @@ def _group_sender_rules_gate_all(platform, extra: dict) -> bool:
 
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
+    from contextlib import suppress
+
+    from gateway.run_startup import _own_policy_envs
+    with suppress(Exception):  # idempotent; callers may hand in a config load_gateway_config never built
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
     for platform, platform_config in getattr(config, "platforms", {}).items():
         if not getattr(platform_config, "enabled", False):
             continue
-        open_env = _OWN_POLICY_OPEN_ENV.get(platform)
+        # Platform plugins declare their own policy env names (gateway_env.AUTHZ own_policy_env).
+        open_env = _own_policy_envs(platform)
         if not open_env:
             continue
         dm_env, group_env, allow_all_env = open_env
