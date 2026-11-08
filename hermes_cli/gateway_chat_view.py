@@ -358,7 +358,11 @@ class GatewayChatView:
         admission = (receipt or {}).get("admission_id")
         if admission and admission not in self.completions and self.session_id == sid:
             self.mine[admission] = None
-            if self.gaps != gaps:  # a re-attach left after this submit: its snapshot covers it
+            # Fork (launch adapter): a repeated request identity (HERMES_CHAT_RUN_ID) answers with the
+            # admission it already made; once that is past ``queued`` its events may be gone, so settle
+            # it from its receipt like a re-attach would, never by waiting on a stream that won't come.
+            replayed = (receipt or {}).get("status") not in (None, "queued")
+            if self.gaps != gaps or replayed:  # a re-attach left after this submit: its snapshot covers it
                 async with self._attaching:
                     if admission not in self.cut and not self.failure:
                         await self._recover(admission, sid)
@@ -671,13 +675,19 @@ def _launch_turn_author() -> dict:
     return {"turn_author": author} if author else {}
 
 
-def _submission_id() -> str:
-    """The admission's request identity. HERMES_CHAT_SUBMISSION_ID (a spawner's stable id for this run)
-    names the first submit, so a retried run is the same admission, never a second turn; later submits
-    and every other caller get a fresh id."""
+def run_request_id(part: str) -> str:
+    """A request identity for this run. HERMES_CHAT_RUN_ID (a spawner's stable id for one logical run)
+    names the run's create (``part="create"``) and its first submit (``"submit"``), so a retried run is
+    the same session and the same admission, never a second turn; anything else gets a fresh id."""
     import os
-    stable = os.environ.pop("HERMES_CHAT_SUBMISSION_ID", None)
-    if stable and "submission" not in _LAUNCH_INPUTS:
-        _LAUNCH_INPUTS["submission"] = stable
-        return stable
+    if "run" not in _LAUNCH_INPUTS:
+        _LAUNCH_INPUTS["run"] = os.environ.pop("HERMES_CHAT_RUN_ID", None) or None
+    run = _LAUNCH_INPUTS["run"]
+    if run and part not in _LAUNCH_INPUTS:
+        _LAUNCH_INPUTS[part] = True
+        return f"{run}-{part}"
     return uuid.uuid4().hex
+
+
+def _submission_id() -> str:
+    return run_request_id("submit")
