@@ -50,6 +50,29 @@ def test_run_replace_refuses_before_any_guard_or_stop(tmp_path, monkeypatch):
     assert exc.value.code == 1
 
 
+@pytest.mark.parametrize("value, expected", [
+    ("helpdesk-request", "helpdesk-request"), ("switchboard-tenant", "switchboard-tenant"),
+    ("slack", None), ("cli", None), ("", None), ("Not A Label!", None),
+])
+def test_a_nested_client_inherits_only_a_valid_provenance_label(monkeypatch, value, expected):
+    """#531 review item 4: a `hermes chat` run from a request or tenant turn's terminal keeps that turn's
+    origin (the gateway binds HERMES_SESSION_SOURCE in its tools' env), so the door's guards see it."""
+    from hermes_cli.gateway_session_store import _source_fields, inherited_origin
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", value)
+    assert inherited_origin() == expected
+    assert _source_fields("cli") == {"source": "cli", **({"origin": expected} if expected else {})}
+
+
+def test_an_inherited_origin_never_refuses_a_resume(monkeypatch):
+    """Only creation carries the inherited origin: the resume check compares explicit flags alone."""
+    import argparse
+
+    from hermes_cli.gateway_chat import check_resume_policy
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "helpdesk-request")
+    args = argparse.Namespace(source=None, in_dir=None)
+    check_resume_policy(args, {"info": {"launch_request": {}}})  # no refusal
+
+
 def test_a_plugin_row_whose_author_no_longer_validates_is_refused():
     from types import SimpleNamespace
 

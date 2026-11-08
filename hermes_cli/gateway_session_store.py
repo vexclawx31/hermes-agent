@@ -552,12 +552,29 @@ def session_store():
     return GatewaySessionStore()
 
 
+def inherited_origin():
+    """Fork (launch adapter): the provenance label of the turn this process runs under, when a turn's tool
+    started it (the gateway binds HERMES_SESSION_SOURCE in its tools' env), and only when it is a valid
+    provenance label (not a surface or platform name). A nested ``hermes chat`` from a request or tenant turn
+    then carries that origin, so source-keyed guards see it, as process ancestry did on r23."""
+    value = os.environ.get("HERMES_SESSION_SOURCE", "").strip()
+    if not value:
+        return None
+    from gateway.session_policy import validate_origin
+    try:
+        return validate_origin(value)
+    except Exception:
+        return None
+
+
 def _source_fields(label):
     """Fork (launch adapter): ``source`` for a surface label; a provenance label (``--source
-    claude-handoff``) rides as the typed ``origin`` field on the default surface for this run."""
+    claude-handoff``) rides as the typed ``origin`` field on the default surface for this run. A surface label
+    keeps an inherited turn's origin (:func:`inherited_origin`)."""
     from hermes_cli.gateway_chat import _SURFACE_LABELS
     if label in _SURFACE_LABELS:
-        return {"source": label}
+        origin = inherited_origin()
+        return {"source": label, **({"origin": origin} if origin else {})}
     from agent.session_source import ONESHOT_SOURCE
     finite = os.environ.get("HERMES_SINGLE_QUERY_SESSION") == "1"
     return {"source": ONESHOT_SOURCE if finite else "cli", "origin": label}
@@ -585,6 +602,8 @@ def create_titled_session(title, launch=None, source=None):
     if source:
         from agent.session_source import create_surface
         params.update(_source_fields(create_surface(source)))
+    elif origin := inherited_origin():  # a nested client keeps the provenance of the turn that started it
+        params["origin"] = origin
     params["row_cwd"] = ""
     try:
         store = session_store()

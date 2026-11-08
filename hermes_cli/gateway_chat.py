@@ -215,6 +215,10 @@ async def run_gateway_chat(args, emitter=None):
             parameters = contract.get("parameters", [])
             policy = _requested_policy(args)
             policy.pop("source", None)
+            if "origin" not in policy:  # fork: a nested client keeps the provenance of the turn that started it
+                from hermes_cli.gateway_session_store import inherited_origin
+                if origin := inherited_origin():
+                    policy["origin"] = origin
             if create_if_missing:
                 policy["title"] = title
             policy.update(env_launch_flags())
