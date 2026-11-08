@@ -215,6 +215,10 @@ async def run_gateway_chat(args, emitter=None):
             parameters = contract.get("parameters", [])
             policy = _requested_policy(args)
             policy.pop("source", None)
+            if "origin" not in policy:  # fork: a nested client keeps the provenance of the turn that started it
+                from hermes_cli.gateway_session_store import inherited_origin
+                if origin := inherited_origin():
+                    policy["origin"] = origin
             if create_if_missing:
                 policy["title"] = title
             policy.update(env_launch_flags())
@@ -263,7 +267,7 @@ async def run_gateway_chat(args, emitter=None):
             except asyncio.CancelledError:
                 if not term.fired:
                     raise
-                stopped = await _stop_run_on_owner(client, snapshot)
+                stopped = await _stop_run_on_owner(client, snapshot, list(view.mine))
                 raise RunStopped(stopped) from None
 
 
@@ -309,17 +313,25 @@ def _spawner_stop_on_term():
         loop.remove_signal_handler(signal.SIGTERM)
 
 
-async def _stop_run_on_owner(client, snapshot):
-    """``session.interrupt`` the run's session, then poll until the owner reports it is no longer running
-    (bounded). True when it stopped."""
+async def _stop_run_on_owner(client, snapshot, admissions):
+    """Cancel THIS run's own admissions (``prompt.cancel``: a queued one is retired, a started one is interrupted),
+    never whatever else the session is running, then poll until the owner reports each terminal (bounded).
+    True when they all stopped (or the run had admitted nothing)."""
     import time
-    stored = snapshot["stored_session_id"]
+    session_id = snapshot.get("session_id") or snapshot["stored_session_id"]
+    if not admissions:
+        return True
+    for admission in admissions:
+        try:
+            await client.rpc("prompt.cancel", session_id=session_id, admission_id=admission)
+        except GatewayClientError:
+            pass  # already terminal, or refused: the receipts below decide
+    deadline = time.monotonic() + RUN_STOP_WAIT_SECONDS
     try:
-        await client.rpc("session.interrupt", session_id=snapshot.get("session_id") or stored)
-        deadline = time.monotonic() + RUN_STOP_WAIT_SECONDS
         while time.monotonic() < deadline:
-            state = await client.rpc("session.resume", session_id=stored)
-            if not (state or {}).get("running"):
+            receipts = [await client.rpc("prompt.receipt", session_id=session_id, admission_id=admission)
+                        for admission in admissions]
+            if all((receipt or {}).get("status") == "terminal" for receipt in receipts):
                 return True
             await asyncio.sleep(0.5)
     except GatewayClientError:

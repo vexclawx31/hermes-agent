@@ -214,6 +214,29 @@ def test_quoted_sudo_with_a_gated_looking_option_fails_closed(cmd):
     assert PRIVILEGE in detect_dangerous_keys(cmd), cmd
 
 
+@pytest.mark.parametrize("cmd", [
+    # Second release review: an expansion where sudo's own options or its command word are.
+    "sudo -$(printf S) id",
+    "s=-; sudo ${s}S id",
+    "f=-S; sudo $f id",
+    "export f=-S; sudo $f id",
+    'set -- -S id; sudo "$@"',
+    "set -- -S; sudo $1 id",
+    'a=(-S id); sudo "${a[@]}"',
+    "read o <<< -S; sudo $o id",
+])
+def test_an_expansion_among_sudos_options_fails_closed(cmd):
+    assert PRIVILEGE in detect_dangerous_keys(cmd), cmd
+
+
+@pytest.mark.parametrize("depth", [94, 375, 1000])
+def test_deep_substitution_nesting_fails_closed_fast(depth):
+    command = "echo " + "$(" * depth + "sudo -n id" + ")" * depth
+    start = time.perf_counter()
+    assert "command parser limit exceeded" in detect_dangerous_keys(command)
+    assert time.perf_counter() - start < 2
+
+
 def test_xargs_replacement_after_sudos_command_stays_quiet():
     # `cp` is sudo's command, so the replacement word is cp's argument, never one of sudo's options.
     keys = detect_dangerous_keys("xargs -I{} sudo cp {} /x")

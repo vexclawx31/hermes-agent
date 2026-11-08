@@ -4554,6 +4554,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
     (``gateway.unmanaged_idle_exit_seconds``)."""
     _guard_official_docker_root_gateway()
+    if replace:  # fork: a managed home's owner is replaced only through its supervisor
+        from hermes_cli.gateway_runtime_managed import refuse_manual_owner_change
+        refuse_manual_owner_change(get_hermes_home(), "gateway run --replace")
     _attach_to_host_gateway_or_guard(force=force, replace=replace)
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)
@@ -5522,6 +5525,8 @@ def _cmd_restart(args):
         restart_externally_supervised_gateway(supervised_pid)
         return
     refuse_restart_of_service_managed_gateway(supervised_pid)
+    from hermes_cli.gateway_runtime_managed import refuse_manual_owner_change
+    refuse_manual_owner_change(get_hermes_home(), "gateway restart")  # fork: before the stop, not after
 
     if stop_profile_gateway():
         print("✓ Stopped gateway for this profile")

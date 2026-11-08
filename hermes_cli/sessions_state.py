@@ -42,7 +42,9 @@ async def _run(args):
             out["interrupted"] = False
             if out["running"]:
                 runtime_id = snapshot.get("session_id") or snapshot["stored_session_id"]
-                result = await client.rpc("session.interrupt", session_id=runtime_id) or {}
+                # Fenced to the generation this read saw: a turn that started since is not interrupted.
+                result = await client.rpc("session.interrupt", session_id=runtime_id,
+                                          execution_generation=snapshot.get("execution_generation")) or {}
                 out["interrupted"] = result.get("status") == "interrupted" or bool(result.get("interrupted"))
                 deadline = time.monotonic() + max(0.0, float(args.wait or 0))
                 while out["running"] and time.monotonic() < deadline:
