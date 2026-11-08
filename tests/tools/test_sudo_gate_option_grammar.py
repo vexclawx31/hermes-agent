@@ -33,11 +33,19 @@ COMBINED = "sudo with combined-flag privilege escalation"
     "sudo --user root ls -S",
     "sudo -p 'pw -S' id",
     "sudo -u -S id",  # -u owns the next word, even option-shaped
+    "sudo -uS id",  # user "S"
+    "sudo -- -S",
+    "sudo -a pam id",  # BSD auth type, not --askpass
+    "sudo -n /usr/bin/shasum -a 256 f && sudo -n ls -l",
+    "/usr/local/bin/agent-sudo-scope --apply -s",
+    'git commit -m "use sudo -S"',
     # "sudo" inside a path or argument is not a sudo invocation.
     "/Users/vex/bin/agent-sudo-scope --agent dumx --apply",
     "~/.local/bin/agent-sudo-scope --apply --agent x",
     "pseudosudo -S id",
-    "echo sudo -S id",
+    # Unquoted `echo sudo -S id` still flags (as before): a bare sudo word is treated as a possible
+    # launcher argument (`xargs sudo -S`). Quoted prose is data:
+    "echo 'sudo -S id'",
     "grep -n 'sudo -s' notes.txt",
     "sudo whoami",
 ])
@@ -67,6 +75,25 @@ def test_not_sudo_own_privilege_flag(cmd):
     ("/usr/bin/sudo -S id", PRIVILEGE),
     ("env FOO=1 sudo -s", PRIVILEGE),
     ("true && sudo -S id", PRIVILEGE),
+    # Review round: forms the old regex caught that a naive parser would miss.
+    ("sudo FOO=1 -s", PRIVILEGE),  # VAR=value among sudo's options
+    ("echo pw | sudo X=1 -S id", PRIVILEGE),
+    ("sudo -u root HOME=/root -i", PRIVILEGE),
+    ("sudo 2>/dev/null -S id", PRIVILEGE),  # redirections are removed by the shell
+    ("echo pw | sudo </dev/stdin -S id", PRIVILEGE),
+    ("sudo >out.txt -s", PRIVILEGE),
+    ("SUDO -S id", PRIVILEGE),  # case-insensitive filesystem
+    ("/USR/BIN/SUDO -S id", PRIVILEGE),
+    ("echo id | xargs sudo -S", PRIVILEGE),
+    ("find . -exec sudo -S id \\;", PRIVILEGE),
+    ("caffeinate sudo -S id", PRIVILEGE),
+    ("$(which sudo) -S id", PRIVILEGE),
+    ("`which sudo` -S id", PRIVILEGE),
+    ('echo "$(sudo -S id)"', PRIVILEGE),
+    ("eval 'sudo -S id'", PRIVILEGE),
+    ("env -S 'sudo -S id'", PRIVILEGE),
+    ("sudo -h host -S id", PRIVILEGE),
+    ("sudo --log id", PRIVILEGE),  # ambiguous prefix with a gated candidate fails closed
     ("bash -c 'sudo -S id'", None),  # payload variant: checked via keys below
 ])
 def test_sudo_own_privilege_flag(cmd, expected):
