@@ -120,6 +120,13 @@ def banner_plan(cli, console) -> BannerPlan:
         provider=cli.provider, context_marker=agent_context_marker(agent) if agent is not None else ""))
 
 
+def banner_disabled_toolsets(cli) -> list[str] | None:
+    """The disabled toolsets the CLI banner counts tools with: the configured ones plus the plugin toolsets
+    the ``plugin_toolset_platforms`` ceiling turns off for the CLI session (as the agent build gates them)."""
+    from toolsets import ceiling_disabled_toolsets
+    return ceiling_disabled_toolsets(cli.disabled_toolsets, "cli")
+
+
 class CLIInfoMixin:
     """Informational views and reload flows for the interactive CLI: banner, help, tools, usage,
     insights, MCP/skills reload, bang shell."""
@@ -184,7 +191,7 @@ class CLIInfoMixin:
                         from model_tools import get_toolset_for_tool
                         tools = get_tool_definitions(
                             enabled_toolsets=self.enabled_toolsets,
-                            disabled_toolsets=self.disabled_toolsets, quiet_mode=True)
+                            disabled_toolsets=banner_disabled_toolsets(self), quiet_mode=True)
                         availability = compute_toolset_availability(self.enabled_toolsets)
                         tmap = _toolset_map(tools, availability, get_toolset_for_tool)
                         save_banner_snapshot(tools, self.enabled_toolsets, availability, tmap)
@@ -198,7 +205,7 @@ class CLIInfoMixin:
                 # Cold path: compute live, then persist the snapshot for the next launch.
                 from model_tools import get_toolset_for_tool
                 tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets,
-                                             disabled_toolsets=self.disabled_toolsets, quiet_mode=True)
+                                             disabled_toolsets=banner_disabled_toolsets(self), quiet_mode=True)
                 availability = compute_toolset_availability(self.enabled_toolsets)
                 build_welcome_banner(tools=tools, availability=availability, **banner_kw)
                 try:

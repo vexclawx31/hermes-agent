@@ -1001,7 +1001,12 @@ def build_cache_parity_fork(
     # (_routed_reasoning_config).
     if not _routed and write_origin == "background_review":
         _warn_ignored_reasoning_effort(agent, task_cfg)
-    review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
+    from hermes_cli.toolset_scope import inherited_ceiling_platform
+    from toolsets import ceiling_platform_of
+    # The fork keeps the plugin toolset ceiling of the session it reviews (a delegated child's is its
+    # parent's, not "subagent"), so late-registered plugin toolsets are judged as that session judges them.
+    with inherited_ceiling_platform(ceiling_platform_of(agent)):
+        review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
     review_agent._memory_write_origin = review_agent._memory_write_context = write_origin
     # Fork-turn log tag: the fork shares the parent's session_id (and model on the
     # same-model path), so its turn-start/turn-exit log lines are otherwise
