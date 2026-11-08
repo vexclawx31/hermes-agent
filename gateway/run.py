@@ -3973,6 +3973,8 @@ class GatewayRunner(
         from gateway.session_api_turn import api_session_vars
         _history_delivery = api_session_vars().get("session_history_delivery")
         tokens = set_session_vars(
+            # Fork (launch adapter): a local session's provenance label is its turns' source.
+            **_launch_origin_source(self, context.source),
             platform=source.platform.value,
             chat_id=source.chat_id,
             chat_type=str(source.chat_type) if source.chat_type else "",
@@ -5232,5 +5234,19 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     os._exit(exit_code)
 
 
+def _launch_origin_source(runner, source) -> dict:
+    """Fork (launch adapter): ``{"source": <origin>}`` for a LOCAL session created with a provenance
+    label (``session.create origin=``), else ``{}``. Tools and plugins read it as
+    HERMES_SESSION_SOURCE, what the in-process ``hermes chat --source <label>`` bound."""
+    from gateway.session_policy import policy_for_source
+    try:
+        policy = policy_for_source(runner, source)
+    except Exception:  # not a restorable local route: the turn itself reports that
+        return {}
+    origin = getattr(policy, "origin", None) if policy is not None else None
+    return {"source": origin} if origin else {}
+
+
 if __name__ == "__main__":
     main()
+

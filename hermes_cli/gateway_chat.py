@@ -17,10 +17,16 @@ from hermes_cli.gateway_connection import RESUME_REFUSALS
 _UNSUPPORTED = (
     "image", "worktree", "w",
     "no_restore_cwd",
-    "run_budget", "verbose", "compact",
+    "verbose", "compact",
 )
+# Fork (launch adapter): `--run-budget` is a per-session creation field the gateway freezes and
+# enforces (session_policy ``run_budget``); an owner that lacks it refuses it as an unsupported option.
 _POLICY = ("model", "provider", "reasoning", "toolsets", "max_turns", "base_url", "ignore_rules", "api_key",
-           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id")
+           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id",
+           "run_budget")
+# Creation labels that name a surface (gateway.session_policy.SURFACES, plus ``desktop``). Any other
+# ``--source`` is a caller's provenance label: sent as the typed ``origin`` field, never as a surface.
+_SURFACE_LABELS = frozenset({"cli", "tui", "gui", "desktop", "acp", "tool", "oneshot"})
 # Where each refused option lives now; the refusal names it so the user is not left guessing.
 _RELOCATED = {
     "image": "`hermes --tui` or the Desktop app to attach the image",
@@ -200,7 +206,10 @@ async def run_gateway_chat(args, emitter=None):
             # an explicit ``--source`` always wins. A remote gateway predating the label stores ``cli``.
             sources = contract.get("sources", [])
             from agent.session_source import create_surface
-            source = create_surface(getattr(args, "source", None) or ("oneshot" if oneshot and "oneshot" in sources else "cli"))
+            # A provenance label (``origin``) leaves the surface to the default rule below.
+            label = getattr(args, "source", None)
+            label = label if label and create_surface(label) in _SURFACE_LABELS else None
+            source = create_surface(label or ("oneshot" if oneshot and "oneshot" in sources else "cli"))
             if source not in sources:
                 raise GatewayClientError(f"Gateway does not support source {source!r}")
             parameters = contract.get("parameters", [])
@@ -230,6 +239,10 @@ async def run_gateway_chat(args, emitter=None):
             await asyncio.to_thread(write_breadcrumb, snapshot["stored_session_id"])
         if emitter is not None:
             emitter.bind_session(snapshot["stored_session_id"])
+            # Fork (launch adapter, #55 on the gateway path): which `-s` skills the session loaded.
+            record = (snapshot.get("info") or {}).get("launch_skills")
+            if isinstance(record, dict):
+                emitter.emit_skills(record.get("loaded"), record.get("missing"))
         view = GatewayChatView(client, snapshot, quiet=quiet, emitter=emitter,
                                usage_file=getattr(args, "usage_file", None))
         view.launch_api_key = getattr(args, "api_key", None)  # /new keeps this launch's key
@@ -292,7 +305,8 @@ def _requested_policy(args):
             policy.pop("skills")
     if getattr(args, "source", None):
         from agent.session_source import create_surface
-        policy["source"] = create_surface(args.source)
+        label = create_surface(args.source)
+        policy["source" if label in _SURFACE_LABELS else "origin"] = label
     return policy
 
 

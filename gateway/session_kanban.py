@@ -257,7 +257,10 @@ def _worker_workspace(frame):
     # keys ``agent:main:``, and only the default profile runs the multiplexer).
     profile = served_profile_name(frame.get('home'))
     tokens = set_session_vars(session_key=route, session_id=session_id,
-                              profile=profile if profile_from_session_key(route) == profile else '')
+                              profile=profile if profile_from_session_key(route) == profile else '',
+                              # Fork (launch adapter): the provenance label is this execution's source,
+                              # as the owner binds it in-process (gateway.run._launch_origin_source).
+                              **({'source': policy.origin} if policy.origin else {}))
     try:
         bind_turn_workspace(policy, session_id)
         yield session_id

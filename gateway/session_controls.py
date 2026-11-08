@@ -504,18 +504,19 @@ class AuthorityConnection:
             # retry of a creation staged without the flag keeps that frozen request.
             params.setdefault('follow_profile_config', True)
         if not ref:
-            skills_prompt = None
+            skills_prompt = skills_record = None
             if 'skills' in params:
                 # Skill files are read off the owner loop, once per NEW session (a retried
                 # request_id resumes the frozen policy and never re-renders).
                 from gateway.session_local_recovery import local_identity
-                from gateway.session_policy import render_launch_skills
+                from gateway.session_policy import render_launch_skills_record
                 params.setdefault('request_id', uuid.uuid4().hex)
                 sid = local_identity(self.authority.profile_id, self.actor.subject, params['request_id'])
                 if self.authority.db.get_session(sid) is None:
-                    skills_prompt = await asyncio.to_thread(render_launch_skills, params, sid)
+                    skills_prompt, skills_record = await asyncio.to_thread(render_launch_skills_record, params, sid)
             # Host-bound client values apply only over the gateway's own ticketed attach (run_api).
             ref = stage_local_session(self.authority, self.actor, params, skills_prompt=skills_prompt,
+                                      skills_record=skills_record,
                                       client_local=self.native_owner,
                                       desktop_local=getattr(self.transport, 'desktop_local', False))
             if isinstance(ref, dict):

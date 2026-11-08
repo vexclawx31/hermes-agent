@@ -53,6 +53,9 @@ class CanonicalCreateParams(ProfileParams):
     # A shell-launched client's allowlisted environment (HERMES_* behaviour values, toolchain PATH/venv),
     # applied to this session only; never echoed in ``launch_request``.
     client_env: dict[str, str] | None = None
+    # Fork (launch adapter): a caller's provenance label (``hermes chat --source <label>`` that is not a
+    # surface); validated and frozen by gateway.session_policy (``ORIGIN_PATTERN``, never a surface).
+    origin: str | None = None
 
 
 class CanonicalResumeParams(ProfileParams):

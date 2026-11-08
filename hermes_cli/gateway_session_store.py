@@ -166,7 +166,7 @@ class GatewaySessionStore:
         params = _creation_policy(launch or {})
         params["cwd"] = _launch_cwd()
         # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
-        params["source"] = create_surface(session_source_for("cli"))
+        params.update(_source_fields(create_surface(session_source_for("cli"))))
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
         local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
@@ -552,15 +552,39 @@ def session_store():
     return GatewaySessionStore()
 
 
-def create_titled_session(title):
+def _source_fields(label):
+    """Fork (launch adapter): ``source`` for a surface label; a provenance label (``--source
+    claude-handoff``) rides as the typed ``origin`` field on the default surface for this run."""
+    from hermes_cli.gateway_chat import _SURFACE_LABELS
+    if label in _SURFACE_LABELS:
+        return {"source": label}
+    from agent.session_source import ONESHOT_SOURCE
+    finite = os.environ.get("HERMES_SINGLE_QUERY_SESSION") == "1"
+    return {"source": ONESHOT_SOURCE if finite else "cli", "origin": label}
+
+
+def classic_launch_from_args(args):
+    """The launch flags of a parsed ``hermes chat`` as the store's ``launch`` mapping."""
+    keys = (*_LAUNCH_POLICY, "run_budget", "verbose")
+    return {key: getattr(args, key, None) for key in keys}
+
+
+def create_titled_session(title, launch=None, source=None):
     """``chat -c <title> --create-if-missing`` for the classic CLI: the gateway's ``session.create``
     with ``title`` (it resolves-or-creates under one owner lock), so this process writes no row.
     Main's ``_create_titled_session`` minted the id and wrote the row itself, with no cwd stamp
     (``row_cwd`` ""). Returns the id, or None when the gateway refused (the caller prints main's
-    "could not be created" copy)."""
-    params = _creation_policy({})
+    "could not be created" copy).
+
+    Fork (launch adapter): *launch* (``classic_launch_from_args``) creates the session with the run's
+    own flags (``-s``, ``-t``, ``--run-budget`` ...); without them the resume that follows refused every
+    launch flag as a change. A provenance *source* label rides as ``origin``."""
+    params = _creation_policy(launch or {})
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
+    if source:
+        from agent.session_source import create_surface
+        params.update(_source_fields(create_surface(source)))
     params["row_cwd"] = ""
     try:
         store = session_store()

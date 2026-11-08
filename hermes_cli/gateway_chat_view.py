@@ -344,7 +344,8 @@ class GatewayChatView:
         self.mutations.retire(self.session_id)
         sid, gaps = self.session_id, self.gaps
         receipt = await self.client.rpc("prompt.submit", session_id=self.session_id,
-                                        input_id=uuid.uuid4().hex, text=text,
+                                        input_id=_submission_id(), text=text,
+                                        **_launch_turn_author(),
                                         **({"finite": True} if self.finite else {}),
                                         **({"unattended": True} if self.finite and self.unattended else {}))
         if (receipt or {}).get("voice_stopped") is True:
@@ -648,3 +649,35 @@ def resume_footer(session_id):
     profile = get_active_profile_name()
     flag = "" if profile in ("default", "custom") else f" -p {profile}"
     return f"\n{t('cli.session.exit_resume_hint')}\n  hermes --resume {session_id}{flag}"
+
+
+# Fork (launch adapter): a spawner's per-run inputs, read once per process and consumed.
+_LAUNCH_INPUTS: dict = {}
+
+
+def _launch_turn_author() -> dict:
+    """``{"turn_author": ...}`` when the spawner set HERMES_TURN_AUTHOR (a dispatcher naming who wrote
+    this run's prompt), else ``{}``. It travels as turn data; the gateway parses it as a client-supplied
+    author, which can never claim ``verified``. Consumed: nothing this process starts inherits it."""
+    import os
+    if "author" not in _LAUNCH_INPUTS:
+        raw = os.environ.pop("HERMES_TURN_AUTHOR", None)
+        author = None
+        if raw:
+            from agent.turn_author import parse_turn_author
+            author = parse_turn_author(raw)
+        _LAUNCH_INPUTS["author"] = author
+    author = _LAUNCH_INPUTS["author"]
+    return {"turn_author": author} if author else {}
+
+
+def _submission_id() -> str:
+    """The admission's request identity. HERMES_CHAT_SUBMISSION_ID (a spawner's stable id for this run)
+    names the first submit, so a retried run is the same admission, never a second turn; later submits
+    and every other caller get a fresh id."""
+    import os
+    stable = os.environ.pop("HERMES_CHAT_SUBMISSION_ID", None)
+    if stable and "submission" not in _LAUNCH_INPUTS:
+        _LAUNCH_INPUTS["submission"] = stable
+        return stable
+    return uuid.uuid4().hex

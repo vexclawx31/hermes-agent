@@ -16,7 +16,8 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
-                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env'})
+                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
+                           'origin'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -37,6 +38,15 @@ LOCAL_DESKTOP_CHAT = 'desktop_local'
 # the profile. Either wins over the creation request (the launch identity, never rewritten) and the older
 # pick receipts.
 SESSION_PINS = 'session_pins'
+# Fork (launch adapter): which `-s/--skills` skills the creation actually loaded, ``{"loaded": [...],
+# "missing": [...]}``, owner-set in the policy's own config like the markers above, so the create
+# snapshot reports it (the stream-json ``system/skills`` event) and no receipt changes shape.
+LAUNCH_SKILLS = 'launch_skills_record'
+# Fork (launch adapter): a caller's provenance label (``hermes chat --source <label>`` for a label that
+# is not a surface: ``switchboard-tenant``, ``helpdesk-ask`` ...), a typed create field frozen in the
+# launch request. It never selects a surface or a toolset; turns bind it as HERMES_SESSION_SOURCE (what
+# the in-process CLI bound), so source-keyed guards and memory filters keep reading it.
+ORIGIN_PATTERN = r'[a-z][a-z0-9-]{1,47}'
 
 
 def session_pinned(config, field, launched):
@@ -301,6 +311,11 @@ class LocalSessionPolicy:
         return self.config().get('model', {}).get('base_url')
 
     @property
+    def origin(self):
+        """The frozen caller provenance label (``origin`` create field), or None."""
+        return json.loads(self.request_json).get('origin')
+
+    @property
     def ignore_rules(self):
         return self.safe_mode or json.loads(self.request_json).get('ignore_rules', False)
 
@@ -433,6 +448,8 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
     bad_bypass = next((name for name in BYPASS_FIELDS if name in params and type(params[name]) is not bool), None)
     if bad_bypass:
         _refuse(bad_bypass, 'must be a boolean')
+    if 'origin' in params:
+        validate_origin(params['origin'])
     safe_mode = params.get('safe_mode', False)
     ignore_user_config = safe_mode or params.get('ignore_user_config', False)
     if 'api_key' in params and (not isinstance(params['api_key'], str) or not params['api_key'].strip()):
@@ -737,15 +754,36 @@ def _extract_config_secrets(value, private, path=()):
             _extract_config_secrets(child, private, child_path)
 
 
+def _reserved_origins():
+    from gateway.config import Platform
+    return (set(SURFACES) | set(SURFACES.values()) | {'local', 'unknown', 'cron', 'kanban', 'bot_room', 'a2a',
+            'api_server', 'gateway', 'webhook'} | {p.value for p in Platform})
+
+
+def validate_origin(value):
+    """Fork (launch adapter): a provenance label is plain data, never a surface or a platform name: a
+    label that named one could make a turn look like that surface to a source-keyed check."""
+    import re
+    if not isinstance(value, str) or not re.fullmatch(ORIGIN_PATTERN, value):
+        _refuse('origin', f'must match {ORIGIN_PATTERN}')
+    if value in _reserved_origins():
+        _refuse('origin', f'{value!r} is a surface or platform name, not a provenance label')
+    return value
+
+
 def launch_skills(params):
-    """The validated `-s/--skills` identifiers of a create request (empty when absent). Skills
-    live in the profile, which a bypass launch must never read: refused there, not dropped."""
+    """The validated `-s/--skills` identifiers of a create request (empty when absent).
+
+    Fork (launch adapter): ``--ignore-user-config`` with explicit ``-s`` loads exactly the named skills
+    (the in-process CLI's behaviour, which tenant intake relies on): nothing else of the profile is
+    read, the session still freezes code defaults, and the record says what loaded. ``--safe-mode``
+    (troubleshooting: no customizations at all) still refuses them."""
     skills = params.get('skills', [])
     if 'skills' in params and (not isinstance(skills, list) or not skills
                                or any(not isinstance(s, str) or not s.strip() for s in skills)):
         _refuse('skills', 'must be a non-empty list of skill names')
-    if skills and any(params.get(name) is True for name in BYPASS_FIELDS):
-        _refuse('skills', 'a bypass launch never reads the profile, so skills cannot be preloaded')
+    if skills and params.get('safe_mode') is True:
+        _refuse('skills', 'a safe-mode launch never reads the profile, so skills cannot be preloaded')
     return [s.strip() for s in skills]
 
 
@@ -753,9 +791,15 @@ def render_launch_skills(params, session_id):
     """`-s/--skills` preload blocks for a new session, rendered ONCE at creation and frozen in its
     policy (the CLI's startup preload). Blocking skill-tree reads: callers run it off the owner
     loop. A typo among good names is logged and skipped, like the CLI; none resolving refuses."""
+    return render_launch_skills_record(params, session_id)[0]
+
+
+def render_launch_skills_record(params, session_id):
+    """``(prompt, record)``: the preload blocks and ``{"loaded": [...], "missing": [...]}`` (None, None
+    without ``-s``). Fork (launch adapter): the record is frozen in the policy (``LAUNCH_SKILLS``)."""
     skills = launch_skills(params)
     if not skills:
-        return None
+        return None, None
     from agent.skill_commands import build_preloaded_skills_prompt, format_missing_skills
     prompt, loaded, missing = build_preloaded_skills_prompt(skills, task_id=session_id)
     if not loaded:
@@ -764,7 +808,7 @@ def render_launch_skills(params, session_id):
         import logging
         logging.getLogger(__name__).warning('Skipping %s for session %s; continuing with: %s',
                                             format_missing_skills(missing), session_id, ', '.join(loaded))
-    return prompt or None
+    return prompt or None, {'loaded': list(loaded), 'missing': list(missing)}
 
 
 def accept_launch_hooks(policy):
