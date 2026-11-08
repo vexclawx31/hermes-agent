@@ -194,6 +194,9 @@ cat "$latch"
 ''')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         monkeypatch.setattr("tools.browser_session_cdp.resolve_cdp_override", lambda url: url)
+        from tools import browser_owned_tabs  # owned-tab binding on the shared browser: test_browser_cdp_owned_tab.py
+        monkeypatch.setattr(browser_owned_tabs, "bind", lambda key, daemon: (
+            browser_owned_tabs.Binding("T1", ("T1",), frozenset()), None))
         drive = lambda **kw: json.loads(bu_cli.browser_exec("print(1)", task_id="t-swap", **kw))["output"].strip()
 
         monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9400")
@@ -534,12 +537,18 @@ class TestOwnTabPreamble:
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         return json.loads(bu_cli.browser_exec("print('payload')", session=session))
 
-    def test_named_shared_browser_gets_preamble(self, tmp_path, monkeypatch):
+    def test_named_shared_browser_gets_owned_tab_preamble(self, tmp_path, monkeypatch):
+        """A shared external browser (CDP override) pins every call to the session's own tab instead
+        (tools.browser_owned_tabs; covered in test_browser_cdp_owned_tab.py)."""
+        from tools import browser_owned_tabs
+        monkeypatch.setattr(browser_owned_tabs, "bind", lambda key, daemon: (
+            browser_owned_tabs.Binding("T1", ("T1",), frozenset()), None))
         result = self._run(tmp_path, monkeypatch, session="r7k2", shared_cdp="http://127.0.0.1:9222")
         assert result["success"] is True
-        assert "_hermes_ensure_own_tab" in result["output"]
+        assert "_hermes_owned_tabs" in result["output"]
+        assert "_hermes_ensure_own_tab" not in result["output"]
         # model code still present, after the preamble
-        assert result["output"].index("_hermes_ensure_own_tab") < result["output"].index("print('payload')")
+        assert result["output"].index("_hermes_owned_tabs") < result["output"].index("print('payload')")
 
     def test_named_packaged_chromium_skips_preamble(self, tmp_path, monkeypatch):
         """Each named session launches its own packaged Chromium — nothing to share a tab with."""
@@ -574,9 +583,10 @@ class TestOwnTabPreamble:
     def test_preamble_is_valid_python(self):
         import ast
 
-        ast.parse(bu_cli._OWN_TAB_PREAMBLE)
-        # and composes with model code
-        ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
+        for preamble in (bu_cli._OWN_TAB_PREAMBLE, bu_cli._OWNED_TAB_PREAMBLE):
+            ast.parse(preamble)
+            # and composes with model code
+            ast.parse(preamble + "print('x')")
 
 
 class TestProviderPickerIntegration:

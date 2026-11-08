@@ -132,20 +132,31 @@ def get_dialog_policy_config() -> tuple[str, float]:
 def ensure_cdp_supervisor(task_id: str) -> None:
     """Start the CDP supervisor for ``task_id`` when an endpoint is reachable (idempotent; restarts on a
     URL change). URL precedence: the CDP override, then the session's own ``cdp_url``. A failed attach
-    never breaks the session."""
+    never breaks the session.
+
+    On a shared external browser (CDP override) the supervisor attaches only to the session's own tab
+    (``tools.browser_owned_tabs``) and is not started before that tab exists: never the first page."""
+    from tools import browser_session as _bs
+    from tools.browser_owned_tabs import is_shared_cdp_session, owned_pin
+    with _bs._cleanup_lock:
+        record = dict(_bs._active_sessions.get(task_id) or {})
     cdp_url = get_cdp_override()
+    page_target_id = None
+    if cdp_url or is_shared_cdp_session(record):
+        page_target_id = owned_pin(record)
+        if not page_target_id:
+            return
     if not cdp_url:
-        from tools import browser_session as _bs
-        with _bs._cleanup_lock:
-            session_cdp = str((_bs._active_sessions.get(task_id) or {}).get("cdp_url") or "")
+        session_cdp = str(record.get("cdp_url") or "")
         cdp_url = resolve_cdp_override(session_cdp) if session_cdp else ""
     if not cdp_url:
         return
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         policy, timeout_s = get_dialog_policy_config()
+        target_kw = {"page_target_id": page_target_id} if page_target_id else {}
         SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=cdp_url, dialog_policy=policy,
-                                         dialog_timeout_s=timeout_s)
+                                         dialog_timeout_s=timeout_s, **target_kw)
     except Exception as exc:  # health: allow BLE001 -- a failed supervisor attach must not break the session
         logger.debug("CDP supervisor attach for task=%s failed (non-fatal): %s", task_id, exc)
 

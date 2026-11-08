@@ -364,6 +364,14 @@ def test_another_profiles_connect_does_not_invalidate_this_profiles_new_session(
     assert sessions == {"task-a": info} and closed == []
 
 
+def _stub_owned_tab_binding(monkeypatch):
+    """These tests cover daemon reloads; owned-tab binding on the shared browser (a CDP round trip) is
+    covered in test_browser_cdp_owned_tab.py."""
+    from tools import browser_owned_tabs
+    monkeypatch.setattr(browser_owned_tabs, "bind", lambda key, daemon: (
+        browser_owned_tabs.Binding("T1", ("T1",), frozenset()), None))
+
+
 def test_a_browser_exec_that_routed_to_the_old_endpoint_during_a_connect_reloads_its_daemon(profiles, monkeypatch):
     """Browser Use path (the default mode): ``browser_exec`` resolves the live endpoint into
     ``BU_CDP_URL`` before the daemon is recorded. A ``/browser connect`` landing in between reaped
@@ -375,9 +383,10 @@ def test_a_browser_exec_that_routed_to_the_old_endpoint_during_a_connect_reloads
     a, _b = profiles
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-harness"])
-    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id, *_target: None)
     monkeypatch.setattr(bs_cdp, "resolve_cdp_override", lambda raw: raw)
     monkeypatch.setattr(server, "_cdp_http_reachable", lambda parsed, timeout=2.0: True)
+    _stub_owned_tab_binding(monkeypatch)
     latched = {}  # like browser-harness: one daemon per identity latches BU_CDP_URL; --reload stops it
 
     def run(cmd, code, env, timeout):
@@ -420,9 +429,10 @@ def test_a_connect_that_lands_while_browser_exec_spawns_its_daemon_reloads_it(pr
     a, _b = profiles
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-harness"])
-    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id, *_target: None)
     monkeypatch.setattr(bs_cdp, "resolve_cdp_override", lambda raw: raw)
     monkeypatch.setattr(server, "_cdp_http_reachable", lambda parsed, timeout=2.0: True)
+    _stub_owned_tab_binding(monkeypatch)
     latched, connects = {}, []
 
     def run(cmd, code, env, timeout):

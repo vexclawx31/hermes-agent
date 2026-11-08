@@ -107,8 +107,11 @@ cat "$latch"
     monkeypatch.setenv("BH_RUNTIME_DIR", str(shared))
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(cli)])
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
-    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id, *_target: None)
     monkeypatch.setattr(bs_cdp, "resolve_cdp_override", lambda url: url)
+    from tools import browser_owned_tabs  # owned-tab binding on the shared browser: test_browser_cdp_owned_tab.py
+    monkeypatch.setattr(browser_owned_tabs, "bind", lambda key, daemon: (
+        browser_owned_tabs.Binding("T1", ("T1",), frozenset()), None))
 
     def drive(home, url=None):
         with _profile_runtime_scope(home, hydrate_secrets=False):

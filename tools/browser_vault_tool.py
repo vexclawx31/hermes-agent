@@ -104,22 +104,32 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
 def _ensure_supervisor(task_id: str):
     """The supervisor for ``task_id`` (browser_exec attaches one on every call), attaching one on demand to
     the task's session CDP endpoint when none is running. None when no endpoint is known; a fill then
-    refuses rather than touching argv."""
+    refuses rather than touching argv.
+
+    On a shared external browser (CDP override, a person's own Chrome) the fill only ever uses a
+    supervisor scoped to the session's own tab (``tools.browser_owned_tabs``): an unscoped one could
+    ``focus_page`` a person's or another agent's same-origin tab. No owned tab → None (the fill refuses)."""
+    from tools.browser_owned_tabs import is_shared_cdp_session, owned_pin
+    from tools.browser_session import session_for_task
+    from tools.browser_session_cdp import get_cdp_override_raw, get_dialog_policy_config, resolve_cdp_override
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
-    if supervisor is not None:
+    record = session_for_task(task_id)
+    shared = bool(get_cdp_override_raw()) or is_shared_cdp_session(record)
+    if supervisor is not None and (not shared or getattr(supervisor, "page_target_id", None)):
         return supervisor
-    from tools.browser_session import session_for_task
-    from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
-
-    cdp_url = str(session_for_task(task_id).get("cdp_url") or "")
+    target = owned_pin(record) if shared else None
+    if shared and not target:
+        return None
+    cdp_url = str(record.get("cdp_url") or "")
     if not cdp_url:
         return None
     policy, timeout_s = get_dialog_policy_config()
+    target_kw = {"page_target_id": target} if target else {}
     try:
         return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=resolve_cdp_override(cdp_url),
-                                                dialog_policy=policy, dialog_timeout_s=timeout_s)
+                                                dialog_policy=policy, dialog_timeout_s=timeout_s, **target_kw)
     except Exception as exc:  # health: allow BLE001 -- a failed attach is reported as supervisor_required
         logger.debug("vault fill: supervisor attach to the task's session failed (%s)", exc)
         return None
