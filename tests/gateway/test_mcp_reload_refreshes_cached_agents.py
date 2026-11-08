@@ -155,7 +155,12 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     # Override the toolsets on the cached agent.
     agent, _sig = runner._agent_cache["session-0"]
     agent.enabled_toolsets = ["safe"]
-    agent.disabled_toolsets = ["terminal"]
+    # Fork #57: a refresh re-applies the session gates (static platform gates, plugin ceiling) every
+    # time, so the selection must be what a build stores: the configured list plus those gates.
+    from toolsets import new_agent_disabled_toolsets
+    agent.disabled_toolsets = new_agent_disabled_toolsets(agent, ["terminal"])
+    built_disabled = list(agent.disabled_toolsets)
+    assert built_disabled[0] == "terminal"
 
     captured_calls = []
 
@@ -173,4 +178,4 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
 
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
-    assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+    assert captured_calls[0]["disabled_toolsets"] == built_disabled

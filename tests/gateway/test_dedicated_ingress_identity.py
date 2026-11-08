@@ -161,7 +161,7 @@ async def test_task_local_executor_reset():
     async def one(owner):
         r, a, e = await build(owner=owner)
         tokens = r._set_session_env(
-            SimpleNamespace(source=e.source, session_key="fixture"), event=e
+            SimpleNamespace(source=e.source, session_key="fixture", session_id=""), event=e
         )
         try:
             await asyncio.sleep(0)

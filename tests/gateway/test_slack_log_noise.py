@@ -280,7 +280,7 @@ def _connect_with_auth_error(exc):
         patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
         patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
         patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
-        patch("gateway.status.release_scoped_lock", return_value=None),
+        patch("gateway.status_scoped_locks.release_scoped_lock", return_value=None),
     ):
         ok = asyncio.run(adapter.connect())
     return ok, adapter

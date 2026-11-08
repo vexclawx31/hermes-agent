@@ -23,7 +23,14 @@ DOORS = [
 @pytest.mark.parametrize('name,path,body,headers,expected', DOORS, ids=[d[0] for d in DOORS])
 async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, monkeypatch, name, path, body,
                                                                 headers, expected):
+    import importlib
+
     from gateway.platforms import api_server_runs
+
+    # Every request's drain check imports gateway.run lazily (api_server._gateway_is_draining). A live
+    # gateway has it loaded before the adapter serves; cold here, its import (seconds on a loaded host)
+    # would run on the loop inside the measured window and read as an admission stall.
+    importlib.import_module('gateway.run')
 
     async def handle(event):
         from gateway.session_results import execution_result
