@@ -6,6 +6,8 @@ segments (`agent-sudo-scope --apply` -> `--a...`). Option parsing in sudo stops
 at `--` or the first non-option word (the command), so only flags before it count.
 """
 
+import time
+
 import pytest
 
 from tools.approval import DEFAULT_HUMAN_REQUIRED
@@ -124,6 +126,54 @@ def test_descriptions_stay_on_the_human_required_floor():
 def test_obfuscated_sudo_words_still_parse(cmd):
     # The no-sudo prefilter keys on s-u-d-o in order, which every deobfuscated spelling keeps.
     assert PRIVILEGE in detect_dangerous_keys(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    # Independent review of c885294835 (v0.23 release): each of these yielded no finding.
+    "sudo 2>&1 -S id",                # an & redirection split the segment before -S
+    "sudo >&2 -S id",
+    "sudo &>/dev/null -S id",
+    "sudo >& 2 -S id",
+    "sudo -C 3 >/dev/null -S id",     # a spaced number is -C's value, not the redirection's fd
+    "sudo -u 2 >/dev/null -S id",
+    'echo "$(sudo -S id $(true))"',   # nested substitution inside double quotes
+    'echo "$(sudo -S id; (true))"',
+    "${x:=sudo} -S id",               # parameter defaults beyond :-
+    "${x-sudo} -S id",
+    "${HOME:+sudo} -S id",
+    "sudo{,} -S id",                  # brace or glob: unresolved, fail closed
+    "/usr/bin/su[d]o -S id",
+    "echo -S id | xargs sudo",        # behind xargs, stdin supplies the rest of sudo's argv
+    "printf '%s\\n' -S id | xargs sudo",
+    "echo x | xargs sudo -n",
+])
+def test_review_bypasses_are_caught(cmd):
+    keys = detect_dangerous_keys(cmd)
+    assert PRIVILEGE in keys or COMBINED in keys, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo -n ls 2>&1 | tee x",
+    "sudo -n cmd 2>&1",
+    "sudo 2>/dev/null -n /usr/bin/shasum -a 256 f",
+    "find . | xargs sudo rm -f x",
+    "xargs -I{} sudo cp {} /x",
+])
+def test_redirections_and_xargs_with_a_command_stay_quiet(cmd):
+    keys = detect_dangerous_keys(cmd)
+    assert PRIVILEGE not in keys and COMBINED not in keys, (cmd, keys)
+
+
+@pytest.mark.parametrize("command", [
+    "eval " * 20 + "sudo id",
+    "env -S " * 20 + "sudo id",
+    "(" * 8000 + "/" * 8000 + "; sudo -n id",
+])
+def test_sudo_parse_stays_bounded(command):
+    from tools.approval_detection import _sudo_privilege_findings
+    start = time.perf_counter()
+    list(_sudo_privilege_findings(command))
+    assert time.perf_counter() - start < 2
 
 
 def test_commands_without_sudo_letters_skip_the_parse():
