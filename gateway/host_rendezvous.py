@@ -654,8 +654,10 @@ def own_multiplex_flag(home: str = "") -> Optional[bool]:
     """``False`` when this gateway is standalone, else ``None`` (unknown).
 
     Both must hold: the launch home is ``gateway.standalone`` by config AND this process does not
-    multiplex. The runner settles the mode (``set_multiplex_active``) before the PID/host claim, so
-    the claim already sees it; a multiplexer whose config was flipped to standalone without a
+    multiplex. On v0.23 the mode is settled before the PID/host claim by ``start_gateway``'s config
+    load (``load_gateway_config_for_runner``: ``resolve_multiplex_mode``, then ``set_multiplex_active``
+    for a multiplexer; a named launch is downgraded by ``_launch_home_may_multiplex``), so the claim
+    already sees it; a multiplexer whose config was flipped to standalone without a
     restart keeps multiplexing, and must not advertise ``false`` on its next republish.
     """
     try:

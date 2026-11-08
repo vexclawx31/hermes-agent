@@ -383,7 +383,7 @@ def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -
     refusal = replace.replace_incompatible_owner(home, deadline=deadline)
     if refusal is not None:
         return GatewayDiscovery("incompatible", reason_code="runtime_protocol",
-                                detail=replace.REFUSAL_DETAIL.get(refusal, _REPLACE_FAILED_DETAIL))
+                                detail=replace.refusal_detail(refusal, home) or _REPLACE_FAILED_DETAIL)
     return GatewayDiscovery("draining", reason_code="replaced")
 
 
@@ -477,6 +477,14 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 if service is not None:
                     start_existing_gateway_service(service, deadline=deadline)
                 else:
+                    from hermes_cli.gateway_runtime_managed import (
+                        MANAGED_RUNTIME_REASON, home_runtime_is_managed, managed_runtime_detail,
+                    )
+                    if target != home and home_runtime_is_managed(home):
+                        # Fork: a managed profile never gets its host's gateway spawned for it either
+                        # (the spawn itself refuses a managed TARGET).
+                        return GatewayDiscovery("inaccessible", reason_code=MANAGED_RUNTIME_REASON,
+                                                detail=managed_runtime_detail(home))
                     from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway, stdio_log_size
                     child_home, child_offset = target, stdio_log_size(target)
                     child = spawn_unmanaged_gateway(target, deadline=deadline, idle_exit=idle_exit)
@@ -488,7 +496,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     except TimeoutError:
         return GatewayDiscovery("starting", reason_code="deadline")
     except RuntimeStartError as exc:
-        return GatewayDiscovery(exc.state, reason_code=exc.reason)
+        return GatewayDiscovery(exc.state, reason_code=exc.reason, detail=exc.detail)
     except PermissionError:
         return _refused(home)
     except OSError:

@@ -32,7 +32,16 @@ REFUSAL_DETAIL = {
     "owner_unverified": "an older Hermes gateway owns this profile and was not verified; run: hermes gateway stop",
     "owner_did_not_exit": "an older Hermes gateway owns this profile and did not stop; run: hermes gateway stop",
     "owner_unreachable": "an older Hermes gateway owns this profile; run: hermes gateway stop",
+    "owner_managed": "an older Hermes gateway owns this profile and is externally managed; restart it through its supervisor",
 }
+
+
+def refusal_detail(code: str, home: Path) -> str | None:
+    """The client-facing line for a refusal code; a managed owner's names the profile."""
+    if code == "owner_managed":
+        from hermes_cli.gateway_runtime_managed import managed_runtime_detail
+        return f"an older Hermes gateway owns this profile; {managed_runtime_detail(home)}"
+    return REFUSAL_DETAIL.get(code)
 
 
 def _install_root() -> Path:
@@ -109,8 +118,15 @@ def _wait_gone(pid: int, seconds: float) -> bool:
 
 def replace_incompatible_owner(home: Path, *, deadline: float) -> str | None:
     """Stop the older-Hermes gateway answering for *home*; None once it is gone, else a refusal code
-    (see :data:`REFUSAL_DETAIL`). Never starts anything: the caller's ensure loop does that."""
+    (see :data:`REFUSAL_DETAIL`). Never starts anything: the caller's ensure loop does that.
+
+    Fork: a home with ``gateway.managed_runtime: true`` (or one served through a multiplexer root
+    that sets it) is refused as ``owner_managed`` before anything is signalled: its supervisor would
+    not revive a planned stop (:mod:`hermes_cli.gateway_runtime_managed`)."""
     from gateway.status import terminate_pid
+    from hermes_cli.gateway_runtime_managed import home_runtime_is_managed
+    if home_runtime_is_managed(home):
+        return "owner_managed"
     budget = deadline - time.monotonic()
     if budget <= 0:
         return "owner_unreachable"
@@ -121,6 +137,8 @@ def replace_incompatible_owner(home: Path, *, deadline: float) -> str | None:
     if found is None:
         return None  # it is already gone: nothing to replace
     control, payload = found
+    if not _same(control, home) and home_runtime_is_managed(control):
+        return "owner_managed"
     verdict = _verified_owner(control, payload)
     if isinstance(verdict, str):
         return verdict
