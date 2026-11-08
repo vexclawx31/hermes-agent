@@ -50,7 +50,15 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     Desktop's ``gateway ensure``, which keeps its attached gateway for the app's lifetime).
     ``force``: a ``gateway restart --force --detach`` replacement keeps the ``--force`` its old owner
     needed (a named profile under a multiplexer), or it exits on the run-side guard.
+
+    Fork: refused for a home with ``gateway.managed_runtime: true``; only its supervisor starts it
+    (:mod:`hermes_cli.gateway_runtime_managed`).
     """
+    from hermes_cli.gateway_runtime_managed import (
+        MANAGED_RUNTIME_REASON, home_runtime_is_managed, managed_runtime_detail,
+    )
+    if home_runtime_is_managed(profile_home):
+        raise RuntimeStartError(MANAGED_RUNTIME_REASON, detail=managed_runtime_detail(profile_home))
     home = profile_home.resolve()
     root = Path(__file__).resolve().parent.parent
     # A root home is only pinned by an explicit selector: without one the child's
@@ -106,7 +114,7 @@ def start_detached_replacement(profile_home: Path, *, force: bool = False) -> in
     try:
         spawn_unmanaged_gateway(profile_home, deadline=time.monotonic() + 30, force=force)
     except RuntimeStartError as exc:
-        print(f"✗ Could not start the gateway in the background: {exc}", file=sys.stderr)
+        print(f"✗ Could not start the gateway in the background: {exc.detail or exc}", file=sys.stderr)
         return 1
     print("✓ Started the gateway in the background")
     return 0
