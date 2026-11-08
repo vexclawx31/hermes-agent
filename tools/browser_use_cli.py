@@ -51,6 +51,90 @@ _REAL_PROFILE_FALLBACK_SENTINEL = "_HERMES_BU_REAL_PROFILE_FALLBACK"
 _LOCAL_FALLBACK_SENTINEL = "_HERMES_BU_LOCAL_FALLBACK"
 # Where new/hidden tabs may be brought to the front: a browser_use_shot.ACTIVATE_* mode. Popped before launch.
 _CLOUD_BROWSER_SENTINEL = "_HERMES_BU_CLOUD_BROWSER"
+# The route is a SHARED external browser (a CDP override: a person's own Chrome): the call works only in
+# tabs it opened (tools.browser_owned_tabs). Popped before launch.
+_SHARED_CDP_SENTINEL = "_HERMES_BU_SHARED_CDP"
+
+# Prepended on a shared external browser (_SHARED_CDP_SENTINEL), every call: pin the daemon to this route's
+# owned tab (HERMES_BU_PIN_TAB) before the model's code runs, or exit without running it; refuse
+# switch_tab/close_tab on a tab the route did not open; report the tabs new_tab() opened and the owned tab
+# the call ended on (HERMES_BU_TAB_STATE) so Hermes records and later closes exactly those.
+_OWNED_TAB_PREAMBLE = """\
+# hermes: this session works only in tabs it opened (shared browser)
+def _hermes_owned_tabs():
+    import atexit as _ax, json as _js, os as _os, sys as _sys
+    _g = globals()
+    _owned = [t for t in _os.environ.get("HERMES_BU_OWNED_TABS", "").split(",") if t]
+    _pin = _os.environ.get("HERMES_BU_PIN_TAB", "")
+    _state = _os.environ.get("HERMES_BU_TAB_STATE", "")
+    _opened = []
+    _new, _switch, _close, _cur = _g["new_tab"], _g["switch_tab"], _g["close_tab"], _g["current_tab"]
+    _trace = _g.get("_traced")
+
+    def _tid(t):
+        return (t.get("targetId") or t.get("target_id")) if isinstance(t, dict) else t
+
+    def _mine(t):
+        return bool(t) and (t in _owned or t in _opened)
+
+    def _save():
+        if not _state:
+            return
+        try:
+            cur = _tid(_cur())
+        except Exception:
+            cur = None
+        try:
+            with open(_state, "w", encoding="utf-8") as fh:
+                _js.dump({"opened": _opened, "current": cur if _mine(cur) else None}, fh)
+        except OSError:
+            pass
+
+    def new_tab(url="about:blank"):
+        t = _new(url)
+        if t and not _mine(t):
+            _opened.append(t)
+        _save()
+        return t
+
+    def switch_tab(target, activate=False):
+        if not _mine(_tid(target)):
+            raise RuntimeError("hermes: this session may only switch to tabs it opened (shared browser); "
+                               "use new_tab(url) for a new page")
+        return _switch(target, activate)
+
+    def close_tab(target=None):
+        t = _tid(_cur()) if target is None else _tid(target)
+        if not _mine(t):
+            raise RuntimeError("hermes: this session may only close tabs it opened (shared browser)")
+        return _close(t)
+
+    def ensure_real_tab():
+        try:
+            cur = _cur()
+            if _mine(_tid(cur)):
+                return cur
+        except Exception:
+            pass
+        _switch(_pin)
+        return _cur()
+
+    try:
+        if _tid(_cur()) != _pin:
+            _switch(_pin)
+        if _tid(_cur()) != _pin:
+            raise RuntimeError("the daemon is still on another tab")
+    except Exception as e:
+        print("hermes: could not switch to this session's own tab (%s); not running on another tab. "
+              "Retry the call." % e, file=_sys.stderr)
+        _sys.exit(3)
+    for _name, _fn in (("new_tab", new_tab), ("switch_tab", switch_tab), ("close_tab", close_tab),
+                       ("ensure_real_tab", ensure_real_tab)):
+        _g[_name] = _trace(_name, _fn) if callable(_trace) else _fn
+    _ax.register(_save)
+_hermes_owned_tabs()
+del _hermes_owned_tabs
+"""
 
 # Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
 # harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
@@ -421,6 +505,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     override = _quiet(get_cdp_override, "")
     if override:
         _set_cdp_env(env, override)
+        env[_SHARED_CDP_SENTINEL] = "1"
         return None
     if force_local_sidecar:
         return _resolve_local_cdp(env, task_id, session_name, sidecar=True)
@@ -503,10 +588,11 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
-def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
+def _attach_vault_supervisor(env: dict, task_id: Optional[str], page_target_id: Optional[str] = None) -> None:
     """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault`` fill has
     a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
-    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``."""
+    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``.
+    ``page_target_id`` (a shared external browser) scopes it to the session's own tab."""
     cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
     if not cdp:
         return
@@ -514,8 +600,9 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         policy, timeout_s = get_dialog_policy_config()
+        target_kw = {"page_target_id": page_target_id} if page_target_id else {}
         SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=resolve_cdp_override(cdp),
-                                         dialog_policy=policy, dialog_timeout_s=timeout_s)
+                                         dialog_policy=policy, dialog_timeout_s=timeout_s, **target_kw)
     except Exception as exc:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
 
@@ -635,6 +722,22 @@ def stop_harness_daemons(home_key: Optional[str] = None) -> None:
         for key in daemons:
             _driven_daemons.pop(key, None)
     _reload_daemons(daemons)
+
+
+def stop_harness_daemon(daemon: tuple[str, ...]) -> None:
+    """Stop one harness daemon (its ``daemon_identity``), e.g. at an owned-tab session's teardown."""
+    with _driven_daemons_lock:
+        _driven_daemons.pop(daemon, None)
+    _reload_daemons([daemon])
+
+
+def _owned_tab_daemon_name(route_key: str) -> str:
+    """BU_NAME for an unnamed session on a shared external browser. The harness's "default" daemon attaches
+    to the first existing tab and re-attaches there after a stale session; a named one only ever uses its
+    own tabs. Per route, so one route's teardown never stops another's daemon. User names cannot start
+    with ``_``."""
+    import hashlib
+    return f"_cdp_{hashlib.sha256(route_key.encode()).hexdigest()[:12]}"
 
 
 def _published_daemon_pid(env: dict) -> Optional[int]:
@@ -806,6 +909,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error(route_err)
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(session)
+    shared_cdp = bool(env.pop(_SHARED_CDP_SENTINEL, None))  # always pop: never exported to the CLI
+    if shared_cdp and not session:
+        env["BU_NAME"] = _owned_tab_daemon_name(route_key)
     fit_default_socket_dir(env)  # BU_NAME is final: a deep HOME's socket would overflow sun_path
     _exec_route_is_sidecar[route_key] = local_sidecar
     local_engine = env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
@@ -815,7 +921,19 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
-    if session and not private_browser:
+    binding = tab_state = None
+    if shared_cdp:
+        # A person's own Chrome: work only in tabs this route opened, or refuse (tools.browser_owned_tabs).
+        from tools import browser_owned_tabs
+        binding, bind_err = browser_owned_tabs.bind(route_key, daemon_identity(env))
+        if bind_err:
+            return tool_error(bind_err)
+        tab_state = browser_owned_tabs.state_path(route_key)
+        Path(tab_state).unlink(missing_ok=True)
+        env.update(HERMES_BU_PIN_TAB=binding.pin, HERMES_BU_OWNED_TABS=",".join(binding.owned),
+                   HERMES_BU_TAB_STATE=tab_state)
+        code = _OWNED_TAB_PREAMBLE + code
+    elif session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
     # Every backend: capture_screenshot() falls back to jpeg instead of hanging on a png a hidden tab never
     # renders; only on a cloud browser does it (and new_tab) bring the tab to the front (tools/browser_use_shot.py).
@@ -835,7 +953,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> dict[str, Any]:
-        _attach_vault_supervisor(env, task_id)
+        if binding is not None:
+            _attach_vault_supervisor(env, task_id, binding.pin)
+        else:
+            _attach_vault_supervisor(env, task_id)
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
             _driven_daemons[daemon] = hermes_home_key()
@@ -861,6 +982,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         dispatched = run_fenced({"features": {"local": True}}, dispatch)
     else:
         dispatched = dispatch()
+    if binding is not None:
+        from tools.browser_owned_tabs import record_call
+        record_call(route_key, binding, tab_state)
     _reload_if_republished(env, generation)
     _own_harness_daemon(env)
     if "proc" not in dispatched:

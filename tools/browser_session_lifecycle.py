@@ -5,7 +5,8 @@ Teardown per session kind (CDP supervisor stopped first, so our WebSocket closes
 cloud → ``provider.close_session``; Lightpanda → ``stop_lightpanda``; launcher Chromium → ``stop_browser``
 (a shared persistent profile only once no other session uses it); sandbox → SIGTERM inside the sandbox
 once no other session uses it;
-real profile → shared per profile home, terminated at exit / on that profile's consent-off; CDP override → nothing (the user's browser).
+real profile → shared per profile home, terminated at exit / on that profile's consent-off; CDP override → only
+the tabs the session opened itself, and its harness daemon (``tools.browser_owned_tabs``); never the user's browser.
 """
 
 from __future__ import annotations
@@ -130,6 +131,9 @@ def release_session_backend(cache_key: str, session_info: dict[str, Any]) -> Non
     """Release ``session_info``'s browser BY OBJECT (an unpublished session releases through this alone)."""
     _close_cloud_session(session_info)
     features = session_info.get("features") or {}
+    if features.get("cdp_override"):  # a shared external browser: close only the tabs this session opened
+        from tools.browser_owned_tabs import release_owned_tabs
+        release_owned_tabs(session_info)
     if features.get("lightpanda"):
         from tools.browser_lightpanda import stop_lightpanda
         stop_lightpanda(session_info.get("session_name", ""))
