@@ -14,6 +14,7 @@ idempotent and never rewrites a later run's status.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -53,8 +54,8 @@ def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[
     return bool(_with_job(job_id, apply, missing=False))
 
 
-def _terminal(execution_id: str) -> Optional[tuple[str, Optional[str]]]:
-    """``(ledger_outcome, delivery_error)`` once the queue row is terminal, else None."""
+def _terminal_row(execution_id: str) -> Optional[tuple[str, Optional[str], dict]]:
+    """``(ledger_outcome, delivery_error, queue_row)`` once the queue row is terminal, else None."""
     from cron.delivery_queue import get_status
 
     row = get_status(str(execution_id))
@@ -63,7 +64,27 @@ def _terminal(execution_id: str) -> Optional[tuple[str, Optional[str]]]:
     delivery_error = None
     if row["status"] in ("failed", "unknown"):
         delivery_error = str(row.get("error") or f"delivery {row['status']}")
-    return _LEDGER_OUTCOME[row["status"]], delivery_error
+    return _LEDGER_OUTCOME[row["status"]], delivery_error, row
+
+
+def _terminal(execution_id: str) -> Optional[tuple[str, Optional[str]]]:
+    """``(ledger_outcome, delivery_error)`` once the queue row is terminal, else None."""
+    terminal = _terminal_row(execution_id)
+    return terminal[:2] if terminal else None
+
+
+def _queue_receipt(row: dict) -> dict:
+    """The send's own targets and message ids stored on its queue row (``receipt``), type-checked."""
+    try:
+        receipt = json.loads(row.get("receipt") or "{}")
+    except (TypeError, ValueError):
+        receipt = {}
+    receipt = receipt if isinstance(receipt, dict) else {}
+    targets, ids = receipt.get("targets"), receipt.get("message_ids")
+    return {
+        "delivery_targets": [str(t) for t in targets] if isinstance(targets, list) else None,
+        "delivery_message_ids": ids if isinstance(ids, dict) else None,
+    }
 
 
 def settled_outcome(execution_id: str) -> Optional[str]:
@@ -76,13 +97,17 @@ def settle_queued_delivery(job_id: Optional[str], execution_id: Optional[str]) -
     """Apply the queue's terminal outcome for *execution_id*; False while still in flight."""
     if not job_id or not execution_id:
         return False
-    terminal = _terminal(str(execution_id))
+    terminal = _terminal_row(str(execution_id))
     if terminal is None:
         return False
-    from cron.executions import settle_delivery_outcome
+    from cron.executions import settle_delivery_outcome, settle_delivery_receipt
 
-    settle_delivery_outcome(str(execution_id), terminal[0])
-    _settle_job_record(str(job_id), str(execution_id), terminal[1])
+    outcome, delivery_error, row = terminal
+    settle_delivery_outcome(str(execution_id), outcome)
+    # Fork #47: the run row keeps this send's own receipt, never the job record's last ids.
+    settle_delivery_receipt(str(execution_id), outcome, delivery_error=delivery_error,
+                            **_queue_receipt(row))
+    _settle_job_record(str(job_id), str(execution_id), delivery_error)
     return True
 
 

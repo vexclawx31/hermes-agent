@@ -381,6 +381,16 @@ def _json_or_none(value: Any) -> Optional[str]:
     return json.dumps(value, sort_keys=True) if value else None
 
 
+def _delivery_error_detail(delivery_error: Any) -> Optional[str]:
+    """Redacted (URL credentials too), bounded delivery error summary, or None."""
+    if not delivery_error:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(
+        str(delivery_error), force=True, redact_url_credentials=True)[:DELIVERY_ERROR_MAX_CHARS]
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None, cancelled: bool = False,
@@ -399,12 +409,7 @@ def finish_execution(
     now = _hermes_now().isoformat()
     status = "cancelled" if cancelled else ("completed" if success else "failed")
     detail = None if success else (str(error) if error else "unknown failure")
-    delivery_detail = None
-    if delivery_error:
-        from agent.redact import redact_sensitive_text
-
-        delivery_detail = redact_sensitive_text(
-            str(delivery_error), force=True, redact_url_credentials=True)[:DELIVERY_ERROR_MAX_CHARS]
+    delivery_detail = _delivery_error_detail(delivery_error)
     with _transaction() as conn:
         owner = (_PROCESS_ID, os.getpid())
         cur = conn.execute(
@@ -512,6 +517,36 @@ def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
                WHERE id=? AND delivery_outcome='queued'
                  AND status IN ('completed','failed','unknown')""",
             (outcome, execution_id),
+        )
+    return cur.rowcount == 1
+
+
+def settle_delivery_receipt(
+    execution_id: str, outcome: str, *, delivery_targets: Optional[list[str]] = None,
+    delivery_message_ids: Optional[dict[str, list[str]]] = None,
+    delivery_error: Optional[str] = None,
+) -> bool:
+    """Copy a settled queued send's own receipt (its queue row's targets, message ids and error)
+    onto the attempt that queued it (fork #47).
+
+    Fenced like ``settle_delivery_outcome``: only a terminal attempt whose outcome is this
+    settlement's (or still ``queued``) is touched, and columns the run already recorded are
+    never overwritten, so a replay, or a drain that finished before the run's own bookkeeping,
+    is safe. Never reads the job record, whose ``last_delivery_message_ids`` is last-writer-wins.
+    """
+    values = (_json_or_none(delivery_targets), _json_or_none(delivery_message_ids),
+              _delivery_error_detail(delivery_error))
+    if not any(values):
+        return False
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET delivery_targets=COALESCE(delivery_targets, ?),
+                   delivery_message_ids=COALESCE(delivery_message_ids, ?),
+                   delivery_error=COALESCE(delivery_error, ?)
+               WHERE id=? AND delivery_outcome IN ('queued', ?)
+                 AND status IN ('completed','failed','unknown')""",
+            (*values, execution_id, outcome),
         )
     return cur.rowcount == 1
 
