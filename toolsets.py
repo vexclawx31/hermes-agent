@@ -449,18 +449,32 @@ def get_toolset_names() -> list[str]:
     return sorted(set(TOOLSETS.keys()) | set(_plugin_display_names()))
 
 
+def _ceiling_blocked(platform: Optional[str]) -> list[str]:
+    """Plugin toolsets outside the active profile's ``plugin_toolset_platforms`` ceiling for *platform*
+    (hermes_cli.toolset_scope); [] when no ceiling is configured."""
+    try:
+        from hermes_cli.toolset_scope import ceiling_blocked_toolsets
+    except ImportError:
+        return []
+    return ceiling_blocked_toolsets(platform)
+
+
 def session_platform_tool_drops(platform: Optional[str]) -> frozenset:
-    """Tools of every platform-gated toolset that a session on *platform* does not get."""
-    return frozenset(tool for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms
-                     for tool in resolve_toolset(name))
+    """Tools of every platform-gated toolset that a session on *platform* does not get: the static
+    session-platform gates plus plugin toolsets outside the config ceiling (computed fresh on every call,
+    so a plugin registered after the agent was built is dropped at the next refresh too)."""
+    gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms]
+    return frozenset(tool for name in (*gated, *_ceiling_blocked(platform)) for tool in resolve_toolset(name))
 
 
 def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[str]) -> Optional[list[str]]:
-    """*disabled* plus every platform-gated toolset a session on *platform* does not get. An agent stores
-    this as its ``disabled_toolsets``, so the tool list, the tool_search listing and bridge, MCP refreshes
-    and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
+    """*disabled* plus every platform-gated toolset a session on *platform* does not get (static gates and
+    plugin toolsets outside the config ceiling). An agent stores this as its ``disabled_toolsets``, so the tool
+    list, the tool_search listing and bridge, MCP refreshes and delegate children (which inherit it) all subtract
+    the gated tools in ``_select_tool_names``."""
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items()
              if platform not in platforms and name not in (disabled or ())]
+    gated += [name for name in _ceiling_blocked(platform) if name not in (disabled or ()) and name not in gated]
     return [*(disabled or ()), *gated] if gated else disabled
 
 
