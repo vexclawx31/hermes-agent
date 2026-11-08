@@ -30,7 +30,8 @@ _CONFIG = (
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.setattr(lcm, "_attempted", set())
-    monkeypatch.setattr(lcm, "_undelivered", {})
+    # Kept notices live in each home's cache (_queue_notice/_claim_notices), not in process state:
+    # every test's home is a fresh tmp_path, so there is nothing left to reset.
     monkeypatch.setattr(mpm, "_attempted", set())
     monkeypatch.delenv("HASS_TOKEN", raising=False)
     # The hermetic harness disables lazy installs by env; these homes allow them in config.yaml.
