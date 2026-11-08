@@ -1,7 +1,9 @@
 """Platform scope rules for configured toolsets."""
 
 import logging
-from typing import Any, Iterable, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +29,29 @@ def toolset_allowed_for_platform(ts_key: str, platform: str) -> bool:
 # process-global mapping, so profiles of a multiplexed gateway cannot see each other's ceiling.
 
 CEILING_KEY = "plugin_toolset_platforms"
-# Delegated children inherit the parent's disabled_toolsets (which already carry the parent's ceiling) and can
-# only narrow from there, so their own "subagent" platform adds no second ceiling.
-CEILING_INHERITS_PARENT = frozenset({"subagent"})
 _warned: set[str] = set()
+# The platform whose ceiling a delegated child is built under: delegate_task sets it (to the parent's ceiling
+# platform) only around child construction, so a session that merely CALLS itself "subagent" (a client-supplied
+# source) gets no exemption; it is capped by the "subagent" entry like any other platform.
+_INHERITED_CEILING_PLATFORM: ContextVar[Optional[tuple[Optional[str]]]] = ContextVar(
+    "hermes_inherited_ceiling_platform", default=None)
+
+
+@contextmanager
+def inherited_ceiling_platform(platform: Optional[str]) -> Iterator[None]:
+    """Build delegated children inside this so they keep their parent's plugin toolset ceiling."""
+    token = _INHERITED_CEILING_PLATFORM.set((platform,))
+    try:
+        yield
+    finally:
+        _INHERITED_CEILING_PLATFORM.reset(token)
+
+
+def ceiling_platform_for_new_agent(platform: Optional[str]) -> Optional[str]:
+    """The platform whose ceiling an agent being built now obeys: the inherited one inside delegate_task's
+    child construction, else its own session platform."""
+    inherited = _INHERITED_CEILING_PLATFORM.get()
+    return inherited[0] if inherited is not None else platform
 
 
 def _warn_once(key: str, message: str) -> None:
@@ -90,9 +111,7 @@ def ceiling_blocked_toolsets(
     platform: Optional[str], *, ceiling: Any = ..., plugin_keys: Optional[Iterable[str]] = None,
 ) -> list[str]:
     """Plugin toolsets (and registry aliases that point at them) a session on ``platform`` may not have.
-    [] when no ceiling is configured or the platform inherits its parent's ceiling."""
-    if platform in CEILING_INHERITS_PARENT:
-        return []
+    [] when no ceiling is configured."""
     ceiling = active_plugin_toolset_ceiling() if ceiling is ... else ceiling
     if ceiling is None:
         return []

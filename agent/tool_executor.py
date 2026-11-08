@@ -365,8 +365,9 @@ def _tool_search_scoped_names(agent) -> frozenset:
     except Exception:
         return frozenset()
 
+    from toolsets import agent_disabled_toolsets
     enabled = getattr(agent, "enabled_toolsets", None)
-    disabled = getattr(agent, "disabled_toolsets", None)
+    disabled = agent_disabled_toolsets(agent)
     cache_key = (
         _registry.current_scope_key(),
         getattr(_registry, "_generation", 0),
@@ -385,6 +386,11 @@ def _tool_search_scoped_names(agent) -> frozenset:
     with contextlib.suppress(Exception):
         agent._tool_search_scope_cache = (cache_key, names)
     return names
+
+
+def _agent_disabled_toolsets(agent):
+    from toolsets import agent_disabled_toolsets
+    return agent_disabled_toolsets(agent)
 
 
 def _canonical_tool_name(function_name: str) -> str:
@@ -1728,7 +1734,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 skip_tool_execution_middleware=True,
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                disabled_toolsets=_agent_disabled_toolsets(agent),
             )
 
     return _SequentialDispatch(

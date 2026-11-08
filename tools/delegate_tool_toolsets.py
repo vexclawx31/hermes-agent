@@ -109,7 +109,8 @@ def _resolve_child_toolsets(
         child_toolsets = sorted(parent_toolsets) or DEFAULT_TOOLSETS
     child_toolsets = _strip_blocked_tools(child_toolsets)
 
-    raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
+    from toolsets import agent_disabled_toolsets
+    raw_parent_disabled = agent_disabled_toolsets(parent_agent)  # gates re-applied now (late plugins too)
     inherited_disabled = (
         [str(name) for name in raw_parent_disabled] if isinstance(raw_parent_disabled, (list, tuple, set)) else []
     )

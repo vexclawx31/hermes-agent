@@ -91,8 +91,18 @@ def test_unknown_platform_fails_closed(plugin_env):
     assert ceiling_blocked_toolsets(None, ceiling=ceiling) == sorted([PLUGIN_TS, OTHER_TS])
 
 
-def test_delegated_child_inherits_parent_ceiling(plugin_env):
-    assert ceiling_blocked_toolsets("subagent", ceiling={}) == []
+def test_platform_named_subagent_gets_no_exemption(plugin_env):
+    """Review finding: a client can set source "subagent"; the name alone must not lift the ceiling."""
+    assert ceiling_blocked_toolsets("subagent", ceiling={}) == sorted([PLUGIN_TS, OTHER_TS])
+
+
+def test_inherited_ceiling_platform_only_inside_delegation():
+    from hermes_cli.toolset_scope import ceiling_platform_for_new_agent, inherited_ceiling_platform
+
+    assert ceiling_platform_for_new_agent("subagent") == "subagent"
+    with inherited_ceiling_platform("slack"):
+        assert ceiling_platform_for_new_agent("subagent") == "slack"
+    assert ceiling_platform_for_new_agent("subagent") == "subagent"
 
 
 def test_alias_key_counts_and_aliases_of_blocked_are_blocked(plugin_env):
@@ -202,11 +212,89 @@ def test_delegate_child_inherits_parent_block(plugin_env, monkeypatch):
 
     _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"]}})
     parent_disabled = toolsets_mod.session_disabled_toolsets(None, "telegram")
-    parent = SimpleNamespace(enabled_toolsets=["web", PLUGIN_TS], disabled_toolsets=parent_disabled)
+    parent = SimpleNamespace(enabled_toolsets=["web", PLUGIN_TS], disabled_toolsets=parent_disabled,
+                             platform="telegram", _plugin_ceiling_platform="telegram")
     child_enabled, child_disabled = _resolve_child_toolsets(parent, [PLUGIN_TS, "web"], "leaf")
-    child_disabled = toolsets_mod.session_disabled_toolsets(child_disabled, "subagent")
+    child_disabled = toolsets_mod.session_disabled_toolsets(child_disabled, "subagent", "telegram")
     tools = model_tools._select_tool_names(child_enabled, child_disabled, quiet_mode=True)
     assert PLUGIN_TOOL not in tools
+
+
+def test_delegate_child_of_allowed_parent_keeps_plugin(plugin_env, monkeypatch):
+    from types import SimpleNamespace
+    from tools.delegate_tool_toolsets import _resolve_child_toolsets
+
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"]}})
+    parent = SimpleNamespace(enabled_toolsets=["web", PLUGIN_TS], platform="slack", _plugin_ceiling_platform="slack",
+                             disabled_toolsets=toolsets_mod.session_disabled_toolsets(None, "slack"))
+    child_enabled, child_disabled = _resolve_child_toolsets(parent, [PLUGIN_TS, "web"], "leaf")
+    child_disabled = toolsets_mod.session_disabled_toolsets(child_disabled, "subagent", "slack")
+    assert PLUGIN_TOOL in model_tools._select_tool_names(child_enabled, child_disabled, quiet_mode=True)
+
+
+def test_late_plugin_cannot_reach_bridge_or_children_before_refresh(plugin_env, monkeypatch):
+    """Review finding: disabled_toolsets is fixed at build; dispatch-time readers re-apply the gate."""
+    from types import SimpleNamespace
+
+    reg, keys = plugin_env
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"], OTHER_TS: ["slack"]}})
+    agent = SimpleNamespace(platform="slack", _plugin_ceiling_platform="slack", enabled_toolsets=None,
+                            disabled_toolsets=toolsets_mod.session_disabled_toolsets(None, "slack"))
+    reg.register(name="late_tool", toolset="ceillate", schema=_schema("late_tool"), handler=_handler)
+    keys.add("ceillate")
+    fresh = toolsets_mod.agent_disabled_toolsets(agent)
+    assert "ceillate" in fresh
+    assert "late_tool" not in model_tools._select_tool_names(None, fresh, quiet_mode=True)
+
+
+def test_refresh_reapplies_gate_without_override(plugin_env, monkeypatch):
+    from types import SimpleNamespace
+    from tools.mcp_tool_agent import _resolve_refresh_toolsets
+
+    reg, keys = plugin_env
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"], OTHER_TS: ["slack"]}})
+    agent = SimpleNamespace(platform="slack", _plugin_ceiling_platform="slack", enabled_toolsets=None,
+                            disabled_toolsets=["memory"])
+    reg.register(name="late_tool", toolset="ceillate", schema=_schema("late_tool"), handler=_handler)
+    keys.add("ceillate")
+    _enabled, disabled = _resolve_refresh_toolsets(agent, None, None)
+    assert "ceillate" in disabled and "memory" in disabled
+    assert agent.disabled_toolsets == disabled
+
+
+def test_mcp_toolset_is_never_blocked(plugin_env, monkeypatch):
+    reg, _keys = plugin_env
+    reg.register(name="mcp__srv_call", toolset="mcp-srv", schema=_schema("mcp__srv_call"), handler=_handler)
+    _use_config(monkeypatch, {"plugin_toolset_platforms": {}})
+    disabled = toolsets_mod.session_disabled_toolsets(None, "cron") or []
+    assert "mcp-srv" not in disabled
+    assert "mcp__srv_call" not in toolsets_mod.session_platform_tool_drops("cron")
+
+
+def test_two_profiles_do_not_share_a_ceiling(plugin_env, monkeypatch):
+    """The ceiling is read per call from the active profile's config: switching configs switches it."""
+    profiles = {"a": {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"]}}, "b": {}}
+    active = {"name": "a"}
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: profiles[active["name"]])
+    assert PLUGIN_TS in toolsets_mod.session_disabled_toolsets(None, "local")
+    active["name"] = "b"
+    assert PLUGIN_TS not in (toolsets_mod.session_disabled_toolsets(None, "local") or [])
+    active["name"] = "a"
+    assert PLUGIN_TS in toolsets_mod.session_disabled_toolsets(None, "local")
+
+
+def test_tools_save_keeps_choices_the_ceiling_hides(plugin_env, monkeypatch):
+    """Review finding: saving a platform must not rewrite plugin choices the checklist did not offer."""
+    saved = {}
+    monkeypatch.setattr(tc, "save_config", lambda cfg: saved.update(cfg))
+    cfg = {"plugin_toolset_platforms": {PLUGIN_TS: ["slack"], OTHER_TS: ["telegram"]},
+           "platform_toolsets": {"telegram": ["hermes-telegram", PLUGIN_TS]},
+           "known_plugin_toolsets": {"telegram": []}}
+    tc._save_platform_tools(cfg, "telegram", {"web", OTHER_TS})
+    assert PLUGIN_TS in saved["platform_toolsets"]["telegram"]  # hidden choice kept as saved
+    assert OTHER_TS in saved["platform_toolsets"]["telegram"]
+    assert PLUGIN_TS not in saved["known_plugin_toolsets"]["telegram"]  # not recorded as an untick
+    assert OTHER_TS in saved["known_plugin_toolsets"]["telegram"]
 
 
 def test_refresh_drops_late_registered_plugin_toolset(plugin_env, monkeypatch):
