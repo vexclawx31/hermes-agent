@@ -1528,12 +1528,6 @@ def _is_sudo_word(word: str) -> bool:
     return tail.lower() == "sudo"
 
 
-def _may_be_unresolved_sudo_word(raw: str, word: str) -> bool:
-    """Fail closed: a word whose spelling the detector cannot resolve (a brace or glob, or a ``$`` expansion
-    left after deobfuscation) but whose letters may spell sudo (``sudo{,}``, ``/usr/bin/su[d]o``)."""
-    return any(c in word for c in "{}*?[$") and _may_spell_sudo(raw)
-
-
 _SUDO_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -1573,12 +1567,19 @@ def _strip_redirections(tokens: list[str]) -> list[str]:
     return kept
 
 
+_SUDO_OPTION_WINDOW = 64
+
+
 def _sudo_privilege_flag(args: list[str], exhausted: str | None = None) -> str | None:
     """Return the finding description if sudo's OWN options (args after the sudo word, up to the
     command) include a gated flag. Option parsing stops at `--` or the first non-option word, so
     the target program's flags (`shasum -a`, `env -i`, `ln -s`) are never read as sudo's.
     `VAR=value` words may sit among sudo's options and do not end them. *exhausted* is returned when the
-    words end while still among sudo's options (``xargs sudo -n``: stdin supplies the rest, flags included)."""
+    words end while still among sudo's options (``xargs sudo -n``: stdin supplies the rest, flags included).
+    Only the first :data:`_SUDO_OPTION_WINDOW` words are read (linear over many sudo words); options that
+    reach that bound without a command fail closed."""
+    if len(args) > _SUDO_OPTION_WINDOW:
+        args, exhausted = args[:_SUDO_OPTION_WINDOW], _SUDO_PRIVILEGE_DESCRIPTION
     args = _strip_redirections(args)
     index = 0
     while index < len(args):
@@ -1630,6 +1631,30 @@ def _may_spell_sudo(command: str) -> bool:
     return True
 
 
+# A plain command has no quoting, escapes, expansions, globs, braces, subshells, comments or redirections:
+# only words and the separators ; & | (and newlines). The option parser reads exactly those; anything else
+# also gets the coarse rule below.
+_PLAIN_COMMAND_RE = re.compile(r"[A-Za-z0-9_./:=,@%+~\s;&|-]*")
+# sudo at a command-like position (start, after whitespace, a separator, `(`, a quote, `/` or `=`),
+# also spelled with a brace or glob suffix (`sudo{,}`).
+_SUDO_POSITION_RE = re.compile(r"(?i)(?:^|(?<=[\s;&|(`'\"/{=]))sudo(?=[\s)'\"`;&|{}\[*?]|$)")
+# Any option-looking word that may be a gated sudo flag: a bundle holding S/A/s/i/l, or the long forms.
+_SUDO_GATED_OPTION_RE = re.compile(r"(?<![^\s'\"=(`{;&|<>\\])-(?:-(?:st|as|sh|log|li)[A-Za-z-]*|[A-Za-z0-9]*[SAsil])")
+
+
+def _sudo_coarse_findings(command: str):
+    """For a command that is not plain (:data:`_PLAIN_COMMAND_RE`): fail closed when sudo appears at a command-like
+    position and any gated-looking option follows it anywhere. Shell syntax (redirections among sudo's options,
+    quoted or escaped operators, nested substitutions, xargs replacement words) can hide where sudo's own
+    options end; then any such flag needs a human. Linear: two regex scans."""
+    if _PLAIN_COMMAND_RE.fullmatch(command):
+        return
+    command = command.replace("\\\n", " ")  # a line continuation joins the words around it
+    match = _SUDO_POSITION_RE.search(command)
+    if match and _SUDO_GATED_OPTION_RE.search(command, match.end()):
+        yield _SUDO_PRIVILEGE_DESCRIPTION
+
+
 def _sudo_privilege_findings(command: str, depth: int = 0):
     """Yield a finding for each sudo invocation whose own options include a gated flag. sudo is any
     word that IS sudo (basename, any case: macOS filesystems are case-insensitive), at a command
@@ -1664,35 +1689,49 @@ def _sudo_privilege_findings(command: str, depth: int = 0):
                 yield _SUDO_PRIVILEGE_DESCRIPTION
             continue
         words = [_deobfuscate_shell_word_for_detection(t) for t in tokens]
-        xargs = False
+        xargs, replace, recursed = False, None, False
         for position, word in enumerate(words):
             name = os.path.basename(word)
-            if _is_sudo_word(word) or _may_be_unresolved_sudo_word(tokens[position], word):
-                # Behind xargs, stdin appends the rest of sudo's argv: options that run out are unknown.
-                finding = _sudo_privilege_flag(words[position + 1:], _SUDO_PRIVILEGE_DESCRIPTION if xargs else None)
+            if _is_sudo_word(word):
+                args = words[position + 1:]
+                if xargs:
+                    # Behind xargs, stdin supplies the rest of sudo's argv (options that run out are unknown), and
+                    # an -I/-J replacement word may become any of sudo's options.
+                    args = ["-S" if replace is not None and replace in arg else arg for arg in args]
+                finding = _sudo_privilege_flag(args, _SUDO_PRIVILEGE_DESCRIPTION if xargs else None)
                 if finding:
                     yield finding
             elif name == "xargs":
                 xargs = True
+                for index in range(position + 1, len(words)):
+                    arg = words[index]
+                    if arg in ("-I", "-J") and index + 1 < len(words):
+                        replace = words[index + 1]
+                    elif arg[:2] in ("-I", "-J") and len(arg) > 2:
+                        replace = arg[2:]
+                    elif arg.startswith("--replace"):
+                        replace = arg.partition("=")[2] or "{}"
+                    elif not arg.startswith("-"):
+                        break
+            elif recursed:
+                continue  # the first eval / env -S payload already holds the rest of the segment
             elif name == "eval":
-                # The payload is the rest of the segment: later words (another eval included) are scanned
-                # there, once. Recursing per eval word grew combinatorially (`eval eval ... sudo`).
+                # Once per segment: the payload is the rest of the segment, so a later eval is scanned inside
+                # it. Recursing per eval word grew combinatorially (`eval eval ... sudo`). The words after it
+                # are still scanned here too (`find ./eval ... -exec sudo -S ...`).
                 yield from _sudo_privilege_findings(" ".join(words[position + 1:]), depth + 1)
-                break
+                recursed = True
             elif name == "env":
                 # `env -S 'cmd args'` / `--split-string=...` re-splits its payload into a command.
-                split = False
                 for index in range(position + 1, len(words)):
                     arg = words[index]
                     if arg.startswith("--split-string") or (arg.startswith("-S") and not arg.startswith("--")):
                         payload = arg.partition("=")[2] if arg.startswith("--") else arg[2:]
                         yield from _sudo_privilege_findings(" ".join([payload, *words[index + 1:]]).strip(), depth + 1)
-                        split = True
+                        recursed = True
                         break
                     if not arg.startswith("-") and not _SUDO_ENV_ASSIGNMENT_RE.match(arg):
                         break
-                if split:
-                    break  # the payload holds the rest of the segment
 
 
 def _iter_shell_command_word_spans(command: str):
@@ -2112,6 +2151,9 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
                 yield description
         if only is None:  # the sudo option-grammar floor (#56) is not a content rule
             yield from _sudo_privilege_findings(command_variant)
+            yield from _sudo_coarse_findings(command_variant)
+    if only is None:  # also the command as written: the variants drop escapes (`-p x\&y` reads as plain there)
+        yield from _sudo_coarse_findings(command)
     if only is not None:
         # The variation-selector check is a content rule too, so the content-only scan keeps it.
         if _INVISIBLE_UNICODE_DESCRIPTION in only and _HIDDEN_VARIATION_SELECTOR_RE.search(command):
