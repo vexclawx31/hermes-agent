@@ -217,7 +217,8 @@ async def test_sessions_state_reports_and_interrupts_on_the_owner(monkeypatch, c
                     state["running"] = False  # the owner settled the interrupt
                 reply = {"result": snapshot()}
             else:
-                reply = {"result": {"status": "interrupted", "interrupted": True}}
+                # The real owner answers an accepted interrupt with the session handle (no status field).
+                reply = {"result": {"session_id": "rt-1", "execution_state": "running"}}
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": request["id"], **reply}))
 
     parser = argparse.ArgumentParser()
