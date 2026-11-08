@@ -589,7 +589,8 @@ def create_titled_session(title, launch=None, source=None):
     try:
         store = session_store()
         params.update(store.client_env())
-        snapshot = store.call("session.create", request_id=uuid.uuid4().hex, title=title, **params)
+        from hermes_cli.gateway_chat_view import run_request_id  # a retried run re-creates idempotently
+        snapshot = store.call("session.create", request_id=run_request_id("create"), title=title, **params)
     except GatewayClientError as exc:
         logger.warning("Failed to create titled session %r on the gateway: %s", title, exc)
         return None
