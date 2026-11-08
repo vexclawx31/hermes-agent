@@ -963,7 +963,27 @@ def _command_parser_limit_exceeded(command: str) -> bool:
     # Long separator-free input has no compound-command utility and makes every regex inspect one giant token.
     if len(command) > _MAX_SEPARATOR_FREE_COMMAND_CHARS and not any(char in command for char in ";&|\n"):
         return True
-    return sum(command.count(char) for char in ";&|\n") >= _MAX_DETECTION_SEGMENTS
+    if sum(command.count(char) for char in ";&|\n") >= _MAX_DETECTION_SEGMENTS:
+        return True
+    return _paren_nesting_depth(command) > _MAX_DETECTION_NESTING
+
+
+# Fork (release review): deeply nested `$(`/`(` made the variant and substitution scans super-linear (minutes for
+# under 1 KB) and raised RecursionError past ~375 levels, out of the detector into its callers. Real commands nest
+# a few levels; past this bound the command fails closed as a parser limit, like an over-long one.
+_MAX_DETECTION_NESTING = 32
+
+
+def _paren_nesting_depth(command: str) -> int:
+    """Deepest `(` nesting, ignoring quoting (an over-count only fails closed). Linear."""
+    depth = deepest = 0
+    for char in command:
+        if char == "(":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif char == ")" and depth:
+            depth -= 1
+    return deepest
 
 
 def _backtick_end_from(segment: str, i: int) -> int | None:
@@ -1651,8 +1671,33 @@ def _sudo_coarse_findings(command: str):
         return
     command = command.replace("\\\n", " ")  # a line continuation joins the words around it
     match = _SUDO_POSITION_RE.search(command)
-    if match and _SUDO_GATED_OPTION_RE.search(command, match.end()):
+    if match and (_SUDO_GATED_OPTION_RE.search(command, match.end()) or _sudo_options_hold_an_expansion(command, match.end())):
         yield _SUDO_PRIVILEGE_DESCRIPTION
+
+
+def _sudo_options_hold_an_expansion(command: str, start: int) -> bool:
+    """An expansion (`$`, a backtick) among sudo's own option words, or as the first word that would be its
+    command: what it expands to is unknown (`sudo -$(printf S) id`, `f=-S; sudo $f id`, `sudo "$@"`), so it may
+    be a gated flag. Words split on whitespace from the raw text; an option that takes a value skips it."""
+    skip = False
+    for word in command[start:].split():
+        if word[:1] in ";&|)\n":
+            return False  # the sudo command ended
+        if skip:
+            skip = False
+            continue
+        bare = word.strip("'\"")
+        if bare.startswith("-") and bare != "-":
+            if "$" in word or "`" in word:
+                return True
+            skip = bare in _SUDO_OPTIONS_WITH_ARG
+            if bare == "--":
+                return False
+            continue
+        if _SUDO_ENV_ASSIGNMENT_RE.match(bare):
+            continue
+        return "$" in word or "`" in word  # the first non-option word: sudo's command, or an unknown flag
+    return False
 
 
 def _sudo_privilege_findings(command: str, depth: int = 0):

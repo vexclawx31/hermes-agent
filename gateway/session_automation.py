@@ -500,11 +500,15 @@ def restore_producer_descriptor(event, descriptor, runner=None):
     if descriptor.get('control') is False:
         event.allow_gateway_control = False
     if descriptor.get('turn_author') is not None:
-        event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
         from agent.plugin_author import plugin_author_from_turn_author
-        if (author := plugin_author_from_turn_author(descriptor['turn_author'])) is not None:
-            event._plugin_author = author
-            event._bot_loop_admitted = True  # charged once, at dispatch
+        author = plugin_author_from_turn_author(descriptor['turn_author'])
+        if author is None:
+            # Fail closed (release review): a stored author that no longer re-validates must not run with the
+            # borrowed human's role and id in its place.
+            raise RuntimeStoreError('invalid_params')
+        event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
+        event._plugin_author = author
+        event._bot_loop_admitted = True  # charged once, at dispatch
     if descriptor.get('injected_turn') is not None:
         from gateway.injected_turn import restore_record
         restore_record(event, descriptor['injected_turn'], runner)

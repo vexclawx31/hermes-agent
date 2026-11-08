@@ -135,7 +135,9 @@ async def test_sigterm_cancels_a_spawner_run_and_only_a_spawner_run(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_a_stopped_run_is_interrupted_on_the_owner_until_it_stops():
+async def test_a_stopped_run_cancels_only_its_own_admissions_until_they_settle():
+    """Release review S2: the stop targets the run's admissions (prompt.cancel), never a bare
+    session.interrupt that would stop another spawner's turn the run is queued behind."""
     from hermes_cli.gateway_chat import _stop_run_on_owner
 
     class Client:
@@ -144,15 +146,21 @@ async def test_a_stopped_run_is_interrupted_on_the_owner_until_it_stops():
 
         async def rpc(self, method, **params):
             self.calls.append((method, params))
-            if method == "session.resume":
+            if method == "prompt.receipt":
                 self.polls += 1
-                return {"running": self.polls < 2}
-            return {"status": "interrupted"}
+                return {"status": "terminal" if self.polls > 1 else "started"}
+            return {"status": "terminal"}
 
     client = Client()
-    assert await _stop_run_on_owner(client, {"session_id": "rt-1", "stored_session_id": "local-abc"}) is True
-    assert client.calls[0] == ("session.interrupt", {"session_id": "rt-1"})
-    assert client.calls[-1] == ("session.resume", {"session_id": "local-abc"})
+    snapshot = {"session_id": "rt-1", "stored_session_id": "local-abc"}
+    assert await _stop_run_on_owner(client, snapshot, ["adm-mine"]) is True
+    assert client.calls[0] == ("prompt.cancel", {"session_id": "rt-1", "admission_id": "adm-mine"})
+    assert "session.interrupt" not in [method for method, _ in client.calls]
+    assert client.calls[-1] == ("prompt.receipt", {"session_id": "rt-1", "admission_id": "adm-mine"})
+
+    untouched = Client()
+    assert await _stop_run_on_owner(untouched, snapshot, []) is True  # nothing admitted: nothing to stop
+    assert untouched.calls == []
 
 
 def test_a_stopped_run_reports_interrupted_130(monkeypatch, capsys):
@@ -194,6 +202,7 @@ async def test_sessions_state_reports_and_interrupts_on_the_owner(monkeypatch, c
     def snapshot():
         pending = [{"admission_id": "adm-1", "status": "started", "outcome": None, "execution_generation": 3}]
         return {"session_id": "rt-1", "stored_session_id": "local-abc", "running": state["running"],
+                "execution_generation": 3,
                 "pending": pending if state["running"] else []}
 
     async def peer(ws):
@@ -229,4 +238,5 @@ async def test_sessions_state_reports_and_interrupts_on_the_owner(monkeypatch, c
         assert await asyncio.to_thread(run, "--interrupt", "--wait", "5") == 0
         shown = json.loads(capsys.readouterr().out)
         assert shown == {"session_id": "local-abc", "running": False, "pending": [], "interrupted": True}
-    assert ("session.interrupt", {"session_id": "rt-1"}) in calls  # the runtime id the owner answered with
+    # The runtime id the owner answered with, fenced to the generation that read saw.
+    assert ("session.interrupt", {"session_id": "rt-1", "execution_generation": 3}) in calls

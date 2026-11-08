@@ -55,3 +55,14 @@ def managed_runtime_detail(home: str | Path) -> str:
     label = f"profile '{name}'" if name else f"home '{home}'"
     return (f"{label}'s gateway is externally managed (gateway.{MANAGED_RUNTIME_KEY}: true); this client "
             "neither stops nor starts it. Restart it through its supervisor.")
+
+
+def refuse_manual_owner_change(home: str | Path, action: str) -> None:
+    """Exit 1 before a manual command stops or replaces the owner of a managed home (``gateway restart``'s
+    stop-and-respawn fallback, ``gateway run --replace``, and Desktop's/the updater's ``--detach`` restart):
+    stopping it first and then refusing the spawn would leave the managed gateway down."""
+    if not home_runtime_is_managed(home):
+        return
+    import sys
+    print(f"✗ {action} refused: {managed_runtime_detail(home)}", file=sys.stderr)
+    sys.exit(1)
