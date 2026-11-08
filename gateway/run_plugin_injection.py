@@ -86,9 +86,9 @@ class GatewayPluginInjectionMixin:
             agent_origin = turn is not None and turn.agent_origin
             source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id,
                                                 agent_origin=agent_origin)
-            # TRIAL NOTE: an agent-origin turn has no committed human message by design, so upstream's
-            # "continue a chat, never open one" check would always refuse it; it is skipped here and
-            # the authority path at dispatch decides (see trial-resolution.tsv: needs redesign).
+            # An agent-origin turn has no committed human message by design, so upstream's "continue a
+            # chat, never open one" check would always refuse it; its grant and the adapter's live
+            # check admit it instead, and the FIFO commits it on its own user-less source.
             if source is None or (not agent_origin and not self._plugin_origin_admissible(
                     source, plugin_home=plugin_home, plugin_id=plugin_id)):
                 return False
@@ -554,19 +554,29 @@ class GatewayPluginInjectionMixin:
         session_key = self._session_key_for_source(source)
         async with self._plugin_injection_scope(source):
             from gateway.session_authorities import active_authority
-            if active_authority(self) is not None:
+            authority = active_authority(self)
+            if authority is not None:
                 # The FIFO admits a producer turn only into a session that already holds a
                 # committed human turn (its connector provenance is borrowed, never minted), so
                 # an origin with no session yet is refused rather than run outside the FIFO.
-                # TRIAL NOTE: this also refuses every first agent-origin turn in a channel (fork #34/#35).
+                # An agent-origin turn (fork #34/#35) is the one exception: its destination was
+                # admitted above by the profile's explicit grant and the adapter's live check, it
+                # has no human to borrow from, and it runs on its own user-less source
+                # (``own_origin``), so it may open the route.
+                agent_origin = turn is not None and turn.agent_origin
                 entry = await self.async_session_store.lookup_by_session_key(session_key)
+                if entry is None and agent_origin:
+                    entry = await self._reserve_agent_origin_route(authority, source, session_key)
                 if entry is None:
                     logger.warning("Plugin message injection refused: plugin=%s %s has no session under "
                                    "the session authority yet", plugin_id, target)
+                    if resume is not None:
+                        resume[1]()
                     return False
                 return await self._admit_plugin_injection(
                     adapter, source, session_key=session_key, session_id=entry.session_id,
-                    content=content, plugin_id=plugin_id, author=author, turn=turn, resume=resume)
+                    content=content, plugin_id=plugin_id, author=author, turn=turn, resume=resume,
+                    plugin_home=plugin_home, own_origin=agent_origin)
             await adapter.handle_message(self._plugin_injection_event(
                 content=content, source=source, author=author, turn=turn, resume=resume,
                 # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
@@ -578,14 +588,34 @@ class GatewayPluginInjectionMixin:
         logger.info("Plugin message injection dispatched: plugin=%s %s session=%s", plugin_id, target, session_key)
         return True
 
+    async def _reserve_agent_origin_route(self, authority, source: SessionSource, session_key: str):
+        """Reserve the session entry an agent-origin turn opens, as native admission does for a first
+        human message (``SessionAuthority._reserve_route`` off the loop, then publish). Its entry."""
+        from functools import partial
+        from gateway.session_runtime_workers import tracked_write
+        from hermes_state_runtime import RuntimeStoreError
+        try:
+            authority._publish_route(source, *await tracked_write(authority, partial(authority._reserve_route, source)))
+        except RuntimeStoreError as exc:
+            logger.warning("Plugin message injection refused: agent-origin route %s not reserved (%s)",
+                           session_key, exc.reason)
+            return None
+        return await self.async_session_store.lookup_by_session_key(session_key)
+
     async def _admit_plugin_injection(
         self, adapter, source: SessionSource, *, session_key: str, session_id: str, content: str,
         plugin_id: str, author: Any = None, turn: Any = None, resume: Any = None,
+        plugin_home: Optional[Path] = None, own_origin: bool = False,
     ) -> Optional[bool]:
         """Under a session authority, commit the plugin turn into the session's durable FIFO as a
         trusted producer admission (the heartbeat / completion seam) instead of running it on the
         in-process lane beside an admitted turn. ``None`` means no authority serves this scope and
-        the caller keeps the standalone adapter path; a refused admission is ``False``, logged."""
+        the caller keeps the standalone adapter path; a refused admission is ``False``, logged.
+
+        The row carries the turn's host facts (``session_automation._producer_descriptor``): the
+        plugin author, ``control: False`` and the injected-turn context, so the drained event is
+        the same authored, non-control turn. A deferred receipt (*resume*) rides the row too, never a
+        finalizer on this transient event. ``own_origin``: an admitted agent-origin destination."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
         if authority is None:
@@ -596,18 +626,20 @@ class GatewayPluginInjectionMixin:
         identity = json.dumps(["plugin", plugin_id, session_key, uuid.uuid4().hex], separators=(",", ":"))
         metadata: dict[str, Any] = {"gateway_session_key": session_key, "gateway_session_id": session_id}
         if author is not None:
-            # Fork (#28/#34): the drain rebuilds the turn author from metadata["turn_author"]
-            # (gateway/session_ingress.py); the in-memory _plugin_author / turn context set by
-            # _plugin_injection_event do NOT survive a durable FIFO row (trial: needs redesign).
             metadata["turn_author"] = author.turn_author()
         event = self._plugin_injection_event(content=content, source=source, metadata=metadata,
-                                             author=author, turn=turn, resume=resume)
+                                             author=author, turn=turn)
+        if resume is not None and plugin_home is not None:
+            from gateway.injected_turn import mark_row_resume
+            mark_row_resume(event, resume[0], plugin_home)
         event.message_id = identity
         try:
-            await authority.admit_automation(adapter, event, identity)
+            await authority.admit_automation(adapter, event, identity, own_origin=own_origin)
         except RuntimeStoreError as exc:
             logger.warning("Plugin message injection refused by the session authority: plugin=%s session=%s (%s)",
                            plugin_id, session_key, exc.reason)
+            if resume is not None:
+                resume[1]()
             return False
         logger.info("Plugin message injection admitted: plugin=%s session=%s session_id=%s",
                     plugin_id, session_key, session_id)

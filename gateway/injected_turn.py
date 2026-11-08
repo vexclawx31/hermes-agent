@@ -119,6 +119,65 @@ def attach_to_event(event: Any, spec: TurnSpec, resume: Optional[tuple] = None) 
         weakref.finalize(event, release)
 
 
+_ROW_RESUME_ATTR = "_hermes_injected_turn_row_resume"
+_RECORD_FIELDS = frozenset({"plugin", "kind", "ref", "agent_origin", "resume"})
+
+
+def mark_row_resume(event: Any, receipt: str, home: Any) -> None:
+    """Host only, on the durable-FIFO path: the deferred receipt the host activated for this event rides its
+    admission row (``row_record``) instead of a finalizer on this transient event, which is dropped as soon as
+    the row commits; the restored event re-binds it (``restore_record``)."""
+    setattr(event, _ROW_RESUME_ATTR, {"id": str(receipt), "home": str(home)})
+
+
+def row_record(event: Any) -> Optional[dict]:
+    """The host-built injected-turn context of *event* as its durable admission row keeps it, or None."""
+    spec = spec_of_event(event)
+    if spec is None:
+        return None
+    record = {"plugin": spec.plugin_id, "kind": spec.kind, "ref": spec.ref, "agent_origin": spec.agent_origin}
+    resume = getattr(event, _ROW_RESUME_ATTR, None)
+    if isinstance(resume, dict) and not spec.agent_origin:
+        record["resume"] = dict(resume)
+    return record
+
+
+def restore_record(event: Any, record: Any, runner: Any = None) -> None:
+    """Re-attach a row's injected-turn context to the event restored from that row (the host's own commit of
+    this turn). Validated again exactly as ``build_turn_spec``; it needs the restored plugin author of the same
+    plugin. Anything else attaches nothing: the turn runs with no context, never a widened one."""
+    from agent.plugin_author import event_plugin_author, valid_plugin_key
+    author = event_plugin_author(event)
+    try:
+        if not isinstance(record, Mapping) or set(record) - _RECORD_FIELDS or not valid_plugin_key(record.get("plugin")):
+            raise ValueError("malformed injected-turn record")
+        if author is None or author.plugin != record["plugin"]:
+            raise ValueError("an injected-turn context needs the row's plugin author")
+        spec = build_turn_spec(record["plugin"], {"kind": record.get("kind"), "ref": record.get("ref"),
+                                                  "agent_origin": record.get("agent_origin", False)})
+    except (KeyError, ValueError):
+        import logging
+        logging.getLogger(__name__).warning("Injected-turn context on an admission row refused; the turn runs "
+                                            "without it")
+        return
+    resume = None
+    raw = record.get("resume")
+    if isinstance(raw, Mapping) and not spec.agent_origin and type(raw.get("id")) is str and type(raw.get("home")) is str:
+        from pathlib import Path
+        home = Path(raw["home"])
+        served = getattr(runner, "_served_profile_for_home", None) if runner is not None else None
+        if served is not None and served(home) is not None:
+            from gateway import deferred
+            receipt = raw["id"]
+            resume = (receipt, lambda: deferred.release_unredeemed(home, receipt))
+    # No finalizer (unlike ``attach_to_event``): preflight checks restore throwaway copies of the row, and
+    # dropping one must not release the receipt before the turn runs. The turn's end releases it
+    # (``InjectedTurn.revoke``); a row that never runs leaves it to gateway-start recovery.
+    setattr(event, _EVENT_ATTR, spec)
+    if resume is not None:
+        setattr(event, _RESUME_ATTR, resume)
+
+
 def spec_of_event(event: Any) -> Optional[TurnSpec]:
     spec = getattr(event, _EVENT_ATTR, None) if event is not None else None
     return spec if type(spec) is TurnSpec else None

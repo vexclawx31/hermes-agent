@@ -458,7 +458,86 @@ def committed_route_envelope(authority, entry):
     return envelope if envelope is not None and 'provenance' in envelope else None
 
 
-def snapshot_automation(authority, adapter, event, identity):
+def _producer_turn_author(raw):
+    """A plugin turn_author as the row keeps it: exactly what ``PluginAuthor.turn_author`` built
+    (``verified`` false, ``is_bot`` true, its own plugin's label), else refused. ``None`` for any
+    other author: a native automation row keeps none, as upstream (attribution then falls back to
+    ``row_turn_author``). Attribution only; it never grants anything."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get('origin') != 'plugin' and not str(raw.get('id') or '').lower().startswith('plugin:'):
+        return None
+    from agent.plugin_author import plugin_author_from_turn_author
+    author = plugin_author_from_turn_author(raw)
+    if author is None:
+        raise RuntimeStoreError('invalid_params')
+    return author.turn_author()
+
+
+def _producer_descriptor(event):
+    """What a native automation row keeps of its producer's host-set turn facts (fork #28/#34/#35):
+    the turn author, an input admitted without gateway control (``control: False``; restored as
+    such, so injected ``/new`` text never becomes a command once the row runs), and a host-built
+    injected-turn context. Nothing here is read from client input."""
+    extra = {}
+    if event.metadata.get('turn_author') is not None:
+        if (author := _producer_turn_author(event.metadata['turn_author'])) is not None:
+            extra['turn_author'] = author
+    if event.allow_gateway_control is not True:
+        extra['control'] = False
+    from gateway.injected_turn import row_record
+    if (record := row_record(event)) is not None:
+        author = extra.get('turn_author')
+        if author is None or author.get('plugin') != record['plugin']:
+            raise RuntimeStoreError('invalid_params')  # a context needs its own plugin's author
+        extra['injected_turn'] = record
+    return extra
+
+
+def restore_producer_descriptor(event, descriptor, runner=None):
+    """``restore_native``'s half of ``_producer_descriptor``: the restored event is the same
+    non-control, authored turn the producer admitted."""
+    if descriptor.get('control') is False:
+        event.allow_gateway_control = False
+    if descriptor.get('turn_author') is not None:
+        event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
+        from agent.plugin_author import plugin_author_from_turn_author
+        if (author := plugin_author_from_turn_author(descriptor['turn_author'])) is not None:
+            event._plugin_author = author
+            event._bot_loop_admitted = True  # charged once, at dispatch
+    if descriptor.get('injected_turn') is not None:
+        from gateway.injected_turn import restore_record
+        restore_record(event, descriptor['injected_turn'], runner)
+
+
+def _own_origin_envelope(authority, adapter, event, entry, identity):
+    """The envelope of a producer turn whose caller proved the destination itself (an agent-origin
+    plugin turn: ``gateway.agent_origin`` grant plus the adapter's live membership check) and so
+    borrows no human's committed source: it runs on its own user-less source, with connector
+    provenance derived server-side (``_binding``, what ``restore_provenance`` re-derives at the
+    drain). Never relayed, never carrying a user, message or bot identity."""
+    runner = authority.runner
+    source = event.source
+    if (source.user_id or source.user_id_alt or source.user_name or source.message_id or source.is_bot
+            or source.delivered_via_upstream_relay or source.role_authorized):
+        raise RuntimeStoreError('invalid_params')
+    owner = runner._transport_owner(source)
+    if owner is None or owner[0] is not adapter or runner._adapter_for_source(source) is not adapter:
+        raise RuntimeStoreError('not_found')
+    from gateway.session_ingress_context import _binding
+    bound, _home, _runtime_home, provenance = _binding(runner, source, owner[1])
+    if bound is not adapter or runner.session_store._generate_session_key(source) != entry.session_key:
+        raise RuntimeStoreError('admission_conflict')
+    encoded = source.to_dict()
+    encoded['is_bot'] = False
+    encoded.pop('message_id', None)
+    return {'source': encoded, 'route': entry.session_key,
+            'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
+            'event': {'message_id': identity}, 'provenance': provenance,
+            'automation': {'identity': identity, 'owner': authority.logical_owner(entry.session_id)}}
+
+
+def snapshot_automation(authority, adapter, event, identity, own_origin=False):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
@@ -470,7 +549,14 @@ def snapshot_automation(authority, adapter, event, identity):
     entry = _owner(runner, event, authority)
     from gateway.session_detached import detached_route_of
     if event.source.platform == Platform.LOCAL or detached_route_of(event.source):
+        if own_origin:
+            raise RuntimeStoreError('invalid_params')
         return snapshot_local_automation(authority, adapter, event, identity, entry)
+    producer = _producer_descriptor(event)
+    if own_origin:
+        envelope = _own_origin_envelope(authority, adapter, event, entry, identity)
+        envelope['automation'].update(notification | producer)
+        return {'text': event.text, 'native_text_v1': envelope}, entry
     from gateway.session_envelope import restore_native
     owner = authority.logical_owner(entry.session_id)
     envelope = committed_route_envelope(authority, entry)
@@ -501,7 +587,7 @@ def snapshot_automation(authority, adapter, event, identity):
         'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
         'event': {'message_id': identity}, 'provenance': provenance,
         'automation': {'identity': identity, 'owner': owner}}
-    envelope['automation'].update(notification)
+    envelope['automation'].update(notification | producer)
     if getattr(event, '_heartbeat_session_id', None):
         envelope['automation']['heartbeat'] = event._heartbeat_session_id
     identities = event.metadata.get('automation_identities')
@@ -602,13 +688,14 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
-async def admit_automation(authority, adapter, event, identity, replaces=None, fold=None):
+async def admit_automation(authority, adapter, event, identity, replaces=None, fold=None, own_origin=False):
     """``replaces``: a queued automation row of the same session this input supersedes (a liveness
     tick carrying the output of the one still waiting). Its cancellation commits in this admission's
     own transaction, so neither lands without the other. ``fold``: ``replaces`` is a completion this
-    batch absorbs (``_fold_queued``), given the tick admission ids it may sit behind."""
+    batch absorbs (``_fold_queued``), given the tick admission ids it may sit behind.
+    ``own_origin``: the caller admitted this destination itself (``_own_origin_envelope``)."""
     authority._require_admission_open()
-    payload, entry = snapshot_automation(authority, adapter, event, identity)
+    payload, entry = snapshot_automation(authority, adapter, event, identity, own_origin=own_origin)
     from gateway.session_authority import LiveSession
     sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
     ref = SessionRef(authority.profile_id, sid)

@@ -4210,12 +4210,14 @@ class SlackAdapter(BasePlatformAdapter):
         return False
 
     async def _thread_root_owner_and_mentions(
-        self, channel_id: str, thread_ts: str, team_id: str = "",
+        self, channel_id: str, thread_ts: str, team_id: str = "", chat_type: str = "",
     ) -> Tuple[str, bool]:
         """Return authenticated root ownership and whether this bot was directly mentioned.
 
         Ownership uses the exact workspace/channel/thread cache key. Unknown and foreign-bot
-        roots cannot inherit process-local markers or a persisted active session.
+        roots cannot inherit process-local markers or a persisted active session. A cache miss
+        fills the thread cache with the inbound *chat_type*'s sender verdicts (an MPIM is ``dm``),
+        as upstream's ``_bot_authored_thread_root`` probe does, so hydration can reuse it.
         """
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id) or ""
         if not thread_ts or not bot_uid:
@@ -4224,7 +4226,8 @@ class SlackAdapter(BasePlatformAdapter):
         cached = self._thread_context_cache.get(cache_key)
         if cached is None:
             await self._fetch_thread_context(
-                channel_id=channel_id, thread_ts=thread_ts, current_ts="", team_id=team_id)
+                channel_id=channel_id, thread_ts=thread_ts, current_ts="", team_id=team_id,
+                chat_type=chat_type)
             cached = self._thread_context_cache.get(cache_key)
         if cached is None:
             return "unknown", False
@@ -4258,7 +4261,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not event_thread_ts or not is_thread_reply:
             return False
         root_owner, directly_mentioned = await self._thread_root_owner_and_mentions(
-            channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id)
+            channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id, chat_type=chat_type)
         if root_owner == "self_bot" or directly_mentioned:
             if directly_mentioned and not self._slack_strict_mention():
                 self._register_mentioned_thread(event_thread_ts, team_id=team_id)
