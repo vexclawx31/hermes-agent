@@ -155,6 +155,7 @@ class TestReviewFindings:
         from tools import approval_detection as d
         keys = [desc for _, desc in d.DANGEROUS_PATTERNS]
         keys += [d._PARSER_LIMIT_DESCRIPTION, d._GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION]
+        keys += [d._SUDO_PRIVILEGE_DESCRIPTION, d._SUDO_COMBINED_PRIVILEGE_DESCRIPTION]
         for entry in approval_module.DEFAULT_HUMAN_REQUIRED:
             assert any(k == entry or k.startswith(entry + " (") for k in keys), entry
 
