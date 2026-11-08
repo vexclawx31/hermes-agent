@@ -122,6 +122,9 @@ class CanonicalSnapshotInfo(SessionInventoryFields):
     cwd: str | None = None
     edit_approval_policy: Literal['ask', 'workspace_session', 'session'] | None = None
     launch_request: dict[str, JsonValue] | None = None
+    # Fork (launch adapter): the caller's provenance label and what `-s` loaded ({loaded, missing}).
+    origin: str | None = None
+    launch_skills: dict[str, list[str]] | None = None
     reasoning_effort: str | None = None
     reasoning_effort_wire: str | None = None
     service_tier: str | None = None

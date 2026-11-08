@@ -156,7 +156,7 @@ class TestChatCFailLoudlyOnStderr:
 
         created = []
         monkeypatch.setattr(store_mod, "create_titled_session",
-                            lambda title: created.append(title) or "local-" + "a" * 64, raising=False)
+                            lambda title, **_launch: created.append(title) or "local-" + "a" * 64, raising=False)
         args = type(
             "Args",
             (),
