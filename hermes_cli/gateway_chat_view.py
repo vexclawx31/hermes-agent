@@ -675,14 +675,20 @@ def _launch_turn_author() -> dict:
     return {"turn_author": author} if author else {}
 
 
+def spawner_run():
+    """HERMES_CHAT_RUN_ID: a spawner's id for this one logical run (read once, then cleared from the env so a
+    tool's subprocess never inherits it), else None."""
+    import os
+    if "run" not in _LAUNCH_INPUTS:
+        _LAUNCH_INPUTS["run"] = os.environ.pop("HERMES_CHAT_RUN_ID", None) or None
+    return _LAUNCH_INPUTS["run"]
+
+
 def run_request_id(part: str) -> str:
     """A request identity for this run. HERMES_CHAT_RUN_ID (a spawner's stable id for one logical run)
     names the run's create (``part="create"``) and its first submit (``"submit"``), so a retried run is
     the same session and the same admission, never a second turn; anything else gets a fresh id."""
-    import os
-    if "run" not in _LAUNCH_INPUTS:
-        _LAUNCH_INPUTS["run"] = os.environ.pop("HERMES_CHAT_RUN_ID", None) or None
-    run = _LAUNCH_INPUTS["run"]
+    run = spawner_run()
     if run and part not in _LAUNCH_INPUTS:
         _LAUNCH_INPUTS[part] = True
         return f"{run}-{part}"

@@ -257,7 +257,74 @@ async def run_gateway_chat(args, emitter=None):
                 merged = isinstance(metadata, dict) and metadata.get(MODEL_ONLY_DISPLAY_METADATA_KEY)
                 if row.get("role") in {"user", "assistant"} and isinstance(row.get("content"), str) and not merged:
                     print(f"{row['role']}: {row['content']}")
-        return await view.run(query, oneshot=oneshot)
+        with _spawner_stop_on_term() as term:
+            try:
+                return await view.run(query, oneshot=oneshot)
+            except asyncio.CancelledError:
+                if not term.fired:
+                    raise
+                stopped = await _stop_run_on_owner(client, snapshot)
+                raise RunStopped(stopped) from None
+
+
+class RunStopped(Exception):
+    """Fork (launch adapter): a spawner stopped its run with SIGTERM; ``stopped`` is the owner's verdict."""
+
+    def __init__(self, stopped):
+        super().__init__("stopped" if stopped else "interrupt sent; still running")
+        self.stopped = stopped
+
+
+RUN_STOP_WAIT_SECONDS = 20.0
+
+
+class _TermGuard:
+    fired = False
+
+
+@contextlib.contextmanager
+def _spawner_stop_on_term():
+    """Fork (launch adapter): for a spawner-owned run (``HERMES_CHAT_RUN_ID``), SIGTERM stops the TURN, not
+    just this client: the run is cancelled here and interrupted on the gateway. Upstream's detach (the
+    turn keeps running) stays the behaviour of every other client and of Ctrl-C."""
+    import signal
+    from hermes_cli.gateway_chat_view import spawner_run
+    guard = _TermGuard()
+    if not spawner_run():
+        yield guard
+        return
+    loop, task = asyncio.get_running_loop(), asyncio.current_task()
+
+    def on_term():
+        guard.fired = True
+        task.cancel()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, on_term)
+    except (NotImplementedError, RuntimeError, ValueError):  # not the main thread / no signal support
+        yield guard
+        return
+    try:
+        yield guard
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
+async def _stop_run_on_owner(client, snapshot):
+    """``session.interrupt`` the run's session, then poll until the owner reports it is no longer running
+    (bounded). True when it stopped."""
+    import time
+    stored = snapshot["stored_session_id"]
+    try:
+        await client.rpc("session.interrupt", session_id=snapshot.get("session_id") or stored)
+        deadline = time.monotonic() + RUN_STOP_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            state = await client.rpc("session.resume", session_id=stored)
+            if not (state or {}).get("running"):
+                return True
+            await asyncio.sleep(0.5)
+    except GatewayClientError:
+        return False
+    return False
 
 
 _RESUME_POLICY_MISMATCH = "Resume retains gateway session policy; creation overrides are unsupported on resume."
@@ -407,6 +474,14 @@ def launch_from_args(args) -> int:
         # WebSocket errors can embed credential URLs/remote bodies.
         message = str(exc) if isinstance(exc, GatewayClientError) else "Gateway connection/read failed; no local fallback"
         return failed(message, 2 if isinstance(exc, GatewayClientError) and ("Unsupported" in message or "unsupported" in message) else 1)
+    except RunStopped as stop:
+        # Fork (launch adapter): the spawner's SIGTERM; the result is interrupted (130) either way, and
+        # stderr says whether the owner confirmed the turn stopped.
+        print("Stopped: the run's turn was interrupted on the gateway." if stop.stopped else
+              "Interrupt sent; the gateway still reported the turn running.", file=sys.stderr)
+        if emitter is not None:
+            return emitter.emit_result({"interrupted": True}, exit_code=130)
+        return 130
     except KeyboardInterrupt:
         print("Detached; accepted work continues at the gateway.", file=sys.stderr)
         if emitter is not None:

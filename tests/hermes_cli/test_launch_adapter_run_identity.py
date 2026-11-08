@@ -108,6 +108,79 @@ def test_titled_create_uses_the_run_id(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sigterm_cancels_a_spawner_run_and_only_a_spawner_run(monkeypatch):
+    import os
+    import signal
+
+    from hermes_cli.gateway_chat import _spawner_stop_on_term
+
+    async def run_until_term():
+        with _spawner_stop_on_term() as term:
+            try:
+                asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return term.fired
+        return None
+
+    monkeypatch.setenv("HERMES_CHAT_RUN_ID", "intake-7")
+    assert await asyncio.create_task(run_until_term()) is True
+    assert asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM) is False  # removed on exit
+
+    monkeypatch.setattr(gateway_chat_view, "_LAUNCH_INPUTS", {})
+    monkeypatch.delenv("HERMES_CHAT_RUN_ID", raising=False)
+    with _spawner_stop_on_term() as term:  # no run id: nothing is installed, upstream's detach stays
+        assert term.fired is False
+    assert asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM) is False
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_run_is_interrupted_on_the_owner_until_it_stops():
+    from hermes_cli.gateway_chat import _stop_run_on_owner
+
+    class Client:
+        def __init__(self):
+            self.calls, self.polls = [], 0
+
+        async def rpc(self, method, **params):
+            self.calls.append((method, params))
+            if method == "session.resume":
+                self.polls += 1
+                return {"running": self.polls < 2}
+            return {"status": "interrupted"}
+
+    client = Client()
+    assert await _stop_run_on_owner(client, {"session_id": "rt-1", "stored_session_id": "local-abc"}) is True
+    assert client.calls[0] == ("session.interrupt", {"session_id": "rt-1"})
+    assert client.calls[-1] == ("session.resume", {"session_id": "local-abc"})
+
+
+def test_a_stopped_run_reports_interrupted_130(monkeypatch, capsys):
+    from hermes_cli import gateway_chat
+
+    class Emitter:
+        def emit_result(self, payload, exit_code):
+            self.payload = payload
+            return exit_code
+
+    async def stopped(*_a, **_k):
+        raise gateway_chat.RunStopped(True)
+
+    from hermes_cli import gateway_chat_startup, stream_json
+
+    emitter = Emitter()
+    monkeypatch.setattr(stream_json, "StreamJsonEmitter", lambda **_kw: emitter)
+    monkeypatch.setattr(gateway_chat, "run_gateway_chat", stopped)
+    monkeypatch.setattr(gateway_chat, "validate_options", lambda _args: None)
+    monkeypatch.setattr(gateway_chat, "_register_terminal_process", lambda: None)
+    monkeypatch.setattr(gateway_chat_startup, "ensure_launch_provider", lambda _args: True)
+    args = argparse.Namespace(query="hi", q=None, oneshot=None, query_file=None, output_format="stream-json")
+    assert gateway_chat.launch_from_args(args) == 130
+    assert emitter.payload == {"interrupted": True}
+    assert "interrupted on the gateway" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
 async def test_sessions_state_reports_and_interrupts_on_the_owner(monkeypatch, capsys):
     from websockets.asyncio.server import serve
 
