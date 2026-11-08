@@ -1375,13 +1375,10 @@ class TestDetectSudoStdin:
     An LLM-driven agent has no TTY, so the sudo invocations that succeed
     without human interaction are those reading the password from stdin
     (-S / --stdin) or via an askpass helper (-A / --askpass). The
-    shell-launch (-s) and list-privileges (-a) flags are also gated since
-    they are privilege-relevant invocations the agent can chain after
-    acquiring the password.
-
-    `_normalize_command_for_detection` lowercases input before pattern
-    matching, so -S/-s and -A/-a are indistinguishable at the regex
-    layer; both letter-pairs are gated.
+    shell (-s), login-shell (-i) and list-privileges (-l) flags are also
+    gated since they are privilege-relevant invocations the agent can chain
+    after acquiring the password. Only sudo's OWN options count: see
+    test_sudo_gate_option_grammar.py.
     """
 
     def test_canonical_pipe_to_sudo_S_detected(self):
@@ -1393,12 +1390,8 @@ class TestDetectSudoStdin:
     def test_interactive_or_unrelated_sudo_safe(self):
         for cmd in (
             "sudo whoami",
-            "sudo -i",
-            "sudo -u root -i",
-            # `--set-home` / `--shell` share no prefix with `--stdin` beyond
-            # "--s", so the broadened `--st[a-z]*` pattern must not catch them.
+            # `--set-home` shares no prefix with `--stdin` beyond "--s".
             "sudo --set-home id",
-            "sudo --shell id",
             "man sudo",
             "which sudo",
             "echo SUDO_USER=$SUDO_USER",

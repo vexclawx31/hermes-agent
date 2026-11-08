@@ -459,15 +459,9 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
     # chmod +x then immediate run: the script content may hold dangerous commands individual patterns miss.
     (r'\bchmod\s+\+x\b.*[;&|]+\s*\./', "chmod +x followed by immediate execution"),
-    # Sudo stdin/askpass/shell/list-privs flags. The agent has no TTY, so sudo invocations that succeed
-    # non-interactively read the password from stdin (-S) or askpass (-A); -s (shell) and -a (list) are gated as
-    # privilege chains (read SUDO_PASSWORD from .env -> sudo -S -s). Plain `sudo cmd` is TTY-bound and excluded. Input
-    # is lowercased, so S/s and A/a collapse. Lazy `[^;|&\n]*?` allows flag args without spanning separators. sudo
-    # resolves unambiguous long-flag prefixes: `--stdin` is the only long option starting with "st", `--askpass` the
-    # only one starting with "a".
-    (r'\bsudo\b[^;|&\n]*?\s+(?:-s\b|--st[a-z]*\b|-a\b|--a[a-z]*\b)', "sudo with privilege flag (stdin/askpass/shell/list)"),
-    # Combined short-flag form (-nS, -sa, -las).
-    (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b', "sudo with combined-flag privilege escalation"),
+    # Sudo stdin/askpass/shell/login/list flags are NOT regex rules: a regex cannot tell sudo's own options
+    # from the target program's (`sudo -n /usr/bin/shasum -a 256 f`) or a path that merely contains "sudo"
+    # (`agent-sudo-scope --apply`). See _sudo_privilege_findings, which parses sudo's real option grammar.
     # Package-manager uninstall commands can remove installed software outside
     # the current project (notably `npm uninstall -g`). Treat their destructive
     # subcommands like other state-removing operations while leaving installs
@@ -494,6 +488,9 @@ _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS = frozenset({
 _REMOVED_PATTERN_KEY_ALIASES = {
     "script execution via -e/-c flag": "(python[23]?|perl|ruby|node)\\s+-[ec]\\s+",
     "script execution via heredoc": "(python[23]?|perl|ruby|node)\\s+<<",
+    # The sudo flag rules became a parser; their regex-derived legacy key was "sudo".
+    "sudo with privilege flag (stdin/askpass/shell/list)": "sudo",
+    "sudo with combined-flag privilege escalation": "sudo",
 }
 # description <-> legacy regex-derived key (the old approval key, kept for backwards compatibility
 # with stored allowlist/session entries), both ways.
@@ -608,7 +605,28 @@ _SIMPLE_SHELL_LITERAL_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _COMMAND_WRAPPER_WORDS = {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "builtin",
                           "nice", "timeout", "stdbuf", "ionice", "chrt", "taskset", "chroot"}
-_SUDO_OPTIONS_WITH_ARG = {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-u", "--user"}
+# sudo 1.9 option grammar (getopt "+Aa:BbC:c:D:Eeg:Hh::iKklNnPp:R:r:SsT:t:U:u:Vv"): option parsing stops at the
+# first non-option word, which is the command. `-h` takes only an attached value, so it never owns the next word.
+_SUDO_SHORT_WITH_ARG = frozenset("aCcDgpRrTtUu")
+_SUDO_LONG_OPTIONS = {
+    # long name -> (takes a required separate-or-= argument, short equivalent)
+    "askpass": (False, "A"), "auth-type": (True, "a"), "background": (False, "b"), "bell": (False, "B"),
+    "chdir": (True, "D"), "chroot": (True, "R"), "close-from": (True, "C"), "command-timeout": (True, "T"),
+    "edit": (False, "e"), "group": (True, "g"), "help": (False, "h"), "host": (True, "h"),
+    "list": (False, "l"), "login": (False, "i"), "login-class": (True, "c"), "no-update": (False, "N"),
+    "non-interactive": (False, "n"), "other-user": (True, "U"), "preserve-env": (False, "E"),
+    "preserve-groups": (False, "P"), "prompt": (True, "p"), "remove-timestamp": (False, "K"),
+    "reset-timestamp": (False, "k"), "role": (True, "r"), "set-home": (False, "H"), "shell": (False, "s"),
+    "stdin": (False, "S"), "type": (True, "t"), "user": (True, "u"), "validate": (False, "v"),
+    "version": (False, "V"),
+}
+# Gated: password from stdin (-S) or an askpass helper (-A), root shell (-s) or login shell (-i), and listing
+# privileges (-l). An agent has no TTY, so these are the sudo forms that chain into unattended root access.
+_SUDO_PRIVILEGE_SHORT = frozenset("SAsil")
+_SUDO_PRIVILEGE_DESCRIPTION = "sudo with privilege flag (stdin/askpass/shell/list)"
+_SUDO_COMBINED_PRIVILEGE_DESCRIPTION = "sudo with combined-flag privilege escalation"
+_SUDO_OPTIONS_WITH_ARG = {f"-{c}" for c in _SUDO_SHORT_WITH_ARG} | {"-h"} | {
+    f"--{name}" for name, (takes_arg, _) in _SUDO_LONG_OPTIONS.items() if takes_arg}
 # Adapted from embwl0x's command-position work in #76063. Option operands are
 # data, not executable positions; option spelling remains case-sensitive.
 _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
@@ -1248,6 +1266,69 @@ def _mask_quoted_newlines_span(command: str, start: int, end: int) -> str:
     return "".join(out)
 
 
+def _resolve_sudo_long_option(name: str) -> tuple[bool, str] | None:
+    """getopt_long semantics: an exact name or an unambiguous prefix. Unknown or ambiguous -> None
+    (sudo refuses to run)."""
+    if name in _SUDO_LONG_OPTIONS:
+        return _SUDO_LONG_OPTIONS[name]
+    matches = [spec for long_name, spec in _SUDO_LONG_OPTIONS.items() if long_name.startswith(name)]
+    return matches[0] if name and len(matches) == 1 else None
+
+
+def _sudo_privilege_flag(args: list[str]) -> str | None:
+    """Return the finding description if sudo's OWN options (args after the sudo word, up to the
+    command) include a gated flag. Option parsing stops at `--` or the first non-option word, so
+    the target program's flags (`shasum -a`, `env -i`, `ln -s`) are never read as sudo's."""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--" or not token.startswith("-") or token == "-":
+            return None
+        index += 1
+        if token.startswith("--"):
+            name, equals, _ = token[2:].partition("=")
+            spec = _resolve_sudo_long_option(name)
+            if spec is None:
+                return None  # sudo exits with a usage error; nothing runs
+            takes_arg, short = spec
+            if short in _SUDO_PRIVILEGE_SHORT:
+                return _SUDO_PRIVILEGE_DESCRIPTION
+            if takes_arg and not equals:
+                index += 1
+            continue
+        bundle = token[1:]
+        for position, char in enumerate(bundle):
+            if char in _SUDO_PRIVILEGE_SHORT:
+                return _SUDO_COMBINED_PRIVILEGE_DESCRIPTION if len(bundle) > 1 else _SUDO_PRIVILEGE_DESCRIPTION
+            if char in _SUDO_SHORT_WITH_ARG:
+                # The value is the rest of this token, or the next word when the option ends the token.
+                if position == len(bundle) - 1:
+                    index += 1
+                break
+            if char == "h":
+                break  # optional value, attached only
+    return None
+
+
+def _sudo_privilege_findings(command: str):
+    """Yield a finding for each sudo invocation at a real command position whose own options
+    include a gated flag. Mentions of "sudo" in paths, arguments or quoted prose are data."""
+    for segment in _iter_top_level_shell_segments(command):
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            if os.path.basename(_deobfuscate_shell_word_for_detection(word)) != "sudo":
+                continue
+            tokens = _shell_segment_tokens(segment, start)
+            if tokens is None:
+                # Malformed quoting: we cannot tell where sudo's options end, so fail closed on any
+                # option-looking word that could be a gated flag.
+                if re.search(r"\s-(?:-(?:st|as|sh|log|li)|[A-Za-z]*[SAsil])", segment[start:]):
+                    yield _SUDO_PRIVILEGE_DESCRIPTION
+                continue
+            finding = _sudo_privilege_flag([_deobfuscate_shell_word_for_detection(t) for t in tokens[1:]])
+            if finding:
+                yield finding
+
+
 def _iter_shell_command_word_spans(command: str):
     """Yield command-position words that may be executable names."""
     for pos in _iter_shell_command_starts(command):
@@ -1568,6 +1649,9 @@ def detect_dangerous_keys(command: str) -> list[str]:
                 hit = pattern_re.search(command_lower)
             if hit:
                 keys.append(description)
+        for description in _sudo_privilege_findings(command_variant):
+            if description not in keys:
+                keys.append(description)
     for description, _ in _execution_flag_findings(_normalize_command_for_detection(command)):
         if description not in keys:
             keys.append(description)
@@ -1595,6 +1679,8 @@ def detect_dangerous_command(command: str) -> tuple:
                     return (True, description, description)
             elif pattern_re.search(command_lower):
                 return (True, description, description)
+        for description in _sudo_privilege_findings(command_variant):
+            return (True, description, description)
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
         return (True, description, description)
