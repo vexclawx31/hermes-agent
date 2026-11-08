@@ -1235,8 +1235,8 @@ def compute_next_run(
         # wall clock for croniter, then re-attach the zone to the result, so
         # the wall-clock hour stays correct every calendar day, including DST
         # boundaries (morning-routine 09:00 America/Toronto).
-        # Fall back to the base's own zone only when nothing is configured.
-        zone = job_zone or get_timezone() or base_time.tzinfo
+        # Nothing configured: the host's DST rules, never a fixed offset (jobs_time.cron_zone).
+        zone = jobs_time.cron_zone(job_zone or get_timezone(), base_time, now)
         base_wall = base_time.astimezone(zone).replace(tzinfo=None)
         it = croniter(expr, base_wall)
         # Strictly-after guard for the DST fall-back hour (qwen-code#11723 class):
@@ -1250,11 +1250,11 @@ def compute_next_run(
         next_wall = it.get_next(datetime)
         for _ in range(2):
             for fold in (0, 1):
-                candidate = next_wall.replace(tzinfo=zone, fold=fold)
+                candidate = jobs_time.wall_clock_instant(next_wall, zone, fold)
                 if candidate.timestamp() > base_ts:
                     return candidate.isoformat()
             next_wall = it.get_next(datetime)
-        return next_wall.replace(tzinfo=zone).isoformat()
+        return jobs_time.wall_clock_instant(next_wall, zone).isoformat()
     return None
 
 

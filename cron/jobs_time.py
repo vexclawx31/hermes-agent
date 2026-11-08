@@ -20,7 +20,7 @@ the "job timezone east of the profile timezone silently never fires" failure. Se
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -129,6 +129,36 @@ def zone_for_job(job_or_timezone: Any) -> Optional[ZoneInfo]:
     except (ZoneInfoNotFoundError, ValueError) as exc:
         _warn_once(TIMEZONE_KEY, value, str(exc))
         return None
+
+
+def cron_zone(configured: Optional[ZoneInfo], base: datetime, now: datetime) -> Optional[tzinfo]:
+    """The zone whose RULES a cron slot is computed in; None means the host's local rules.
+
+    A job pin or the profile zone wins, then the base instant's own IANA zone. Otherwise the
+    Hermes clock is server-local (``datetime.now().astimezone()``): its FIXED offset has no
+    DST rules, and stamping it on a slot past a clock change fired the first run after it an
+    hour early (autumn) or late (spring), so the host's rules are used. A fixed offset that
+    is NOT the host's current one (a caller-supplied clock) is kept as-is, as before.
+    """
+    if configured is not None:
+        return configured
+    if isinstance(base.tzinfo, ZoneInfo):
+        return base.tzinfo
+    if now.utcoffset() == datetime.now().astimezone().utcoffset():
+        return None
+    return base.tzinfo
+
+
+def wall_clock_instant(wall: datetime, zone: Optional[tzinfo], fold: int = 0) -> datetime:
+    """Attach a naive cron wall clock to *zone* (``cron_zone``'s result) as an aware instant.
+
+    ``zone=None`` resolves the wall clock with the host's local rules per slot: naive
+    ``astimezone()`` honours ``fold`` with the same PEP 495 semantics as zoneinfo (a skipped
+    spring time shifts forward by the gap; fold=0 is the first of a repeated autumn time).
+    """
+    if zone is None:
+        return wall.replace(fold=fold).astimezone()
+    return wall.replace(tzinfo=zone, fold=fold)
 
 
 def grace_seconds_override(grace_minutes: Any) -> Optional[int]:
