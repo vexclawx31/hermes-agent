@@ -837,7 +837,7 @@ def _rewrite_resolved_hermes_home(command: str) -> str:
 
 
 _PARAM_REPLACEMENT_RE = re.compile(r"\$\{[^}/\s]+/[^}/]*/(?P<replacement>[^}]*)\}")
-_PARAM_DEFAULT_RE = re.compile(r"\$\{[^}:}\s]+:-(?P<default>[^}]*)\}")
+_PARAM_DEFAULT_RE = re.compile(r"\$\{[^}:=+\-\s]+:?[-=+](?P<default>[^}]*)\}")  # :- - := = :+ +
 _SIMPLE_SHELL_LITERAL_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _COMMAND_WRAPPER_WORDS = {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "builtin",
@@ -1138,10 +1138,14 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
         return None
 
 
-def _iter_top_level_shell_segments(command: str):
-    """Yield top-level command segments in one left-to-right pass."""
+def _iter_top_level_shell_segments(command: str, *, redirections: bool = False):
+    """Yield top-level command segments in one left-to-right pass. *redirections*: an ``&`` that is part of a
+    redirection operator (``2>&1``, ``>&2``, ``&>file``, ``<&0``) does not end the segment."""
     start = 0
     for kind, i, j, quote in _scan_shell(command, comments=True):
+        if redirections and kind == "char" and quote is None and command[i] == "&" and (
+                (i and command[i - 1] in "<>") or command.startswith(">", i + 1)):
+            continue
         if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
             if start < i:
                 yield command[start:i]
@@ -1516,33 +1520,66 @@ def _resolve_sudo_long_option(name: str) -> tuple[bool, str] | None:
     return next((spec for spec in matches if spec[1] in _SUDO_PRIVILEGE_SHORT), None) if name else None
 
 
-_SUDO_WORD_RE = re.compile(r"[$`(]*(?:.*/)?sudo[)`]*", re.IGNORECASE)
+def _is_sudo_word(word: str) -> bool:
+    """The word IS sudo: ``sudo``, ``/usr/bin/sudo``, ``$(which sudo)`` spellings (``[$`(]*(?:.*/)?sudo[)`]*``,
+    any case). String operations, not a regex: the overlapping prefix classes backtracked quadratically."""
+    word = word.rstrip(")`")
+    tail = word.rsplit("/", 1)[1] if "/" in word else word.lstrip("$`(")
+    return tail.lower() == "sudo"
+
+
 _SUDO_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
+_REDIRECT_FD_MARK = "\x00fd:"
+# An fd number is part of a redirection only when it starts a word and touches the operator (`2>x`, `2>&1`);
+# `-C 3 >x` keeps 3 as -C's value.
+_REDIRECT_FD_RE = re.compile(r"(?:(?<=\s)|^)(\d+)(?=[<>])")
+
+
+def _sudo_segment_tokens(segment: str) -> list[str] | None:
+    """:func:`_shell_segment_tokens` for the sudo parser: redirection operators (``>``, ``2>&1``, ``&>``,
+    ``>&``) lex as their own words, and an fd number touching one is marked so it is dropped with it."""
+    try:
+        lexer = shlex.shlex(_REDIRECT_FD_RE.sub(_REDIRECT_FD_MARK + r"\1", segment), posix=True,
+                            punctuation_chars="<>&")
+        lexer.whitespace_split, lexer.commenters = True, ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
 def _strip_redirections(tokens: list[str]) -> list[str]:
-    """Drop shell redirections (`2>/dev/null`, `</dev/stdin`, `>&2`): the shell removes them before
-    sudo sees its argv, wherever they appear among sudo's options."""
+    """Drop shell redirections (`2>/dev/null`, `</dev/stdin`, `>&2`, `2>&1`, `&>f`): the shell removes them
+    before sudo sees its argv, wherever they appear among sudo's options."""
     kept: list[str] = []
     skip_target = False
     for token in tokens:
         if skip_target:
             skip_target = False
             continue
-        if token and set(token) <= set("<>"):
-            if kept and kept[-1].isdigit():
-                kept.pop()  # fd number lexed as its own word (`2>` -> `2`, `>`)
+        if token.startswith(_REDIRECT_FD_MARK):
+            continue  # the fd of the operator that follows
+        if token and set(token) <= set("<>&") and any(c in token for c in "<>"):
             skip_target = True
             continue
         kept.append(token)
     return kept
 
 
-def _sudo_privilege_flag(args: list[str]) -> str | None:
+_SUDO_OPTION_WINDOW = 64
+
+
+def _sudo_privilege_flag(args: list[str], exhausted: str | None = None) -> str | None:
     """Return the finding description if sudo's OWN options (args after the sudo word, up to the
     command) include a gated flag. Option parsing stops at `--` or the first non-option word, so
     the target program's flags (`shasum -a`, `env -i`, `ln -s`) are never read as sudo's.
-    `VAR=value` words may sit among sudo's options and do not end them."""
+    `VAR=value` words may sit among sudo's options and do not end them. *exhausted* is returned when the
+    words end while still among sudo's options (``xargs sudo -n``: stdin supplies the rest, flags included).
+    Only the first :data:`_SUDO_OPTION_WINDOW` words are read (linear over many sudo words); options that
+    reach that bound without a command fail closed."""
+    if len(args) > _SUDO_OPTION_WINDOW:
+        args, exhausted = args[:_SUDO_OPTION_WINDOW], _SUDO_PRIVILEGE_DESCRIPTION
     args = _strip_redirections(args)
     index = 0
     while index < len(args):
@@ -1578,7 +1615,7 @@ def _sudo_privilege_flag(args: list[str]) -> str | None:
                 if position == len(bundle) - 1 and index < len(args) and not args[index].startswith("-"):
                     index += 1
                 break
-    return None
+    return exhausted
 
 
 def _may_spell_sudo(command: str) -> bool:
@@ -1594,6 +1631,30 @@ def _may_spell_sudo(command: str) -> bool:
     return True
 
 
+# A plain command has no quoting, escapes, expansions, globs, braces, subshells, comments or redirections:
+# only words and the separators ; & | (and newlines). The option parser reads exactly those; anything else
+# also gets the coarse rule below.
+_PLAIN_COMMAND_RE = re.compile(r"[A-Za-z0-9_./:=,@%+~\s;&|-]*")
+# sudo at a command-like position (start, after whitespace, a separator, `(`, a quote, `/` or `=`),
+# also spelled with a brace or glob suffix (`sudo{,}`).
+_SUDO_POSITION_RE = re.compile(r"(?i)(?:^|(?<=[\s;&|(`'\"/{=]))sudo(?=[\s)'\"`;&|{}\[*?]|$)")
+# Any option-looking word that may be a gated sudo flag: a bundle holding S/A/s/i/l, or the long forms.
+_SUDO_GATED_OPTION_RE = re.compile(r"(?<![^\s'\"=(`{;&|<>\\])-(?:-(?:st|as|sh|log|li)[A-Za-z-]*|[A-Za-z0-9]*[SAsil])")
+
+
+def _sudo_coarse_findings(command: str):
+    """For a command that is not plain (:data:`_PLAIN_COMMAND_RE`): fail closed when sudo appears at a command-like
+    position and any gated-looking option follows it anywhere. Shell syntax (redirections among sudo's options,
+    quoted or escaped operators, nested substitutions, xargs replacement words) can hide where sudo's own
+    options end; then any such flag needs a human. Linear: two regex scans."""
+    if _PLAIN_COMMAND_RE.fullmatch(command):
+        return
+    command = command.replace("\\\n", " ")  # a line continuation joins the words around it
+    match = _SUDO_POSITION_RE.search(command)
+    if match and _SUDO_GATED_OPTION_RE.search(command, match.end()):
+        yield _SUDO_PRIVILEGE_DESCRIPTION
+
+
 def _sudo_privilege_findings(command: str, depth: int = 0):
     """Yield a finding for each sudo invocation whose own options include a gated flag. sudo is any
     word that IS sudo (basename, any case: macOS filesystems are case-insensitive), at a command
@@ -1606,11 +1667,21 @@ def _sudo_privilege_findings(command: str, depth: int = 0):
         if re.search(r"(?i:\bsudo\b)", command):
             yield _SUDO_PRIVILEGE_DESCRIPTION  # fail closed past the nesting bound
         return
-    # Command substitutions run even inside double quotes (`echo "$(sudo -S id)"`).
-    for match in re.finditer(r"\$\(([^()]*)\)|`([^`]*)`", command):
-        yield from _sudo_privilege_findings(match.group(1) or match.group(2) or "", depth + 1)
-    for segment in _iter_top_level_shell_segments(command):
-        tokens = _shell_segment_tokens(segment, 0)
+    # Command substitutions run even inside double quotes (`echo "$(sudo -S id)"`). Balanced, outermost
+    # first (an inner one is inside its body, scanned by the recursion).
+    pos = 0
+    while (start := command.find("$(", pos)) >= 0:
+        end = _scan_dollar_paren_end(command, start)
+        if end is None:  # unbalanced: what runs is unknown
+            if re.search(r"(?i:sudo)", command[start:]):
+                yield _SUDO_PRIVILEGE_DESCRIPTION
+            break
+        yield from _sudo_privilege_findings(command[start + 2:end - 1], depth + 1)
+        pos = end
+    for match in re.finditer(r"`([^`]*)`", command):
+        yield from _sudo_privilege_findings(match.group(1), depth + 1)
+    for segment in _iter_top_level_shell_segments(command, redirections=True):
+        tokens = _sudo_segment_tokens(segment)
         if tokens is None:
             # Malformed quoting: we cannot tell where sudo's options end, so fail closed on any
             # option-looking word after a sudo word that could be a gated flag.
@@ -1618,14 +1689,38 @@ def _sudo_privilege_findings(command: str, depth: int = 0):
                 yield _SUDO_PRIVILEGE_DESCRIPTION
             continue
         words = [_deobfuscate_shell_word_for_detection(t) for t in tokens]
+        xargs, replace, recursed = False, None, False
         for position, word in enumerate(words):
             name = os.path.basename(word)
-            if _SUDO_WORD_RE.fullmatch(word):
-                finding = _sudo_privilege_flag(words[position + 1:])
+            if _is_sudo_word(word):
+                args = words[position + 1:]
+                if xargs:
+                    # Behind xargs, stdin supplies the rest of sudo's argv (options that run out are unknown), and
+                    # an -I/-J replacement word may become any of sudo's options.
+                    args = ["-S" if replace is not None and replace in arg else arg for arg in args]
+                finding = _sudo_privilege_flag(args, _SUDO_PRIVILEGE_DESCRIPTION if xargs else None)
                 if finding:
                     yield finding
+            elif name == "xargs":
+                xargs = True
+                for index in range(position + 1, len(words)):
+                    arg = words[index]
+                    if arg in ("-I", "-J") and index + 1 < len(words):
+                        replace = words[index + 1]
+                    elif arg[:2] in ("-I", "-J") and len(arg) > 2:
+                        replace = arg[2:]
+                    elif arg.startswith("--replace"):
+                        replace = arg.partition("=")[2] or "{}"
+                    elif not arg.startswith("-"):
+                        break
+            elif recursed:
+                continue  # the first eval / env -S payload already holds the rest of the segment
             elif name == "eval":
+                # Once per segment: the payload is the rest of the segment, so a later eval is scanned inside
+                # it. Recursing per eval word grew combinatorially (`eval eval ... sudo`). The words after it
+                # are still scanned here too (`find ./eval ... -exec sudo -S ...`).
                 yield from _sudo_privilege_findings(" ".join(words[position + 1:]), depth + 1)
+                recursed = True
             elif name == "env":
                 # `env -S 'cmd args'` / `--split-string=...` re-splits its payload into a command.
                 for index in range(position + 1, len(words)):
@@ -1633,6 +1728,7 @@ def _sudo_privilege_findings(command: str, depth: int = 0):
                     if arg.startswith("--split-string") or (arg.startswith("-S") and not arg.startswith("--")):
                         payload = arg.partition("=")[2] if arg.startswith("--") else arg[2:]
                         yield from _sudo_privilege_findings(" ".join([payload, *words[index + 1:]]).strip(), depth + 1)
+                        recursed = True
                         break
                     if not arg.startswith("-") and not _SUDO_ENV_ASSIGNMENT_RE.match(arg):
                         break
@@ -2055,6 +2151,9 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
                 yield description
         if only is None:  # the sudo option-grammar floor (#56) is not a content rule
             yield from _sudo_privilege_findings(command_variant)
+            yield from _sudo_coarse_findings(command_variant)
+    if only is None:  # also the command as written: the variants drop escapes (`-p x\&y` reads as plain there)
+        yield from _sudo_coarse_findings(command)
     if only is not None:
         # The variation-selector check is a content rule too, so the content-only scan keeps it.
         if _INVISIBLE_UNICODE_DESCRIPTION in only and _HIDDEN_VARIATION_SELECTOR_RE.search(command):
