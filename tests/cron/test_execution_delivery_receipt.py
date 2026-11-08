@@ -27,38 +27,42 @@ def _telegram_fixture(tmp_path, monkeypatch, *, fail_send=False):
     return sent
 
 
-def _use_external_worker(job, monkeypatch, *, patch_queue=True):
-    from cron import delivery_queue
-
+def _use_external_worker(job, monkeypatch):
     execution = executions.create_execution(job["id"], source="fixture")
     job["execution_id"] = execution["id"]
     monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", execution["id"])
-    if not patch_queue:
-        return
-    original_wait = delivery_queue.enqueue_and_wait
 
-    def drain_before_wait(execution_id, job, content, *, for_failure=False):
-        delivery_queue.enqueue(execution_id, job, content, for_failure=for_failure)
-        assert scheduler.drain_delivery_queue({}, None) == 1
-        return original_wait(execution_id, job, content, for_failure=for_failure)
 
-    monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_before_wait)
+def _drain():
+    """The gateway's housekeeping drain: every cron send goes through the durable queue (v0.23)."""
+    assert scheduler.drain_delivery_queue({}, None) == 1
 
 
 @pytest.mark.parametrize("external_worker", [False, True])
-def test_each_run_keeps_its_own_receipt(tmp_path, monkeypatch, external_worker):
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_each_run_keeps_its_own_receipt(tmp_path, monkeypatch, external_worker, drain_first):
+    """``drain_first``: the gateway settles the send before the run's own bookkeeping lands."""
     _telegram_fixture(tmp_path, monkeypatch)
     job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:fixture-chat")
+    if drain_first:
+        from cron import scheduler_bookkeeping
 
-    first_job = dict(job)
-    if external_worker:
-        _use_external_worker(first_job, monkeypatch)
-    scheduler.run_one_job(first_job)
-    second_job = dict(jobs.get_job(job["id"]))
-    second_job.pop("execution_id", None)
-    if external_worker:
-        _use_external_worker(second_job, monkeypatch, patch_queue=False)
-    scheduler.run_one_job(second_job)
+        finish = scheduler_bookkeeping.finish_completed_run
+
+        def drain_then_finish(*args, **kwargs):
+            _drain()
+            return finish(*args, **kwargs)
+
+        monkeypatch.setattr(scheduler_bookkeeping, "finish_completed_run", drain_then_finish)
+
+    for run in (dict(job), dict(jobs.get_job(job["id"]))):
+        run.pop("execution_id", None)
+        if external_worker:
+            _use_external_worker(run, monkeypatch)
+        scheduler.run_one_job(run)
+        if not drain_first:
+            assert executions.latest_execution(job["id"])["delivery_outcome"] == "queued"
+            _drain()
 
     newest, older = executions.list_executions(job_id=job["id"], limit=10)
     assert newest["id"] != older["id"]
@@ -73,35 +77,48 @@ def test_each_run_keeps_its_own_receipt(tmp_path, monkeypatch, external_worker):
 
 
 def test_queued_failed_send_never_borrows_an_earlier_runs_ids(tmp_path, monkeypatch):
-    """Worker path: the gateway's send crashed, so this run posted nothing. The job record still
+    """The gateway's queued send crashed, so this run posted nothing. The job record still
     holds the previous run's ids (last writer wins); the receipt must not report them."""
-    from cron import delivery_queue
-
     _telegram_fixture(tmp_path, monkeypatch)
     job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:fixture-chat")
     jobs.update_job(job["id"], {"last_delivery_message_ids": {"telegram:fixture-chat": ["earlier-run"]}})
     run = dict(jobs.get_job(job["id"]))
-    _use_external_worker(run, monkeypatch, patch_queue=False)
-    original_wait = delivery_queue.enqueue_and_wait
+    _use_external_worker(run, monkeypatch)
 
-    def crash(queued_job, _content, _for_failure):
+    async def crash(_platform, _pconfig, _chat_id, _text, **_kwargs):
         # Another run of the job posts meanwhile: the job record now names ITS ids.
-        jobs.update_job(queued_job["id"], {"last_delivery_message_ids": {"telegram:fixture-chat": ["other-run"]}})
+        jobs.update_job(job["id"], {"last_delivery_message_ids": {"telegram:fixture-chat": ["other-run"]}})
         raise RuntimeError("gateway send crashed")
 
-    def drain_with_crash(execution_id, job, content, *, for_failure=False):
-        delivery_queue.enqueue(execution_id, job, content, for_failure=for_failure)
-        assert delivery_queue.drain(crash) == 1
-        return original_wait(execution_id, job, content, for_failure=for_failure)
-
-    monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_with_crash)
     scheduler.run_one_job(run)
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", crash)
+    _drain()
 
     row = executions.latest_execution(job["id"])
+    assert row["id"] == run["execution_id"]
     assert row["delivery_outcome"] == "failed"
     assert row["delivery_message_ids"] is None
     assert row["delivery_targets"] == ["telegram:fixture-chat"]
     assert "gateway send crashed" in row["delivery_error"]
+
+
+def test_run_that_delivers_nothing_leaves_no_current_receipt(tmp_path, monkeypatch):
+    _telegram_fixture(tmp_path, monkeypatch)
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:fixture-chat")
+    scheduler.run_one_job(dict(job))
+    _drain()
+    assert jobs.get_job(job["id"])["last_delivery_message_ids"] == {"telegram:fixture-chat": ["msg-1"]}
+
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "raw output", scheduler.SILENT_MARKER, None))
+    scheduler.run_one_job(dict(jobs.get_job(job["id"])))
+
+    stored = jobs.get_job(job["id"])
+    assert stored["last_delivery_message_ids"] is None and stored.get("last_delivery_queued") is None
+    silent, delivered = executions.list_executions(job_id=job["id"], limit=10)
+    assert silent["delivery_outcome"] == "suppressed"
+    assert silent["delivery_targets"] is None and silent["delivery_message_ids"] is None
+    assert delivered["delivery_message_ids"] == {"telegram:fixture-chat": ["msg-1"]}
 
 
 def _slack_live_delivery(job, *, extra, opened_thread=None):
@@ -188,7 +205,9 @@ def test_lost_claim_after_delivery_keeps_the_receipt(monkeypatch, tmp_path):
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *args, **kwargs: False)
     monkeypatch.setattr(scheduler, "self_removal_delivery_allowed", lambda _job_id: False)
 
-    assert scheduler._finish_completed_run(d, "owner-1", row["id"]) is True
+    from cron.scheduler_bookkeeping import finish_completed_run
+
+    assert finish_completed_run(d, "owner-1", row["id"]) is True
     done = executions.get_execution(row["id"])
     assert done["error"] == "Fire claim ownership lost before terminal completion."
     assert done["delivery_message_ids"] == {"telegram:42": ["m1"]}
@@ -247,6 +266,7 @@ def test_failed_delivery_records_target_and_error(tmp_path, monkeypatch):
     job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:fixture-chat")
 
     scheduler.run_one_job(job)
+    _drain()
 
     row = executions.latest_execution(job["id"])
     assert row["delivery_outcome"] == "failed"
