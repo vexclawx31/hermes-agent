@@ -799,7 +799,10 @@ export function inboundReadReceiptKeys({ key, enabled }) {
 }
 
 // proto.WebMessageInfo.Status values (Baileys). PENDING is our own local state, never a receipt.
-const DELIVERY_STATUS_NAMES = { 0: 'error', 2: 'server_ack', 3: 'delivered', 4: 'read', 5: 'played' };
+// The names of the delivery_status events the adapter logs ('delivered' for 3). Not the fork's
+// DELIVERY_STATUS_NAMES above (the per-send status store reports 3 as 'delivery_ack'): the two
+// vocabularies serve different callers, and one module cannot declare the same name twice.
+const RECEIPT_EVENT_STATUS_NAMES = { 0: 'error', 2: 'server_ack', 3: 'delivered', 4: 'read', 5: 'played' };
 const RECEIPT_TIMESTAMP_STATUS = [
   ['playedTimestamp', 'played'], ['readTimestamp', 'read'], ['receiptTimestamp', 'delivered'],
 ];
@@ -822,7 +825,7 @@ export function deliveryStatusEvent({ key, update, receipt, isOwnSend }) {
     at = Number(receipt[hit[0]]) || 0;
     recipientId = normalizeWhatsAppId(receipt.userJid || '');
   } else {
-    status = DELIVERY_STATUS_NAMES[update?.status];
+    status = RECEIPT_EVENT_STATUS_NAMES[update?.status];
     if (!status) return null;
     at = Number(update.messageTimestamp) || 0;
   }
