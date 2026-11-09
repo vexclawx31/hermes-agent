@@ -772,7 +772,10 @@ class GatewayAuthorizationMixin:
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
         # Per-group sender rules (WhatsApp ``groups.<id>.allow_from``) are authoritative for group turns:
         # re-check this sender on the live adapter before allow-all, chat-scoped and env allowlist grants.
-        if is_group and allow_adapter_delegation:
+        # Not gated by ``allow_adapter_delegation``: the verdict is the live adapter's own operator policy
+        # read fresh here, never a caller-supplied flag, so durable native admission (delegation off)
+        # reaches the same verdict inbound did. The caller-flag grants below stay delegation-gated.
+        if is_group:
             sender_rules = self._adapter_group_sender_verdict(source, source.user_id, adapter_profile)
             if sender_rules is not None:
                 return sender_rules
