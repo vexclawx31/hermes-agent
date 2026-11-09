@@ -498,7 +498,9 @@ class PluginContext(PluginCapabilityCtxMixin):
     ) -> dict[str, Any]:
         """Call ``tool`` on MCP ``server`` synchronously through :mod:`tools.mcp_tool`'s native client
         (same trust gates, breaker, reconnect — never a parallel connection). Servers not in
-        ``plugins.entries.<plugin_id>.mcp_allowlist`` raise ``PermissionError`` (default-deny). ``timeout``
+        ``plugins.entries.<plugin_id>.mcp_allowlist`` raise ``PermissionError`` (default-deny), and so
+        do tool names the connection does not advertise or that the model-facing
+        ``mcp_servers.<server>.tools.include``/``exclude`` hides (fail-closed). ``timeout``
         clamps to 1–600s; results over ~64KB are truncated with a marker.
 
         This is a per-server grant, deliberately not ambient authority over every configured server.
@@ -511,6 +513,12 @@ class PluginContext(PluginCapabilityCtxMixin):
                 f"server {server!r}. Add it to "
                 f"plugins.entries.{self.plugin_id}.mcp_allowlist in config.yaml "
                 f"to grant access (default is no MCP access)."
+            )
+        if not self._mcp_tool_visible(server, tool):
+            raise PermissionError(
+                f"Plugin {self.manifest.name!r} may not call MCP tool {tool!r} on "
+                f"server {server!r}: the connected server does not advertise it, or "
+                f"mcp_servers.{server}.tools.include/exclude hides it from the model."
             )
         try:
             timeout = float(timeout)
@@ -546,6 +554,38 @@ class PluginContext(PluginCapabilityCtxMixin):
         else:
             envelope = {"ok": True, "result": parsed if parsed is not None else raw}
         return {**envelope, "truncated": True} if truncated else envelope
+
+    @staticmethod
+    def _mcp_tool_visible(server: str, tool: str) -> bool:
+        """The model's view of ``server``: ``tool`` must be a name its resolved connection
+        advertises (exact, case-sensitive) that passes the ``tools.include``/``exclude``
+        filter of the config that connection was registered with. A live connection uses its
+        own ``_tools``/``_config``; a lazy one its registered config and schema-cache entry.
+        Anything unresolvable (no connection, no cache entry, an error) -> hidden."""
+        try:
+            from tools.mcp_tool_common import _core
+            from tools.mcp_tool_scope import _resolve_server_key
+            from tools.mcp_schema_cache import get_cached_entry, tools_from_cache_entry
+            from tools import mcp_tool_registration as _registration
+            with _core._lock:
+                key = _resolve_server_key(server)
+                live = _core._servers.get(key)
+                lazy_config = _core._lazy_server_configs.get(key)
+                fingerprint = _core._lazy_server_fingerprints.get(key)
+            config = getattr(live, "_config", None)
+            names = [getattr(t, "name", None) for t in getattr(live, "_tools", None) or ()]
+            if not names and lazy_config is not None and fingerprint:
+                entry = get_cached_entry(server, fingerprint)
+                config = lazy_config
+                names = [t.get("name") for t in tools_from_cache_entry(entry or {})
+                         if isinstance(t, dict)]
+            if not isinstance(config, dict) or not isinstance(tool, str) or tool not in names:
+                return False
+            return bool(_registration._make_tool_filter(server, config)(tool))
+        except Exception as exc:
+            logger.warning("MCP tool filter for %s/%s failed (%s); refusing the call",
+                           server, tool, exc)
+            return False
 
     @staticmethod
     def _mcp_allowlist(plugin_id: str) -> list[str]:

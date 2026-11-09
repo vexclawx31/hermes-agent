@@ -24,6 +24,10 @@ class _Server:
     def __init__(self):
         self.session = _Session()
         self._rpc_lock = asyncio.Lock()
+        # What a real connection records at connect time; ``ctx.call_mcp`` only reaches
+        # advertised tools that pass the connection's tools.include/exclude.
+        self._config = {}
+        self._tools = [SimpleNamespace(name='echo', description='')]
 
 
 _ensure_mcp_loop()
