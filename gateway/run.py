@@ -3777,13 +3777,19 @@ class GatewayRunner(
             return "default"
 
     def _is_user_authorized_for_source(
-        self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
+        self, source: SessionSource, *, allow_adapter_delegation: bool = True,
+        fresh_group_sender_rules: bool = False) -> bool:
         """Authorize under the live transport's profile, not the routed runtime (which need not copy the
-        shared bot token/allowlist); the transport home is stamped on the source for this read only."""
+        shared bot token/allowlist); the transport home is stamped on the source for this read only.
+        ``fresh_group_sender_rules`` (durable native admission only) applies the live adapter's per-group
+        sender verdict with delegation off; see ``_principal_authorized``."""
         def _check() -> bool:
-            # Keep the one-argument seam used by plugins/tests; pass the keyword only when disabling.
+            # Keep the one-argument seam used by plugins/tests; pass keywords only when needed.
             if allow_adapter_delegation:
                 return self._is_user_authorized(source)
+            if fresh_group_sender_rules:
+                return self._is_user_authorized(
+                    source, allow_adapter_delegation=False, fresh_group_sender_rules=True)
             return self._is_user_authorized(source, allow_adapter_delegation=False)
 
         return self._under_authorization_profile(source, _check)

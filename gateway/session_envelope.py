@@ -162,7 +162,10 @@ def _validate_native(runner, event, provenance=None, fresh_roles=False):
         # re-check denied what the inbound filter had just accepted (#139199).
         delegated = runner._adapter_flag(
             source.platform, "authorization_is_upstream", runner._adapter_profile_for_source(source))
-    if not runner._is_user_authorized_for_source(source, allow_adapter_delegation=delegated):
+    # The source is the platform event the adapter admitted (or its stored row on replay via
+    # ``check_native_route``), so the live adapter's per-group sender rules are rechecked fresh here.
+    if not runner._is_user_authorized_for_source(
+            source, allow_adapter_delegation=delegated, fresh_group_sender_rules=True):
         _refuse(event, 'permission_denied', 'user_not_authorized')
     for name in ('channel_prompt', 'channel_context', 'reply_anchor_override'):
         if getattr(event, name) is not None and not isinstance(getattr(event, name), str):

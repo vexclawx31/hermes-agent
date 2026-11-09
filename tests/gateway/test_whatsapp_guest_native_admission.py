@@ -5,7 +5,9 @@ gateway, then the durable re-check in ``session_envelope._validate_native`` refu
 ``permission_denied`` / ``user_not_authorized``: ordinary native input runs with
 ``allow_adapter_delegation=False`` and the per-group sender verdict was skipped, so the check fell
 to principal allowlists that never hold guests. The verdict is the live adapter's own operator
-policy read fresh at admission time, so it now runs with delegation off too; every caller-flag
+policy read fresh at admission time, so durable native admission and its stored-row replay
+(``fresh_group_sender_rules=True``) now apply it with delegation off; callers that choose their own
+identity (plugin injection) and the role-reauthorization shortcut do not. Every caller-flag
 grant (``role_authorized``, ``delivered_via_upstream_relay``, ``enforces_own_access_policy``,
 ``authorization_is_upstream``) stays delegation-gated.
 """
@@ -87,8 +89,18 @@ async def _admit(runner, authority, event):
 
     with native_callback(runner, event, get_hermes_home()):
         receipt = await authority.admit_native(event)
+    _admit.last_session_id = receipt.ref.session_id
     return list_session_admissions(authority.db, session_id=receipt.ref.session_id,
                                    pending_only=False)[-1]["payload"]
+
+
+def _provenance(runner, event):
+    """Connector provenance captured the way ``prepare_native`` does, for a clean event."""
+    from gateway.session_ingress_context import capture_provenance, native_callback
+    from hermes_constants import get_hermes_home
+
+    with native_callback(runner, event, get_hermes_home()):
+        return capture_provenance(runner, event)
 
 
 # --- 1. adapter allows -> durable native admits ---------------------------------------------
@@ -138,20 +150,87 @@ async def test_changed_group_allow_from_admits_only_the_newly_listed_guest(tmp_p
     assert payload["native_text_v1"]["source"]["user_id"] == OTHER_GUEST
 
 
-@pytest.mark.parametrize("stale", ["role_authorized", "delivered_via_upstream_relay", "authorization_is_upstream"])
 @pytest.mark.asyncio
-async def test_stale_fields_cannot_stand_in_for_a_revoked_rule(tmp_path, monkeypatch, stale):
+async def test_stale_role_delegation_cannot_stand_in_for_a_revoked_rule(tmp_path, monkeypatch):
+    """A stale ``role_authorized`` that somehow arrived with ``fresh_roles`` (delegation on) still
+    meets the per-group sender verdict first: refused at authorization."""
+    from gateway.session_envelope import _validate_native
+
     runner, adapter = _setup(tmp_path, monkeypatch, guest_group_allow=(OWNER,))
-    authority = await _authority(runner, monkeypatch, f"wa-guest-stale-{stale}")
+    await _authority(runner, monkeypatch, "wa-guest-stale-fresh-roles")
+    event = _event(_source(adapter, GUEST))
+    provenance = _provenance(runner, event)
+    event.source.role_authorized = True
+    with pytest.raises(RuntimeStoreError, match="permission_denied") as refused:
+        _validate_native(runner, event, provenance, fresh_roles=True)
+    assert refused.value.field == "user_not_authorized"
+
+
+@pytest.mark.asyncio
+async def test_stale_role_flag_on_full_path_is_refused(tmp_path, monkeypatch):
+    """Full path: ``reauthorize_roles`` finds no direct grant and WhatsApp has no connector role
+    check, so it refuses with ``permission_denied`` before ``_validate_native``."""
+    runner, adapter = _setup(tmp_path, monkeypatch, guest_group_allow=(OWNER,))
+    authority = await _authority(runner, monkeypatch, "wa-guest-stale-role")
     source = _source(adapter, GUEST)
-    if stale == "authorization_is_upstream":
-        vars(source)[stale] = True  # a declaration stamped on the source; only the adapter is read
-    else:
-        setattr(source, stale, True)
-    with pytest.raises(RuntimeStoreError) as refused:
+    source.role_authorized = True
+    with pytest.raises(RuntimeStoreError, match="permission_denied"):
         await _admit(runner, authority, _event(source))
-    # A relay flag without a relay delivery fails provenance capture (``not_found``) before validation.
-    assert refused.value.args[0] in {"permission_denied", "invalid_params", "not_found"}
+
+
+@pytest.mark.asyncio
+async def test_adapter_authorization_is_upstream_cannot_override_a_revoked_rule(tmp_path, monkeypatch):
+    """The adapter-level ``authorization_is_upstream`` (where ``_adapter_flag`` reads it) turns
+    delegation on, but the per-group sender verdict runs before that grant, so the rule decides."""
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    runner, adapter = _setup(tmp_path, monkeypatch, guest_group_allow=(OWNER,))
+    monkeypatch.setattr(WhatsAppAdapter, "authorization_is_upstream", True, raising=False)
+    assert runner._adapter_flag(Platform.WHATSAPP, "authorization_is_upstream", None) is True
+    authority = await _authority(runner, monkeypatch, "wa-guest-stale-upstream")
+    with pytest.raises(RuntimeStoreError, match="permission_denied") as refused:
+        await _admit(runner, authority, _event(_source(adapter, GUEST)))
+    assert refused.value.field == "user_not_authorized"
+
+
+@pytest.mark.asyncio
+async def test_stale_relay_flag_is_refused_before_authorization(tmp_path, monkeypatch):
+    """By design a relay flag without a relay delivery never reaches authorization: provenance
+    capture refuses it on the full path, and validation refuses it without relay provenance."""
+    from gateway.session_envelope import _validate_native
+
+    runner, adapter = _setup(tmp_path, monkeypatch, guest_group_allow=(OWNER,))
+    authority = await _authority(runner, monkeypatch, "wa-guest-stale-relay")
+    source = _source(adapter, GUEST)
+    source.delivered_via_upstream_relay = True
+    with pytest.raises(RuntimeStoreError, match="not_found|permission_denied"):
+        await _admit(runner, authority, _event(source))
+    event = _event(_source(adapter, GUEST))
+    provenance = _provenance(runner, event)
+    event.source.delivered_via_upstream_relay = True
+    with pytest.raises(RuntimeStoreError, match="invalid_params") as refused:
+        _validate_native(runner, event, provenance)
+    assert refused.value.field == "upstream_relay_without_provenance"
+
+
+@pytest.mark.asyncio
+async def test_stored_row_replay_rechecks_the_live_rule(tmp_path, monkeypatch):
+    """``check_native_route`` (queued-row replay) admits an allowed guest's stored row and refuses
+    it once the rule is revoked."""
+    from gateway.session_envelope import check_native_route
+
+    runner, adapter = _setup(tmp_path, monkeypatch)
+    authority = await _authority(runner, monkeypatch, "wa-guest-replay")
+    source = _source(adapter, GUEST)
+    payload = await _admit(runner, authority, _event(source))
+    session_id = _admit.last_session_id
+    replayed, route = await check_native_route(runner, payload, session_id, source, adapter)
+    assert (replayed.user_id, replayed.chat_id) == (GUEST, GUEST_GROUP)
+    assert route == payload["native_text_v1"]["route"]
+    adapter._groups[GUEST_GROUP]["allow_from"] = [OWNER]
+    with pytest.raises(RuntimeStoreError, match="permission_denied") as refused:
+        await check_native_route(runner, payload, session_id, source, adapter)
+    assert refused.value.field == "user_not_authorized"
 
 
 def test_failed_sender_rule_check_fails_closed(tmp_path, monkeypatch):
@@ -256,6 +335,27 @@ def test_forged_upstream_relay_without_provenance_is_refused(tmp_path, monkeypat
     with pytest.raises(RuntimeStoreError, match="invalid_params") as refused:
         snapshot_native(runner, _event(source))
     assert refused.value.field == "upstream_relay_without_provenance"
+
+
+@pytest.mark.parametrize("chat_id", [GUEST_GROUP, ORDINARY_GROUP])
+def test_plugin_injection_as_group_guest_is_still_denied(tmp_path, monkeypatch, chat_id):
+    """Plugin injection names its own origin identity, so it must not borrow the group sender rule
+    (exact group or the ``groups['*']`` default): denied exactly as on main."""
+    runner, adapter = _setup(tmp_path, monkeypatch)
+    adapter._groups["*"] = {"allow_from": ["*"]}
+    source = _source(adapter, GUEST, chat_id)
+    assert adapter._is_group_allowed(chat_id, GUEST) is True
+    assert runner._plugin_injection_authorized(source, plugin_id="synthetic", target="t") is False
+    assert runner._is_user_authorized_for_source(source, allow_adapter_delegation=False) is False
+
+
+def test_fresh_group_sender_rules_is_opt_in(tmp_path, monkeypatch):
+    """Only the durable native path asks for the fresh verdict with delegation off."""
+    runner, adapter = _setup(tmp_path, monkeypatch)
+    source = _source(adapter, GUEST)
+    assert runner._is_user_authorized_for_source(source, allow_adapter_delegation=False) is False
+    assert runner._is_user_authorized_for_source(
+        source, allow_adapter_delegation=False, fresh_group_sender_rules=True) is True
 
 
 def test_caller_flag_grants_stay_delegation_gated(tmp_path, monkeypatch):
