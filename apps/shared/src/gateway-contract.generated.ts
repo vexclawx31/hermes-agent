@@ -4819,6 +4819,8 @@ export interface CanonicalSessionInfo {
   cwd?: string | null
   edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
+  origin?: string | null
+  launch_skills?: Record<string, string[]> | null
   reasoning_effort?: string | null
   reasoning_effort_wire?: string | null
   service_tier?: string | null
@@ -5080,6 +5082,7 @@ export interface CanonicalCreateParams {
   run_budget?: number | null
   verbose?: boolean
   client_env?: Record<string, string> | null
+  origin?: string | null
 }
 export interface CanonicalSnapshot {
   session_id: string
@@ -5154,6 +5157,8 @@ export interface CanonicalSnapshotInfo {
   cwd?: string | null
   edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
+  origin?: string | null
+  launch_skills?: Record<string, string[]> | null
   reasoning_effort?: string | null
   reasoning_effort_wire?: string | null
   service_tier?: string | null
@@ -5176,6 +5181,7 @@ export interface CanonicalResumeParams {
   source?: string | null
   editor?: Record<string, unknown> | null
   api_key?: string | null
+  origin?: string | null
   defer_history?: boolean
   omit_messages?: boolean
   cols?: number | null

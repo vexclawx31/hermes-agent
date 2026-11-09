@@ -69,6 +69,9 @@ class CanonicalResumeParams(ProfileParams):
     editor: dict[str, JsonValue] | None = None
     # Re-supplies a launch-only key a restart revoked; never durable, must match the launch's.
     api_key: str | None = None
+    # Fork (launch adapter): the resuming client's provenance label (``--source``). Frozen as the policy's
+    # ``origin`` only when the resume adopts a pre-v0.23 session; refused when it differs from a frozen one.
+    origin: str | None = None
     defer_history: bool = False
     omit_messages: bool = False
     cols: int | None = None

@@ -49,8 +49,44 @@ def require_history_claim(authority, conn, actor, sid):
         raise RuntimeStoreError('permission_denied')
 
 
-def resolve_local_target(authority, actor, sid):
-    """Resolve physical history IDs without silently adopting canonical corruption."""
+# Fork (launch adapter): provenance labels a resume never mints by adopting a legacy row. A tenant
+# turn always runs in a fresh session created with that label, never in adopted owner history.
+NEVER_ADOPTED_ORIGINS = frozenset({'switchboard-tenant'})
+
+
+def adoption_origin(origin):
+    """Fork (launch adapter): the resuming client's provenance label (``hermes chat --source <label>``)
+    an adoption freezes as the new policy's ``origin``, validated exactly as ``session.create`` does
+    (``session_policy.validate_origin``), or None for an unlabelled resume. A label adoption never
+    mints (``NEVER_ADOPTED_ORIGINS``) is refused, so the adoption fails closed and writes nothing."""
+    if origin is None:
+        return None
+    from gateway.session_policy import _refuse, validate_origin
+    validate_origin(origin)
+    if origin in NEVER_ADOPTED_ORIGINS:
+        _refuse('origin', f'{origin!r} is never minted by adopting an existing session')
+    return origin
+
+
+def require_frozen_origin(authority, session_id, origin):
+    """Fork (launch adapter): a labelled resume of a session whose local policy is already frozen.
+    The frozen ``origin`` (present or absent) is never changed by a resume; a label that differs from
+    it is refused, as the client's own ``check_resume_policy`` refuses any other differing launch flag."""
+    from hermes_state_local import local_receipt
+    request = json.loads(local_receipt(authority.db, session_id)['policy']['request_json'])
+    if request.get('origin') != origin:
+        from gateway.session_policy import _refuse
+        _refuse('origin', "differs from this session's frozen launch origin; a resume cannot relabel it")
+
+
+def resolve_local_target(authority, actor, sid, *, origin=None, relabel='refuse'):
+    """Resolve physical history IDs without silently adopting canonical corruption.
+
+    *origin*: the resuming client's provenance label. Adopting a legacy row freezes it as the new
+    policy's ``origin`` (``adoption_origin``). A session whose local policy is already frozen keeps its
+    own: with ``relabel='refuse'`` (``session.resume``) a different label is refused; ``'ignore'`` is
+    ``session.create``'s titled create-if-missing, which leaves every creation field of an existing
+    session as it was."""
     db = authority.db
     row = db.get_session(sid)
     if row is None:
@@ -68,9 +104,11 @@ def resolve_local_target(authority, actor, sid):
     if bound or str(row.get('chat_id') or '').startswith('local-'):
         ref = SessionRef(authority.profile_id, row['chat_id'])
         authority.authorize(actor, ref, 'session:read')
+        if origin is not None and relabel == 'refuse':
+            require_frozen_origin(authority, ref.session_id, origin)
         from gateway.session_local_recovery import restore_local_session
         return restore_local_session(authority, ref.session_id) if bound else ref
-    return adopt_legacy_session(authority, actor, row)
+    return adopt_legacy_session(authority, actor, row, origin=origin)
 
 
 def legacy_launch_params(row):
@@ -254,12 +292,14 @@ def adopts_client_history(authority, actor, row):
     return True
 
 
-def adopt_legacy_session(authority, actor, row):
+def adopt_legacy_session(authority, actor, row, *, origin=None):
     if actor.profile_id != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
     if (getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) != actor
             or not {'session:read', 'session:create'} <= actor.capabilities):
         raise RuntimeStoreError('not_found')
+    # Checked before any write: a refused label refuses the adoption, never adopts it unlabelled.
+    origin = adoption_origin(origin)
     from hermes_state_local_migration import legacy_creation_source, validate_legacy_row
     validate_legacy_row(authority.db, row, subject=actor.subject)
     authority._require_admission_open()
@@ -276,6 +316,9 @@ def adopt_legacy_session(authority, actor, row):
     private = {}
     config = _load_gateway_config()
     params, api_mode = legacy_bot_chat_launch(row, params, api_mode, config)
+    if origin is not None:
+        # The label only: nothing else of the resume request reaches the adopted policy.
+        params['origin'] = origin
     model_cfg = config.get('model')
     if isinstance(model_cfg, dict) and ('provider' in params or 'base_url' in params):
         from gateway.session_route_identity import ROUTE_BOUND_KEYS, resolved_route, same_route

@@ -39,7 +39,7 @@ async def test_session_resume_still_remaps_legacy_cli_source(monkeypatch):
 
     monkeypatch.setattr(
         'gateway.session_local_migration.resolve_local_target',
-        lambda authority, actor, sid: resolved.append(sid) or owner_ref)
+        lambda authority, actor, sid, origin=None: resolved.append(sid) or owner_ref)
 
     authority = SimpleNamespace(
         profile_id='fixture',

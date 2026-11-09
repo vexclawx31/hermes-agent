@@ -495,7 +495,10 @@ class AuthorityConnection:
         hidden = params.pop('hidden', False)
         if type(hidden) is not bool:
             raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
-        ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True)
+        # Fork (launch adapter): a found legacy row is adopted under the request's provenance label; a
+        # session with a frozen policy keeps its own, like every other creation field here.
+        ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True,
+                                               origin=params.get('origin'), relabel='ignore')
         if (not ref and title == 'Bot Chat'
                 and not any(params.get(name) is True for name in BYPASS_FIELDS)
                 and staged_creation_follows(self.authority, self.actor, params.get('request_id'))):
@@ -621,10 +624,11 @@ class AuthorityConnection:
             # Bare `-c` / `--resume latest`: the most recent session of that surface family the
             # actor may read (workspace first), resolved by the owner like a title.
             from gateway.session_local_title import resolve_latest_session
-            ref = resolve_latest_session(self.authority, self.actor, params['latest'], params.get('workspace'))
+            ref = resolve_latest_session(self.authority, self.actor, params['latest'], params.get('workspace'),
+                                         origin=params.get('origin'))
         elif 'title' in params:
             from gateway.session_local_title import resolve_titled_session
-            ref = resolve_titled_session(self.authority, self.actor, params['title'])
+            ref = resolve_titled_session(self.authority, self.actor, params['title'], origin=params.get('origin'))
         else:
             # The TUI exit hint abbreviates canonical local IDs to ``local-`` plus 16 hex
             # characters. Resolve only that family before authorization so a unique hint reaches
@@ -645,8 +649,11 @@ class AuthorityConnection:
             # after list_sessions projects the tip (#139306).
             if row and (row['source'] in LEGACY_LOCAL_SOURCES | {Platform.LOCAL.value}
                         or adopts_client_history(self.authority, self.actor, row)):
+                # Fork (launch adapter): ``origin``, the client's ``--source`` label, labels an adoption
+                # and must match a frozen policy's own (``resolve_local_target``).
                 ref = resolve_local_target(self.authority, self.actor,
-                    self.authority.db.get_compression_tip(ref.session_id) or ref.session_id)
+                    self.authority.db.get_compression_tip(ref.session_id) or ref.session_id,
+                    origin=params.get('origin'))
             elif row:
                 # A messaging compression continuation attaches to its lineage root, the session
                 # its lane's turns stream to; the reply names that root.
