@@ -174,17 +174,81 @@ def test_the_origin_has_no_env_fallback_and_is_not_exported_to_child_processes(m
     assert "HERMES_TURN_ORIGIN" not in session_context._VAR_MAP
 
 
-def test_a_cron_run_is_a_known_origin(monkeypatch, tmp_path):
+def _cron_scope(monkeypatch):
     from cron import scheduler as sched
     from cron.scheduler_run_scope import _CronRunScope
     monkeypatch.setattr(sched, "_resolve_job_workdir", lambda job, job_id: "")
     scope = _CronRunScope({"id": "j1"}, "j1", "e1")
+    scope.enter()
+    return scope
+
+
+def test_a_cron_run_is_a_known_origin(monkeypatch):
+    scope = _cron_scope(monkeypatch)
     try:
         assert turn_origin() == "cron"
         assert _session_meta(META) == {SESSION_META_KEY: "cron"}
     finally:
         scope.exit()
     assert turn_origin() == ""
+
+
+def test_a_cli_tenant_turn_label_from_the_environment_reaches_the_server(monkeypatch):
+    # `hermes chat --source switchboard-tenant` (in-process CLI) writes the label to os.environ only.
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "switchboard-tenant")
+    assert _session_meta(META) == {SESSION_META_KEY: "switchboard-tenant"}
+
+
+def test_a_cron_run_inside_a_tenant_turn_keeps_the_tenant_label(monkeypatch):
+    # cronjob(action="run") runs the job in-process: its scope must not relabel the tenant turn as cron.
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "switchboard-tenant")
+    scope = _cron_scope(monkeypatch)
+    try:
+        assert _session_meta(META) == {SESSION_META_KEY: "switchboard-tenant"}
+        from gateway.session_context import get_session_env
+        assert get_session_env("HERMES_SESSION_SOURCE", "") == ""   # the session source stays blank as before
+    finally:
+        scope.exit()
+
+
+def test_a_cron_run_inside_a_bound_labelled_turn_keeps_that_label(monkeypatch):
+    tokens = set_session_vars(platform="local", turn_origin="switchboard-tenant")
+    try:
+        scope = _cron_scope(monkeypatch)
+        try:
+            assert _session_meta(META) == {SESSION_META_KEY: "switchboard-tenant"}
+        finally:
+            scope.exit()
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_an_api_server_turn_is_a_known_platform_caller():
+    from gateway.platforms.api_server import APIServerAdapter
+    tokens = APIServerAdapter._bind_api_server_session(chat_id="c", session_key="k", session_id="s")
+    try:
+        assert _session_meta(META) == {SESSION_META_KEY: "platform:api_server"}
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_a_detached_platform_chat_is_still_labelled_by_its_transport(monkeypatch):
+    # A Slack chat moved to Desktop binds the local view for routing; its origin stays the transport's.
+    from gateway import session_detached
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionContext
+    monkeypatch.setattr(session_detached, "session_env_source", lambda runner, source: _src(Platform.LOCAL, "d1"))
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {}
+    context = SessionContext(source=_src(Platform.SLACK), connected_platforms=[], home_channels={},
+                             session_key="agent:main:slack:dm:C1")
+    tokens = runner._set_session_env(context)
+    try:
+        from gateway.session_context import get_session_env
+        assert get_session_env("HERMES_SESSION_PLATFORM") == "local"   # the stub took effect
+        assert _session_meta(META) == {SESSION_META_KEY: "platform:slack"}
+    finally:
+        runner._clear_session_env(tokens)
 
 
 # --- concurrent callers ----------------------------------------------------------------------------

@@ -3976,6 +3976,8 @@ class GatewayRunner(
         tokens = set_session_vars(
             # Fork (launch adapter): a local session's provenance label is its turns' source.
             **_launch_origin_source(self, context.source),
+            # The transport's own source, deliberately not session_env_source: a detached Slack chat typed
+            # from Desktop is still a platform turn, and its local view would fail the policy lookup.
             turn_origin=turn_origin_label(self, context.source),
             platform=source.platform.value,
             chat_id=source.chat_id,

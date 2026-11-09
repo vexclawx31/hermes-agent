@@ -33,13 +33,18 @@ class _CronRunScope:
 
     def __init__(self, job: dict, job_id: str, execution_id: Optional[str]):
         from cron import scheduler as _sched
-        from gateway.session_context import set_session_vars, _VAR_MAP
+        from gateway.session_context import get_session_env, set_session_vars, turn_origin, _VAR_MAP
         from tools.terminal_tool import record_session_cwd
 
         self._job = job
         self._var_map = _VAR_MAP
         # Resolve workdir BEFORE set_session_vars so it owns the _SESSION_CWD set/clear.
         self.workdir = _sched._resolve_job_workdir(job, job_id)
+        # Fork (launch adapter): a run started inside a labelled turn (cronjob action=run in a
+        # ``--source switchboard-tenant`` turn) keeps that turn's label; only a scheduler run with no outer
+        # label is ``cron``. Read BEFORE binding: the bind blanks the source. Only the origin carries it
+        # (HERMES_SESSION_SOURCE stays blank as before: pickers and provider rules read that one).
+        outer = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip() or turn_origin().strip()
         self._ctx_tokens = set_session_vars(
             platform="",
             chat_id="",
@@ -58,7 +63,7 @@ class _CronRunScope:
             async_delivery=False,
             cwd=self.workdir or "",
             # Fork (launch adapter): a scheduler run is a known origin for opted-in MCP servers.
-            turn_origin="cron",
+            turn_origin=outer or "cron",
         )
         for name in _CRON_DELIVERY_VARS:
             _VAR_MAP[name].set("")
