@@ -3972,9 +3972,11 @@ class GatewayRunner(
         # #98619: an admitted API turn carries its session-id provenance; other platforms leave it unset.
         from gateway.session_api_turn import api_session_vars
         _history_delivery = api_session_vars().get("session_history_delivery")
+        from gateway.run_turn_origin import launch_origin_source as _launch_origin_source, turn_origin_label
         tokens = set_session_vars(
             # Fork (launch adapter): a local session's provenance label is its turns' source.
             **_launch_origin_source(self, context.source),
+            turn_origin=turn_origin_label(self, context.source),
             platform=source.platform.value,
             chat_id=source.chat_id,
             chat_type=str(source.chat_type) if source.chat_type else "",
@@ -5232,19 +5234,6 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     for _step in (_release_locks, _mark_exited, _flush_metrics, _write_cpu_profile, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
-
-
-def _launch_origin_source(runner, source) -> dict:
-    """Fork (launch adapter): ``{"source": <origin>}`` for a LOCAL session created with a provenance
-    label (``session.create origin=``), else ``{}``. Tools and plugins read it as
-    HERMES_SESSION_SOURCE, what the in-process ``hermes chat --source <label>`` bound."""
-    from gateway.session_policy import policy_for_source
-    try:
-        policy = policy_for_source(runner, source)
-    except Exception:  # not a restorable local route: the turn itself reports that
-        return {}
-    origin = getattr(policy, "origin", None) if policy is not None else None
-    return {"source": origin} if origin else {}
 
 
 if __name__ == "__main__":

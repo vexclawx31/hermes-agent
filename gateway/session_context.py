@@ -70,6 +70,14 @@ class _TurnSender:
 
 _TURN_SENDER: ContextVar[Any] = ContextVar("HERMES_TURN_SENDER", default=_UNSET)
 _SENDER_ROLES = frozenset({"owner", "member"})
+
+# Fork (launch adapter): the trusted label of the turn's ORIGIN for opted-in MCP servers
+# (``tools.mcp_tool_handlers._session_meta``). The gateway binds it from its own routing, never from
+# message text: a local session's frozen ``origin`` label, ``platform:<name>`` for a turn an adapter
+# delivered (Slack, WhatsApp, ...), ``cron`` for a scheduler run. "" when the context is genuinely
+# missing (a local session without an origin, a failed policy lookup), so a door that requires a
+# source refuses. Not in _VAR_MAP: no env fallback, no export to child processes.
+_TURN_ORIGIN: ContextVar[Any] = ContextVar("HERMES_TURN_ORIGIN", default=_UNSET)
 # session_key -> the live turn-sender holders bound for it (busy-path folds downgrade them all).
 _TURN_SENDERS_BY_SESSION: dict[str, "weakref.WeakSet[_TurnSender]"] = {}
 
@@ -154,6 +162,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None, sender_role: str = "", sender_id: str | None = None,
+    turn_origin: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -166,7 +175,9 @@ def set_session_vars(
     cannot grant wake authority.
 
     ``sender_role`` / ``sender_id`` bind the turn's trusted sender for tool hooks
-    (:func:`turn_sender_hook_kwargs`); ``sender_id`` defaults to ``user_id``."""
+    (:func:`turn_sender_hook_kwargs`); ``sender_id`` defaults to ``user_id``.
+
+    ``turn_origin`` binds the turn's trusted origin label (:func:`turn_origin`; "" = no origin known)."""
     from gateway.ingress_identity import clear_trusted_ingress
     from gateway.injected_turn import clear_injected_turn
     clear_trusted_ingress()
@@ -184,6 +195,7 @@ def set_session_vars(
     holder = _TurnSender(sender_role if sender_role in _SENDER_ROLES else "",
                          str(user_id if sender_id is None else sender_id or ""))
     tokens.append(_TURN_SENDER.set(holder))
+    tokens.append(_TURN_ORIGIN.set(str(turn_origin or "")))
     if session_key:
         _TURN_SENDERS_BY_SESSION.setdefault(session_key, weakref.WeakSet()).add(holder)
     _runtime_cwd("set_session_cwd", cwd)
@@ -204,6 +216,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TURN_ORIGIN.set(_UNSET)
     _forget_turn_sender()
     _runtime_cwd("clear_session_cwd")
 
@@ -222,8 +235,15 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TURN_ORIGIN.set(_UNSET)
     _forget_turn_sender()
     _runtime_cwd("clear_session_cwd")
+
+
+def turn_origin() -> str:
+    """The current turn's trusted origin label (see ``_TURN_ORIGIN``), or "" when none is bound here."""
+    value = _TURN_ORIGIN.get()
+    return value if isinstance(value, str) else ""
 
 
 def _forget_turn_sender() -> None:

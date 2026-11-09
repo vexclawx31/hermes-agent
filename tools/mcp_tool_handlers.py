@@ -559,11 +559,13 @@ def _session_meta(server) -> Optional[dict]:
     """Fork (launch adapter): ``{"hermes/session_source": <source>}`` for a server whose config opts in
     (``mcp_servers.<name>.session_meta: true``), read on the agent thread. The gateway binds the source
     (a provenance label such as ``helpdesk-request``), so a shared server can tell which kind of turn
-    called it without reading process ancestry; the model cannot set it. Off by default."""
+    called it without reading process ancestry; the model cannot set it. Without one, the turn's trusted
+    origin (``platform:slack``, ``cron``; gateway.session_context.turn_origin). None when neither is
+    known, so a server that requires a source refuses. Off by default."""
     if (getattr(server, "_config", None) or {}).get("session_meta") is not True:
         return None
-    from gateway.session_context import get_session_env
-    source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip()
+    from gateway.session_context import get_session_env, turn_origin
+    source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip() or turn_origin().strip()
     return {SESSION_META_KEY: source} if source else None
 
 

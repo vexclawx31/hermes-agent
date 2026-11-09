@@ -57,6 +57,8 @@ class _CronRunScope:
             # #53027, #63142.
             async_delivery=False,
             cwd=self.workdir or "",
+            # Fork (launch adapter): a scheduler run is a known origin for opted-in MCP servers.
+            turn_origin="cron",
         )
         for name in _CRON_DELIVERY_VARS:
             _VAR_MAP[name].set("")
