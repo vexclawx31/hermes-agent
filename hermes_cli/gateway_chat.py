@@ -134,10 +134,14 @@ def _workspace_key(cwd):
 async def _resume(client, args, **params):
     """``session.resume``; ``--api-key`` re-supplies a launch-only key an owner restart revoked.
     The owner binds it only to a session launched with that same key (never durable); anything
-    else is a route override and refused like every other creation flag on resume."""
+    else is a route override and refused like every other creation flag on resume.
+    Fork (launch adapter): a ``--source`` provenance label goes as ``origin``. The owner freezes it
+    when the resume adopts a pre-v0.23 session and refuses it when it differs from a frozen origin."""
     key = getattr(args, "api_key", None)
+    origin = _requested_policy(args).get("origin")
+    extra = {**({"api_key": key} if key else {}), **({"origin": origin} if origin else {})}
     try:
-        return await client.rpc("session.resume", **params, **({"api_key": key} if key else {}))
+        return await client.rpc("session.resume", **params, **extra)
     except GatewayClientError as exc:
         if key and str(exc) == "admission_conflict":
             raise GatewayClientError(RESUME_KEY_MISMATCH) from None

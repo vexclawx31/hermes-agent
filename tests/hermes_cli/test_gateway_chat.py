@@ -352,3 +352,21 @@ async def test_oneshot_z_writes_no_session_lines_to_stderr_like_main(monkeypatch
     assert await gateway_chat.run_gateway_chat(argparse.Namespace(query="q", quiet=True)) == 0
     err = capsys.readouterr().err
     assert "Session: stored-z" in err and "session_id: stored-z" in err
+
+
+@pytest.mark.asyncio
+async def test_resume_sends_a_provenance_label_as_origin_and_a_surface_label_never():
+    """Fork (launch adapter): ``--resume <id> --source <label>`` hands the owner the label as ``origin``,
+    which an adoption of a pre-v0.23 session freezes; a surface ``--source`` and no ``--source`` send none."""
+    from hermes_cli import gateway_chat
+    calls = []
+
+    class Peer:
+        async def rpc(self, method, **params):
+            calls.append((method, params))
+            return {"stored_session_id": "stored"}
+
+    for source, sent in (("helpdesk-ask", {"origin": "helpdesk-ask"}), ("desktop", {}), (None, {})):
+        calls.clear()
+        await gateway_chat._resume(Peer(), argparse.Namespace(source=source), session_id="stored")
+        assert calls == [("session.resume", {"session_id": "stored", **sent})]

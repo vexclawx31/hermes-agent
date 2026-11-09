@@ -8848,6 +8848,18 @@
             ],
             "default": null,
             "title": "Client Env"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Origin"
           }
         },
         "title": "CanonicalCreateParams",
@@ -9724,6 +9736,18 @@
             "default": null,
             "title": "Api Key"
           },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Origin"
+          },
           "defer_history": {
             "default": false,
             "title": "Defer History",
@@ -10237,6 +10261,36 @@
             ],
             "default": null,
             "title": "Launch Request"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Origin"
+          },
+          "launch_skills": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Launch Skills"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -11036,6 +11090,36 @@
             ],
             "default": null,
             "title": "Launch Request"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Origin"
+          },
+          "launch_skills": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Launch Skills"
           },
           "reasoning_effort": {
             "anyOf": [

@@ -9,12 +9,13 @@ from __future__ import annotations
 from hermes_state_runtime import RuntimeStoreError
 
 
-def resolve_titled_session(authority, actor, name, *, missing_ok=False):
+def resolve_titled_session(authority, actor, name, *, missing_ok=False, origin=None, relabel='refuse'):
     """Exact session id first, then title (latest ``"<title> #N"`` continuation wins over
     the bare title), projected forward to the compression tip. Only a local session the
     actor may read is returned, or one a messaging lane took over from a local surface
     (``handed_off_ref``); a foreign or other non-local match is ``not_found`` so another
-    principal's titles are never confirmed."""
+    principal's titles are never confirmed. *origin* / *relabel*: the resuming client's provenance
+    label (``resolve_local_target``)."""
     if not isinstance(name, str) or not name.strip():
         raise RuntimeStoreError('invalid_params')
     db = authority.db
@@ -30,9 +31,11 @@ def resolve_titled_session(authority, actor, name, *, missing_ok=False):
     try:
         if moved is not None:
             authority.authorize(actor, moved, 'session:read')
+            from gateway.session_local_migration import refuse_routed_origin
+            refuse_routed_origin(origin, relabel)
             return moved
         from gateway.session_local_migration import resolve_local_target
-        ref = resolve_local_target(authority, actor, tip['id'])
+        ref = resolve_local_target(authority, actor, tip['id'], origin=origin, relabel=relabel)
     except RuntimeStoreError as exc:
         if exc.reason == 'permission_denied':
             raise RuntimeStoreError('not_found') from None
@@ -40,7 +43,7 @@ def resolve_titled_session(authority, actor, name, *, missing_ok=False):
     return ref
 
 
-def resolve_latest_session(authority, actor, family, workspace=None):
+def resolve_latest_session(authority, actor, family, workspace=None, *, origin=None):
     """The most recently active session of a surface family (``cli`` = classic CLI incl. its finite
     one-shot runs, ``tui``), scoped to ``workspace`` (git root / cwd) first and then global: the
     classic ``hermes -c`` / ``--resume latest`` rule (``hermes_cli.main._resolve_last_session``),
@@ -61,7 +64,7 @@ def resolve_latest_session(authority, actor, family, workspace=None):
                                                 workspace_key=scope, skip_launch_stubs=True):
             tip = authority.db.get_compression_tip(row['id']) or row['id']
             try:
-                return resolve_local_target(authority, actor, tip)
+                return resolve_local_target(authority, actor, tip, origin=origin)
             except RuntimeStoreError as exc:
                 if exc.reason not in {'permission_denied', 'not_found', 'profile_mismatch'}:
                     raise
