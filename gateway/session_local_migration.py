@@ -80,16 +80,19 @@ def fill_adopted_origin(authority, actor, session_id, origin):
     it, and nothing is written). Returns whether it labelled the session."""
     from hermes_state_local import local_receipt
     from hermes_state_local_migration import LEGACY_PREFIX
-    stored = local_receipt(authority.db, session_id)['policy']
-    request = json.loads(stored['request_json'])
-    if 'origin' in request or actor.profile_id != authority.profile_id:
-        return False
-    if (getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) != actor
+    # The cheap checks first: a session this cannot label (another actor, no legacy binding: created
+    # fresh on v0.23, or an unbound ``local-`` row) is the caller's ordinary frozen-origin case.
+    if (actor.profile_id != authority.profile_id
+            or getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) != actor
             or not {'session:read', 'session:create'} <= actor.capabilities):
         return False
     with authority.db._read_ctx() as conn:
         if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (LEGACY_PREFIX + session_id,)).fetchone() is None:
-            return False  # created fresh on v0.23: its unlabelled launch is its own
+            return False
+    stored = local_receipt(authority.db, session_id)['policy']
+    request = json.loads(stored['request_json'])
+    if 'origin' in request:
+        return False
     origin = adoption_origin(origin)
     from gateway.session_policy import restore_policy
     from gateway.session_policy_refresh import _rebind
@@ -113,6 +116,15 @@ def fill_adopted_origin(authority, actor, session_id, origin):
     return True
 
 
+def refuse_routed_origin(origin, relabel='refuse'):
+    """Fork (launch adapter): a labelled resume that reaches a messaging lane (or a chat one took over)
+    has no frozen local launch origin to match, its turns being labelled by their transport. A label is
+    refused there as any differing label is (a tenant label also on the ``'ignore'`` path)."""
+    if origin is not None and (relabel == 'refuse' or origin in NEVER_ADOPTED_ORIGINS):
+        from gateway.session_policy import _refuse
+        _refuse('origin', 'a messaging session has no launch origin; a resume cannot label it')
+
+
 def require_frozen_origin(authority, session_id, origin):
     """Fork (launch adapter): a labelled resume of a session whose local policy is already frozen.
     A frozen ``origin`` is never changed by a resume, and an unlabelled policy is labelled only once, by
@@ -133,7 +145,8 @@ def resolve_local_target(authority, actor, sid, *, origin=None, relabel='refuse'
     own, except that a policy adopted without one takes the label once (``fill_adopted_origin``). Otherwise,
     with ``relabel='refuse'`` (``session.resume``) a different label is refused; ``'ignore'`` is
     ``session.create``'s titled create-if-missing, which leaves every other creation field of an existing
-    session as it was."""
+    session as it was, except a ``NEVER_ADOPTED_ORIGINS`` label, refused there too unless it is the
+    session's own."""
     db = authority.db
     row = db.get_session(sid)
     if row is None:
@@ -152,7 +165,8 @@ def resolve_local_target(authority, actor, sid, *, origin=None, relabel='refuse'
         ref = SessionRef(authority.profile_id, row['chat_id'])
         authority.authorize(actor, ref, 'session:read')
         if (origin is not None and not fill_adopted_origin(authority, actor, ref.session_id, origin)
-                and relabel == 'refuse'):
+                and (relabel == 'refuse' or origin in NEVER_ADOPTED_ORIGINS)):
+            # A tenant label is never ignored: its turn must not run in a session labelled otherwise.
             require_frozen_origin(authority, ref.session_id, origin)
         from gateway.session_local_recovery import restore_local_session
         return restore_local_session(authority, ref.session_id) if bound else ref

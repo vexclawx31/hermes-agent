@@ -245,8 +245,144 @@ async def test_a_fresh_unlabelled_v023_session_is_never_labelled_by_a_resume(hom
     _refused(await _call(connection, 'session.resume', session_id=sid, origin='helpdesk-ask'))
     assert (await _create_titled(connection, home, 'fresh chat', 'again', origin='helpdesk-ask'))['result'][
         'session_id'] == sid
+    # A tenant label is never ignored: the titled create refuses rather than return an unlabelled session.
+    _refused(await _create_titled(connection, home, 'fresh chat', 'tenant', origin='switchboard-tenant'))
     assert _stored(authority, sid) == before
     assert _turn_labels(runner, authority, sid) == ('', {})
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_label_finding_a_session_labelled_otherwise_is_refused_not_ignored(home, owner):
+    """The titled create-if-missing ignores a differing label, except ``switchboard-tenant``: a tenant
+    turn never runs under another label. A session that is itself the tenant's resumes."""
+    runner, authority, connection = owner
+    other = (await _call(connection, 'session.create', request_id='o', source='cli', cwd=str(home),
+                         origin='helpdesk-ask'))['result']['session_id']
+    tenant = (await _call(connection, 'session.create', request_id='t', source='cli', cwd=str(home),
+                          origin='switchboard-tenant'))['result']['session_id']
+    authority.db.set_session_title(other, 'other chat')
+    authority.db.set_session_title(tenant, 'tenant chat')
+    data = _refused(await _create_titled(connection, home, 'other chat', 'c1', origin='switchboard-tenant'))
+    assert 'origin' in json.dumps(data)
+    assert _origin(authority, other) == 'helpdesk-ask'
+    response = await _create_titled(connection, home, 'tenant chat', 'c2', origin='switchboard-tenant')
+    assert response['result']['session_id'] == tenant
+    assert _turn_labels(runner, authority, tenant)[0] == 'switchboard-tenant'
+
+
+@pytest.mark.asyncio
+async def test_a_labelled_resume_of_a_messaging_session_is_refused(home, owner):
+    runner, authority, connection = owner
+    runner._restored_source = lambda entry: entry.origin  # seam: the lane's persisted source as stored
+    authority.db.create_session('slack-1', source='slack', session_key='agent:main:slack:dm:C1', chat_id='C1',
+                                chat_type='dm', user_id='human')
+    response = await _call(connection, 'session.resume', session_id='slack-1', origin='helpdesk-ask')
+    assert 'error' in response, response
+    data = response['error'].get('data') or {}
+    assert data.get('reason') == 'invalid_params' and 'origin' in json.dumps(data), response
+    # The same resume without a label attaches: the label alone is what is refused.
+    assert 'result' in await _call(connection, 'session.resume', session_id='slack-1')
+
+
+def test_the_routed_origin_refusal_names_the_field():
+    from gateway.session_local_migration import refuse_routed_origin
+    from hermes_state_runtime import RuntimeStoreError
+    refuse_routed_origin(None)
+    refuse_routed_origin('helpdesk-ask', 'ignore')  # the titled create ignores a label, as everywhere
+    for origin, relabel in (('helpdesk-ask', 'refuse'), ('switchboard-tenant', 'ignore')):
+        with pytest.raises(RuntimeStoreError) as caught:
+            refuse_routed_origin(origin, relabel)
+        assert (caught.value.reason, caught.value.field) == ('invalid_params', 'origin')
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_local_row_resolves_for_an_ignored_label_as_for_none(home, owner):
+    """The fill's cheap checks run first: a ``local-`` row without a receipt is no fill candidate. An ignored
+    label resolves it as an unlabelled resume does; a label that must match fails closed."""
+    from gateway.session_local_migration import resolve_local_target
+    from hermes_state_runtime import RuntimeStoreError
+    _runner, authority, connection = owner
+    authority.db.create_session('local-0123456789abcdef', source='local', chat_id='local-0123456789abcdef',
+                                cwd=str(home))
+    actor = connection.actor
+
+    def outcome(**kwargs):
+        try:
+            return resolve_local_target(authority, actor, 'local-0123456789abcdef', **kwargs)
+        except RuntimeStoreError as exc:
+            return exc.reason
+
+    # No receipt: the row is no fill candidate (decided before any receipt read) ...
+    from gateway.session_local_migration import fill_adopted_origin
+    assert fill_adopted_origin(authority, actor, 'local-0123456789abcdef', 'helpdesk-ask') is False
+    # ... and every resume of it, labelled or not, ends exactly as the unlabelled one: refused, closed.
+    plain = outcome()
+    assert plain == 'storage_unavailable'
+    for kwargs in ({'origin': 'helpdesk-ask', 'relabel': 'ignore'}, {'origin': 'helpdesk-ask'},
+                   {'origin': 'switchboard-tenant', 'relabel': 'ignore'}):
+        assert outcome(**kwargs) == plain
+    assert _stored(authority, 'local-0123456789abcdef') is None
+
+
+@pytest.mark.asyncio
+async def test_the_one_time_label_is_refused_while_a_turn_runs_and_lands_once_idle(home, owner):
+    runner, authority, connection = owner
+    _legacy(authority.db, home, 'legacy-1', title=TITLE)
+    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-1')
+    before = _stored(authority, 'legacy-1')
+
+    def running(conn):
+        conn.execute("INSERT INTO worker_executions(execution_id, session_id, kind, owner_epoch, generation, "
+                     "status, adoption_digest) VALUES ('w1', 'legacy-1', 'child', 1, 1, 'running', 'd')")
+    authority.db._execute_write(running)
+    _refused(await _call(connection, 'session.resume', session_id='legacy-1', origin='helpdesk-ask'),
+             reason='session_busy')
+    assert _stored(authority, 'legacy-1') == before
+    authority.db._execute_write(lambda conn: conn.execute("UPDATE worker_executions SET status='terminal'"))
+    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-1', origin='helpdesk-ask')
+    assert _turn_labels(runner, authority, 'legacy-1')[0] == 'helpdesk-ask'
+
+
+@pytest.mark.asyncio
+async def test_two_racing_labelled_resumes_label_the_session_once(home, owner):
+    import asyncio
+    _runner, authority, connection = owner
+    _legacy(authority.db, home, 'legacy-1', title=TITLE)
+    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-1')
+    first, second = await asyncio.gather(
+        _call(connection, 'session.resume', session_id='legacy-1', origin='label-one'),
+        _call(connection, 'session.resume', session_id='legacy-1', origin='label-two'))
+    won = [label for label, response in (('label-one', first), ('label-two', second)) if 'result' in response]
+    assert len(won) == 1, (first, second)
+    assert _origin(authority, 'legacy-1') == won[0]
+
+
+@pytest.mark.asyncio
+async def test_the_latest_door_adopts_under_the_label(home, owner):
+    runner, authority, connection = owner
+    _legacy(authority.db, home, 'legacy-1', title=TITLE)
+    authority.db.append_message('legacy-1', 'user', 'hello')
+    response = await _call(connection, 'session.resume', session_id='', latest='cli', origin='helpdesk-ask')
+    assert 'result' in response, response
+    assert response['result']['session_id'] == 'legacy-1'
+    assert _turn_labels(runner, authority, 'legacy-1')[0] == 'helpdesk-ask'
+
+
+@pytest.mark.asyncio
+async def test_a_compression_chain_is_labelled_on_its_tip(home, owner):
+    """A legacy conversation compressed before v0.23: resuming its first segment's id reaches the tip, which
+    the resume adopts under the label; the tip's own id then resumes with the same label only."""
+    runner, authority, connection = owner
+    _legacy(authority.db, home, 'legacy-root', title=TITLE)
+    authority.db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET end_reason='compression' WHERE id='legacy-root'"))
+    _legacy(authority.db, home, 'legacy-tip', parent_session_id='legacy-root')
+    response = await _call(connection, 'session.resume', session_id='legacy-root', origin='helpdesk-ask')
+    assert 'result' in response, response
+    tip = response['result']['session_id']
+    assert _turn_labels(runner, authority, tip)[0] == 'helpdesk-ask'
+    _refused(await _call(connection, 'session.resume', session_id='legacy-tip', origin='other-label'))
+    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-tip', origin='helpdesk-ask')
 
 
 @pytest.mark.asyncio

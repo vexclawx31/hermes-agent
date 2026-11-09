@@ -660,6 +660,11 @@ class AuthorityConnection:
                 # its lane's turns stream to; the reply names that root.
                 from gateway.session_route_recovery import messaging_owner_ref
                 ref = messaging_owner_ref(self.authority, ref)
+                if params.get('origin') is not None:
+                    # Authorized first: the refusal must not tell another principal what this session is.
+                    self.authority.authorize(self.actor, ref, 'session:read')
+                    from gateway.session_local_migration import refuse_routed_origin
+                    refuse_routed_origin(params['origin'])
         if params.get('editor') is not None:
             self.authority.authorize(self.actor, ref, 'session:control')
             from gateway.session_local_mcp import resume_editor_mcp

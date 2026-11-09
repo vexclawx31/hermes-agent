@@ -31,6 +31,8 @@ def resolve_titled_session(authority, actor, name, *, missing_ok=False, origin=N
     try:
         if moved is not None:
             authority.authorize(actor, moved, 'session:read')
+            from gateway.session_local_migration import refuse_routed_origin
+            refuse_routed_origin(origin, relabel)
             return moved
         from gateway.session_local_migration import resolve_local_target
         ref = resolve_local_target(authority, actor, tip['id'], origin=origin, relabel=relabel)
