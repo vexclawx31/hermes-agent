@@ -3580,10 +3580,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         reach ``HERMES_SESSION_PROFILE``: the persistent-Docker container key is derived from it, so an
         unbound profile collapses every profile's turns onto the default sandbox (#96370)."""
         from gateway.session_context import set_session_vars
-        return set_session_vars(
-            platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
+        return set_session_vars(platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
             profile=profile, async_delivery=False, cron_session="", session_history_delivery=session_history_delivery,
-            turn_origin="platform:api_server")   # fork (launch adapter): the same label run.py binds for API turns
+            turn_origin="platform:api_server")   # fork (launch adapter): the label run.py binds for API turns
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[dict[str, Any]], requested_runtime: Optional[dict[str, Any]],
