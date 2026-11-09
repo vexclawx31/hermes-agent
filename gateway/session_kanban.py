@@ -259,7 +259,7 @@ def _worker_workspace(frame):
     tokens = set_session_vars(session_key=route, session_id=session_id,
                               profile=profile if profile_from_session_key(route) == profile else '',
                               # Fork (launch adapter): the provenance label is this execution's source,
-                              # as the owner binds it in-process (gateway.run._launch_origin_source).
+                              # as the owner binds it in-process (gateway.run_turn_origin.launch_origin_source).
                               **({'source': policy.origin} if policy.origin else {}))
     try:
         bind_turn_workspace(policy, session_id)
