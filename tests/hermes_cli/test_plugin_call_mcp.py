@@ -197,3 +197,87 @@ def test_oversized_result_is_truncated(monkeypatch):
     assert result["truncated"] is True
     assert len(result["result"]) <= PluginContext._MCP_RESULT_CHAR_CAP + 20
     assert result["result"].endswith("… [truncated]")
+
+
+# ---------------------------------------------------------------------------
+# mcp_servers.<x>.tools.include / exclude apply to plugins too
+# ---------------------------------------------------------------------------
+
+
+def _patch_config_with_servers(monkeypatch, entries: dict, mcp_servers: dict) -> None:
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod, "load_config",
+        lambda *a, **k: {"plugins": {"entries": entries}, "mcp_servers": mcp_servers},
+    )
+
+
+_GITHUB_INCLUDE = {"github": {"command": "gh-mcp", "tools": {"include": ["list_issues", "get_*"]}}}
+_GITHUB_EXCLUDE = {"github": {"command": "gh-mcp", "tools": {"exclude": ["delete_*"]}}}
+
+
+@pytest.mark.parametrize("tool", ["list_issues", "get_issue"])
+def test_included_tool_is_callable(monkeypatch, tool):
+    _patch_config_with_servers(monkeypatch, {"my-plugin": {"mcp_allowlist": ["github"]}}, _GITHUB_INCLUDE)
+    captured = {}
+    _patch_handler(monkeypatch, json.dumps({"result": "ok"}), captured)
+
+    result = _make_ctx().call_mcp("github", tool, {"n": 1})
+
+    assert captured["tool"] == tool
+    assert captured["args"] == {"n": 1}
+    assert result == {"ok": True, "result": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("servers", "tool"),
+    [(_GITHUB_INCLUDE, "create_issue"), (_GITHUB_EXCLUDE, "delete_repo"),
+     ({"github": {"command": "gh-mcp", "tools": {"include": []}}}, "list_issues")],
+)
+def test_filtered_out_tool_is_refused_before_any_server_call(monkeypatch, servers, tool):
+    _patch_config_with_servers(monkeypatch, {"my-plugin": {"mcp_allowlist": ["github"]}}, servers)
+    called = {}
+    _patch_handler(monkeypatch, json.dumps({"result": "should not run"}), called)
+
+    with pytest.raises(PermissionError) as exc:
+        _make_ctx().call_mcp("github", tool)
+
+    assert tool in str(exc.value)
+    assert "mcp_servers.github.tools" in str(exc.value)
+    assert called == {}  # no handler built, no transport touched
+
+
+def test_exclude_list_leaves_other_tools_callable(monkeypatch):
+    _patch_config_with_servers(monkeypatch, {"my-plugin": {"mcp_allowlist": ["github"]}}, _GITHUB_EXCLUDE)
+    captured = {}
+    _patch_handler(monkeypatch, json.dumps({"result": "ok"}), captured)
+
+    assert _make_ctx().call_mcp("github", "list_issues")["ok"] is True
+    assert captured["tool"] == "list_issues"
+
+
+def test_server_without_filter_is_unchanged(monkeypatch):
+    _patch_config_with_servers(
+        monkeypatch, {"my-plugin": {"mcp_allowlist": ["github"]}}, {"github": {"command": "gh-mcp"}})
+    captured = {}
+    _patch_handler(monkeypatch, json.dumps({"result": "ok"}), captured)
+
+    assert _make_ctx().call_mcp("github", "delete_repo")["ok"] is True
+    assert captured["tool"] == "delete_repo"
+
+
+def test_failing_filter_fails_closed(monkeypatch):
+    _patch_config_with_servers(monkeypatch, {"my-plugin": {"mcp_allowlist": ["github"]}}, _GITHUB_INCLUDE)
+    from tools import mcp_tool_registration as _registration
+
+    def _boom(name, config):
+        raise RuntimeError("filter exploded")
+
+    monkeypatch.setattr(_registration, "_make_tool_filter", _boom)
+    called = {}
+    _patch_handler(monkeypatch, json.dumps({"result": "should not run"}), called)
+
+    with pytest.raises(PermissionError):
+        _make_ctx().call_mcp("github", "list_issues")
+    assert called == {}

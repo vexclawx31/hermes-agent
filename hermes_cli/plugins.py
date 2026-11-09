@@ -498,7 +498,8 @@ class PluginContext(PluginCapabilityCtxMixin):
     ) -> dict[str, Any]:
         """Call ``tool`` on MCP ``server`` synchronously through :mod:`tools.mcp_tool`'s native client
         (same trust gates, breaker, reconnect — never a parallel connection). Servers not in
-        ``plugins.entries.<plugin_id>.mcp_allowlist`` raise ``PermissionError`` (default-deny). ``timeout``
+        ``plugins.entries.<plugin_id>.mcp_allowlist`` raise ``PermissionError`` (default-deny), and so
+        do tools the model-facing ``mcp_servers.<server>.tools.include``/``exclude`` hides. ``timeout``
         clamps to 1–600s; results over ~64KB are truncated with a marker.
 
         This is a per-server grant, deliberately not ambient authority over every configured server.
@@ -511,6 +512,12 @@ class PluginContext(PluginCapabilityCtxMixin):
                 f"server {server!r}. Add it to "
                 f"plugins.entries.{self.plugin_id}.mcp_allowlist in config.yaml "
                 f"to grant access (default is no MCP access)."
+            )
+        if not self._mcp_tool_visible(server, tool):
+            raise PermissionError(
+                f"Plugin {self.manifest.name!r} may not call MCP tool {tool!r} on "
+                f"server {server!r}: mcp_servers.{server}.tools.include/exclude "
+                f"hides it (plugins get the same tools as the model)."
             )
         try:
             timeout = float(timeout)
@@ -546,6 +553,20 @@ class PluginContext(PluginCapabilityCtxMixin):
         else:
             envelope = {"ok": True, "result": parsed if parsed is not None else raw}
         return {**envelope, "truncated": True} if truncated else envelope
+
+    @staticmethod
+    def _mcp_tool_visible(server: str, tool: str) -> bool:
+        """Model-facing ``tools.include``/``exclude`` predicate; any error -> hidden."""
+        try:
+            from tools.mcp_tool_config import _load_mcp_config
+            from tools import mcp_tool_registration as _registration
+            config = (_load_mcp_config() or {}).get(server)
+            config = config if isinstance(config, dict) else {}
+            return bool(_registration._make_tool_filter(server, config)(tool))
+        except Exception as exc:
+            logger.warning("MCP tool filter for %s/%s failed (%s); refusing the call",
+                           server, tool, exc)
+            return False
 
     @staticmethod
     def _mcp_allowlist(plugin_id: str) -> list[str]:
