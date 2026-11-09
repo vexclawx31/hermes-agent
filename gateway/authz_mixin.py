@@ -740,7 +740,9 @@ class GatewayAuthorizationMixin:
             self._under_authorization_profile(source, lambda: self._bot_loop_guard_instance().note_reply(
                 self._bot_loop_guard_conversation(source), str(source.user_id or "")))
 
-    def _is_user_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
+    def _is_user_authorized(
+        self, source: SessionSource, *, allow_adapter_delegation: bool = True, fresh_group_sender_rules: bool = False,
+    ) -> bool:
         """Whether a user may use the bot.
 
         Order: trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``,
@@ -748,14 +750,17 @@ class GatewayAuthorizationMixin:
         ``GATEWAY_ALLOW_ALL_USERS``, default deny. A bot-authored message that any of these admits
         is still refused while its chat's loop guard is cooling down.
         """
-        if not self._principal_authorized(source, allow_adapter_delegation=allow_adapter_delegation):
+        if not self._principal_authorized(source, allow_adapter_delegation=allow_adapter_delegation,
+                                          fresh_group_sender_rules=fresh_group_sender_rules):
             return False
         if not getattr(source, "is_bot", False):
             return True
         # The guard judges the final verdict: a chat allowlist admits a bot before the ALLOW_BOTS block runs.
         return not self._bot_loop_guard_instance().blocked(self._bot_loop_guard_conversation(source))
 
-    def _principal_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool) -> bool:
+    def _principal_authorized(
+        self, source: SessionSource, *, allow_adapter_delegation: bool, fresh_group_sender_rules: bool = False,
+    ) -> bool:
         """The allowlist verdict alone, before the bot loop guard."""
         from gateway.session_local import authorize_local_source
         local_verdict = authorize_local_source(self, source)
@@ -772,7 +777,12 @@ class GatewayAuthorizationMixin:
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
         # Per-group sender rules (WhatsApp ``groups.<id>.allow_from``) are authoritative for group turns:
         # re-check this sender on the live adapter before allow-all, chat-scoped and env allowlist grants.
-        if is_group and allow_adapter_delegation:
+        # ``fresh_group_sender_rules``: durable native admission and its stored-row replay run with
+        # delegation off, but their source identity is the platform event the adapter itself admitted,
+        # not a caller's choice, so the live adapter's fresh verdict applies there too. Callers that
+        # name an identity themselves (plugin injection) and the role-reauthorization shortcut leave it
+        # off; the caller-flag grants below stay delegation-gated either way.
+        if is_group and (allow_adapter_delegation or fresh_group_sender_rules):
             sender_rules = self._adapter_group_sender_verdict(source, source.user_id, adapter_profile)
             if sender_rules is not None:
                 return sender_rules
