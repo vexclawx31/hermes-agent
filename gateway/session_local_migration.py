@@ -68,10 +68,56 @@ def adoption_origin(origin):
     return origin
 
 
+def fill_adopted_origin(authority, actor, session_id, origin):
+    """Fork (launch adapter): the one-time label of a session an earlier resume adopted WITHOUT one.
+
+    Pre-v0.23 conversations adopted before adoption carried the resuming client's label froze a policy
+    with no ``origin``. A labelled resume sets it once, under the adoption's own rules: only for a policy
+    that has no ``origin`` and came from legacy adoption (its ``gateway.local_legacy.v1:`` binding), only
+    for the actor adoption admits, with the label validated as adoption validates it (``adoption_origin``).
+    Nothing else of the request is applied: the new policy is the stored one with ``origin`` added, re-bound
+    and committed as its next generation by compare-and-swap (a concurrent edit or a running turn refuses
+    it, and nothing is written). Returns whether it labelled the session."""
+    from hermes_state_local import local_receipt
+    from hermes_state_local_migration import LEGACY_PREFIX
+    stored = local_receipt(authority.db, session_id)['policy']
+    request = json.loads(stored['request_json'])
+    if 'origin' in request or actor.profile_id != authority.profile_id:
+        return False
+    if (getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) != actor
+            or not {'session:read', 'session:create'} <= actor.capabilities):
+        return False
+    with authority.db._read_ctx() as conn:
+        if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (LEGACY_PREFIX + session_id,)).fetchone() is None:
+            return False  # created fresh on v0.23: its unlabelled launch is its own
+    origin = adoption_origin(origin)
+    from gateway.session_policy import restore_policy
+    from gateway.session_policy_refresh import _rebind
+    from hermes_state_mutation_prepared import commit_refreshed_policy
+    generation = authority.db.get_session(session_id)['runtime_generation']
+    old = restore_policy(stored)
+    labelled = replace(old, request_json=json.dumps({**request, 'origin': origin}))
+    labelled = _rebind(authority, session_id, old, labelled, {}, ())
+    commit_refreshed_policy(authority.db, epoch=authority.epoch, session_id=session_id, old=stored,
+                            new=asdict(labelled), generation=generation)
+    live = authority.sessions.get(session_id)
+    from gateway.session_history_mount import is_history_mount
+    if live is not None and not is_history_mount(live):
+        # Already served: its live policy follows the commit, as a policy refresh publishes it.
+        from gateway.session_local import local_session_info, publish_local_policy
+        ref = SessionRef(authority.profile_id, session_id)
+        publish_local_policy(authority, session_id)
+        authority._schedule(ref)
+        authority._publish_pending(ref)
+        live.event_stream.publish(session_id, local_session_info(authority, ref), event_type='session.info')
+    return True
+
+
 def require_frozen_origin(authority, session_id, origin):
     """Fork (launch adapter): a labelled resume of a session whose local policy is already frozen.
-    The frozen ``origin`` (present or absent) is never changed by a resume; a label that differs from
-    it is refused, as the client's own ``check_resume_policy`` refuses any other differing launch flag."""
+    A frozen ``origin`` is never changed by a resume, and an unlabelled policy is labelled only once, by
+    ``fill_adopted_origin``; any other label that differs is refused, as the client's own
+    ``check_resume_policy`` refuses any other differing launch flag."""
     from hermes_state_local import local_receipt
     request = json.loads(local_receipt(authority.db, session_id)['policy']['request_json'])
     if request.get('origin') != origin:
@@ -84,8 +130,9 @@ def resolve_local_target(authority, actor, sid, *, origin=None, relabel='refuse'
 
     *origin*: the resuming client's provenance label. Adopting a legacy row freezes it as the new
     policy's ``origin`` (``adoption_origin``). A session whose local policy is already frozen keeps its
-    own: with ``relabel='refuse'`` (``session.resume``) a different label is refused; ``'ignore'`` is
-    ``session.create``'s titled create-if-missing, which leaves every creation field of an existing
+    own, except that a policy adopted without one takes the label once (``fill_adopted_origin``). Otherwise,
+    with ``relabel='refuse'`` (``session.resume``) a different label is refused; ``'ignore'`` is
+    ``session.create``'s titled create-if-missing, which leaves every other creation field of an existing
     session as it was."""
     db = authority.db
     row = db.get_session(sid)
@@ -104,7 +151,8 @@ def resolve_local_target(authority, actor, sid, *, origin=None, relabel='refuse'
     if bound or str(row.get('chat_id') or '').startswith('local-'):
         ref = SessionRef(authority.profile_id, row['chat_id'])
         authority.authorize(actor, ref, 'session:read')
-        if origin is not None and relabel == 'refuse':
+        if (origin is not None and not fill_adopted_origin(authority, actor, ref.session_id, origin)
+                and relabel == 'refuse'):
             require_frozen_origin(authority, ref.session_id, origin)
         from gateway.session_local_recovery import restore_local_session
         return restore_local_session(authority, ref.session_id) if bound else ref

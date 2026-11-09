@@ -495,8 +495,9 @@ class AuthorityConnection:
         hidden = params.pop('hidden', False)
         if type(hidden) is not bool:
             raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
-        # Fork (launch adapter): a found legacy row is adopted under the request's provenance label; a
-        # session with a frozen policy keeps its own, like every other creation field here.
+        # Fork (launch adapter): a found legacy row is adopted under the request's provenance label, and one
+        # adopted earlier without a label takes it once; any other frozen origin is kept, like every other
+        # creation field here.
         ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True,
                                                origin=params.get('origin'), relabel='ignore')
         if (not ref and title == 'Bot Chat'

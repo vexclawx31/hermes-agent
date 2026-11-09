@@ -5,9 +5,10 @@
 a legacy row the first time they open it. The adoption freezes the client's validated label as the new
 policy's ``origin``, so the conversation's turns carry it (``turn_origin_label`` / ``launch_origin_source``)
 and help-desk doors that require a turn source accept its MCP calls. Only the label carries over: every
-other creation field of the request is ignored, as an unlabelled adoption ignores it. A session whose
-policy is already frozen keeps its origin (present or absent); ``session.resume`` refuses a different
-label, the titled create-if-missing leaves it as it was. ``switchboard-tenant`` is never minted by
+other creation field of the request is ignored, as an unlabelled adoption ignores it. A session an
+earlier resume adopted without a label takes the label once, under the same rules. Any other frozen
+origin is kept (a labelled one, or the absent one of a session created fresh on v0.23): ``session.resume``
+refuses a different label, the titled create-if-missing leaves it as it was. ``switchboard-tenant`` is never minted by
 adoption, and a refused label refuses the adoption: nothing is written.
 
 Real: SessionStore/SessionAuthority/AuthorityConnection dispatch, ``resolve_local_target`` ->
@@ -176,17 +177,76 @@ async def test_a_frozen_origin_resists_relabelling(home, owner):
     assert _turn_labels(runner, authority, sid)[0] == 'helpdesk-ask'
 
 
+def _without_origin(policy):
+    """The stored policy minus its origin and the secret references that hash the whole policy."""
+    policy = dict(policy)
+    request = json.loads(policy.pop('request_json'))
+    request.pop('origin', None)
+    refs = {ref: policy.pop(ref) is None for ref in ('credential_ref', 'config_secret_ref')}
+    return request, refs, policy
+
+
 @pytest.mark.asyncio
-async def test_an_already_adopted_unlabelled_session_stays_unlabelled(home, owner):
-    """Adoption happens once. A session adopted without a label (before this fix, or by an unlabelled
-    resume) has a frozen policy whose origin is absent, and a later labelled resume never adds one."""
+@pytest.mark.parametrize('door', ['create-if-missing', 'resume-id'])
+async def test_a_session_adopted_without_a_label_takes_one_label_once(home, owner, door):
+    """The live case: a pre-v0.23 conversation an earlier v0.23 resume adopted unlabelled (its policy has
+    no origin and the ``gateway.local_legacy.v1:`` binding). The next labelled resume labels it, once,
+    while it is served; nothing else of the request is applied, and a different label later is refused
+    (``session.resume``) or ignored (titled create-if-missing)."""
     runner, authority, connection = owner
     _legacy(authority.db, home, 'legacy-1', title=TITLE)
-    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-1')
-    _refused(await _call(connection, 'session.resume', session_id='legacy-1', origin='helpdesk-ask'))
-    assert 'result' in await _create_titled(connection, home, TITLE, 'c2', origin='helpdesk-ask')
-    assert _origin(authority, 'legacy-1') is None
+    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-1')  # adopted unlabelled
+    before = _stored(authority, 'legacy-1')
+    assert 'origin' not in json.loads(before['request_json'])
     assert _turn_labels(runner, authority, 'legacy-1') == ('', {})
+    other = home / 'elsewhere'
+    other.mkdir()
+    if door == 'create-if-missing':
+        response = await _call(connection, 'session.create', request_id='c2', source='cli', cwd=str(other),
+                               title=TITLE, origin='helpdesk-ask', toolsets=['terminal', 'web'],
+                               model='other-model', yolo=True)
+    else:
+        response = await _call(connection, 'session.resume', session_id='legacy-1', origin='helpdesk-ask')
+    assert 'result' in response, response
+    assert response['result']['session_id'] == 'legacy-1'
+    after = _stored(authority, 'legacy-1')
+    assert _origin(authority, 'legacy-1') == 'helpdesk-ask'
+    assert response['result']['info']['launch_request'].get('origin') == 'helpdesk-ask'
+    assert _without_origin(after) == _without_origin(before)  # restrictions unchanged
+    # The served session's live policy follows the commit: its next turn is labelled.
+    assert _turn_labels(runner, authority, 'legacy-1') == ('helpdesk-ask', {'source': 'helpdesk-ask'})
+    # Once: a second, different label never relabels it.
+    _refused(await _call(connection, 'session.resume', session_id='legacy-1', origin='other-label'))
+    assert 'result' in await _create_titled(connection, home, TITLE, 'c3', origin='other-label')
+    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-1', origin='helpdesk-ask')
+    assert _origin(authority, 'legacy-1') == 'helpdesk-ask'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('label', ['switchboard-tenant', 'cli', 'slack', 'Bad_Label', 'x'])
+async def test_the_one_time_label_is_refused_for_tenant_reserved_and_invalid_labels(home, owner, label):
+    _runner, authority, connection = owner
+    _legacy(authority.db, home, 'legacy-1', title=TITLE)
+    assert 'result' in await _call(connection, 'session.resume', session_id='legacy-1')
+    before = _stored(authority, 'legacy-1')
+    _refused(await _call(connection, 'session.resume', session_id='legacy-1', origin=label))
+    assert 'error' in await _create_titled(connection, home, TITLE, 'c2', origin=label)
+    assert _stored(authority, 'legacy-1') == before
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_unlabelled_v023_session_is_never_labelled_by_a_resume(home, owner):
+    """No legacy binding: the session was created on v0.23 without a label, and that launch is its own."""
+    runner, authority, connection = owner
+    response = await _call(connection, 'session.create', request_id='fresh', source='cli', cwd=str(home))
+    sid = response['result']['session_id']
+    authority.db.set_session_title(sid, 'fresh chat')
+    before = _stored(authority, sid)
+    _refused(await _call(connection, 'session.resume', session_id=sid, origin='helpdesk-ask'))
+    assert (await _create_titled(connection, home, 'fresh chat', 'again', origin='helpdesk-ask'))['result'][
+        'session_id'] == sid
+    assert _stored(authority, sid) == before
+    assert _turn_labels(runner, authority, sid) == ('', {})
 
 
 @pytest.mark.asyncio
