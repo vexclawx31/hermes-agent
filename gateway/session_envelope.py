@@ -360,8 +360,12 @@ async def check_native_route(runner, payload, session_id, available_source, adap
     _validate_native(runner, event, provenance, fresh_roles)
     route = payload['native_text_v1']['route']
     store = runner.session_store
+    # Startup recovery binds the entry's stored origin, rebuilt from disk without the trust markers:
+    # key a copy carrying the adapter's own verdict, as the restored event is.
+    available = copy(available_source)
+    _reannotate_adapter_trust(runner, available)
     if (store._generate_session_key(event.source) != route
-            or store._generate_session_key(available_source) != route):
+            or store._generate_session_key(available) != route):
         raise RuntimeStoreError('admission_conflict')
     entry = store.lookup_by_session_key(route)
     if entry is None or entry.session_id != session_id:

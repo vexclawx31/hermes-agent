@@ -127,6 +127,26 @@ async def test_drain_preflight_accepts_a_trusted_group_row(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_startup_recovery_binds_queued_trusted_rows_to_the_stored_origin(tmp_path, monkeypatch):
+    """After a restart, recovery binds each queued row to the routing entry's origin, rebuilt from
+    disk without the trust markers. Keyed per participant it never matched the shared route, so
+    every queued trusted-group row was refused; the adapter's verdict now applies to it too."""
+    from gateway.session import SessionSource
+
+    runner, adapter = _setup(tmp_path, monkeypatch)
+    authority = await _authority(runner, monkeypatch, "wa-trusted-recovery")
+    live = _live_source(adapter, MEMBER)
+    _payload, target = await _admit(runner, authority, _event(live, "q1"))
+    await _admit(runner, authority, _event(_live_source(adapter, OWNER), "q2"))
+    stored_origin = SessionSource.from_dict(live.to_dict())  # as a restarted store holds it
+    assert stored_origin.shared_group is False
+    authority.sessions.pop(target, None)  # a fresh owner: no live session yet
+    assert await authority.recover_native_sessions([(target, stored_origin, adapter)]) == {target: "ready"}
+    assert stored_origin.shared_group is False  # the caller's origin object is not changed
+    assert authority.sessions[target].source.shared_group is True
+
+
+@pytest.mark.asyncio
 async def test_untrusted_group_keeps_per_participant_sessions(tmp_path, monkeypatch):
     from gateway.session_envelope import check_native_route
 
