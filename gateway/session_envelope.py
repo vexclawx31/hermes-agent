@@ -297,12 +297,28 @@ def restore_native_source(payload, runner=None):
     source.is_bot = envelope['source']['is_bot']
     # Private descriptor requests a fresh check, never supplies the verdict.
     source.role_authorized = envelope.get('reauthorize') == 'roles'
-    if 'provenance' in envelope:
-        from gateway.session_ingress_context import callback_runner, restore_provenance
-        runner = runner or callback_runner()
-        if runner is not None:
-            restore_provenance(runner, source, envelope['provenance'])
+    from gateway.session_ingress_context import callback_runner, restore_provenance
+    runner = runner or callback_runner()
+    if 'provenance' in envelope and runner is not None:
+        restore_provenance(runner, source, envelope['provenance'])
+    _reannotate_adapter_trust(runner, source)
     return source
+
+
+def _reannotate_adapter_trust(runner, source):
+    """Re-derive the wire-invisible trust markers (``shared_group``, ``sender_role``) from the
+    answering adapter's own config, never from the payload. The live event carried them when its
+    route was stamped; a source rebuilt without them keys per participant, so admission reserved a
+    per-sender session under the shared route and every drain preflight refused the row
+    (``admission_conflict``) in each trusted group. A trust change between admission and drain
+    re-keys the source and is still refused there."""
+    lookup = getattr(runner, '_adapter_for_source', None)
+    if lookup is None or getattr(source, 'chat_type', '') != 'group':
+        return
+    adapter = lookup(source)
+    annotate = getattr(adapter, 'annotate_group_trust', None)
+    if callable(annotate):
+        annotate(source)
 
 
 def restore_native(payload, runner=None):
