@@ -592,6 +592,8 @@ class SessionAuthority:
         if revision := payload['native_text_v1']['event'].get('edit_revision'):
             request_id += ':edit:' + revision  # an edit is its own input, not a changed replay of the send
         committed = [ref]  # the row's target: the write may retarget a rotated-away reservation
+        from gateway.ingress_identity import hold_pending, settle_pending
+        held = ('messaging:' + identity, request_id)
         # A /retry re-send carries its transcript rewrite: it commits in this admission's own write.
         from gateway import session_retry_admission
         rewrite = session_retry_admission.take(event, self.db)
@@ -600,17 +602,24 @@ class SessionAuthority:
             committed[0] = SessionRef(self.profile_id, row.get('target_session_id') or ref.session_id)
             if rewrite is not None and rewrite.applied:
                 rewrite.on_commit()
+            settle_pending(held, event, row['admission_id'] if row['status'] == 'queued' else None)
             return self._admitted(committed[0], event, row)
         from gateway.session_ingress_media import _lease_scope
         if (scope := _lease_scope.get()) is not None:
             scope.write_started = True
         native_write_started.set(True)  # shielded from here: a cancelled caller may still commit
-        return await tracked_write(self, partial(
-            self._admit_native_write, principal_id='messaging:' + identity, session_id=ref.session_id,
-            request_id=request_id, payload=payload,
-            authorize=session_retry_admission.compose(rewrite, self._admission_gate(fence)),
-            raw=getattr(event, 'raw_message', None)),
-            then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]))
+        # Held before the write: a drain already looping may claim the row before ``admitted`` runs.
+        hold_pending(self.runner, held, event)
+        try:
+            return await tracked_write(self, partial(
+                self._admit_native_write, principal_id='messaging:' + identity, session_id=ref.session_id,
+                request_id=request_id, payload=payload,
+                authorize=session_retry_admission.compose(rewrite, self._admission_gate(fence)),
+                raw=getattr(event, 'raw_message', None)),
+                then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]))
+        except Exception:
+            settle_pending(held, event)  # refused: nothing committed for this event
+            raise
 
     def _admit_native_write(self, *, principal_id, session_id, request_id, payload, authorize, raw=None):
         # Off the loop and in admission order: the redelivery reconcile reads the ledger it decides
@@ -859,6 +868,8 @@ class SessionAuthority:
         # Published once: a later exact retry re-collects media but never repeats the completion.
         self.cancel_obligations.discard(admission_id)
         self.native_waiters.discard(admission_id)
+        from gateway.ingress_identity import release_admitted
+        release_admitted(admission_id)
         drop_producer_turn(self, admission_id)
         waiter = self.waiters.pop(admission_id, None)
         if waiter is not None and not waiter.done():

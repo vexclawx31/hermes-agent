@@ -281,6 +281,9 @@ def bind_followup_turn_sender(pending_event: Any, source: Any, interrupted: bool
     """A queued follow-up runs as the next turn in this same context. With its own event it gets
     that event's trusted sender; an event-less follow-up of an interrupted turn carries interrupt
     text of unknown origin, so it is downgraded (fail closed); a leftover steer keeps the sender."""
+    # The follow-up is another message (or none): the first turn's native proof is not its own.
+    from gateway.ingress_identity import clear_trusted_ingress
+    clear_trusted_ingress()
     if pending_event is not None:
         rebind_turn_sender(**turn_sender_vars(None, pending_event, source=source))
     elif interrupted:
