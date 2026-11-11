@@ -316,7 +316,7 @@ async def execute_admission(authority, ref, row):
         home = restore_provenance(authority.runner, event.source, provenance)
     if 'native_text_v1' in row['payload']:
         from gateway.ingress_identity import carry_admitted
-        carry_admitted(authority.runner, row['admission_id'], event)
+        carry_admitted(authority.runner, (row['principal_id'], row['request_id']), row['admission_id'], event)
     from gateway.config import Platform
     from gateway.session_api_turn import api_execution, prepare_api_execution
     from gateway.session_results import execution_result

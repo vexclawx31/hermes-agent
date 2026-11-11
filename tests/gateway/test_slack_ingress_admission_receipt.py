@@ -16,18 +16,21 @@ import pytest_asyncio
 
 from gateway import ingress_identity
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.ingress_identity import carry_admitted, get_trusted_ingress, hold_admitted, slack_binding
+from gateway.ingress_identity import (
+    carry_admitted, get_trusted_ingress, hold_pending, release_admitted, settle_pending, slack_binding)
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session_authority import initialize_session_authority
-from gateway.session_context import clear_session_vars
+from gateway.session_context import clear_session_vars, fold_turn_sender
 from gateway.session_envelope import restore_native, snapshot_native
 from gateway.session_results import execution_result
 from plugins.platforms.slack.adapter import SlackAdapter
 from tests.waiting import async_wait_until
 
 CHANNEL, TEAM, USER = 'C123456789', 'T123456789', 'U123456789'
+KEY = ('messaging:fixture', '1788265045.536689')  # the row identity admission derives before its write
+OTHER_KEY = ('messaging:fixture', 'another-row')
 
 
 def _adapter(runner):
@@ -49,6 +52,27 @@ async def _native(adapter, ts='1788265045.536689', user=USER, channel=CHANNEL):
         media_text_inlined=[], channel_context=None)
 
 
+def _admit(runner, admission_id, event):
+    """What ``_admit_native`` does around its write for a row that committed as queued."""
+    hold_pending(runner, KEY, event)
+    settle_pending(KEY, event, admission_id)
+
+
+def _execute(runner, admission_id, rebuilt):
+    """What ``execute_admission`` does for a row whose commit callback already ran."""
+    carry_admitted(runner, OTHER_KEY, admission_id, rebuilt)
+
+
+def _held():
+    return {**ingress_identity._PENDING, **ingress_identity._ADMITTED}
+
+
+def _bind(runner, event, source=None):
+    """The binding the real turn makes (``_hmwa_prepare_turn`` -> ``_set_session_env``)."""
+    return runner._set_session_env(SimpleNamespace(
+        source=event.source if source is None else source, session_key='fixture', session_id='fixture'), event=event)
+
+
 @pytest_asyncio.fixture
 async def gateway(tmp_path, monkeypatch):
     monkeypatch.setenv('SLACK_ALLOWED_USERS', USER)
@@ -63,9 +87,7 @@ async def gateway(tmp_path, monkeypatch):
         return SendResult(success=True, message_id='s')
 
     async def turn(event, source, *_args, **_kwargs):
-        # The binding the real turn makes (``_hmwa_prepare_turn`` -> ``_set_session_env``).
-        tokens = runner._set_session_env(
-            SimpleNamespace(source=source, session_key='fixture', session_id='fixture'), event=event)
+        tokens = _bind(runner, event, source)
         try:
             seen.append((event, get_trusted_ingress()))
         finally:
@@ -75,10 +97,12 @@ async def gateway(tmp_path, monkeypatch):
 
     monkeypatch.setattr(adapter, 'send', send)
     monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+    ingress_identity._PENDING.clear()
     ingress_identity._ADMITTED.clear()
     try:
         yield SimpleNamespace(runner=runner, adapter=adapter, authority=authority, seen=seen)
     finally:
+        ingress_identity._PENDING.clear()
         ingress_identity._ADMITTED.clear()
         authority.db.close()
 
@@ -101,7 +125,19 @@ async def test_fresh_native_message_keeps_verified_origin_through_admission(gate
         'slack', '1788265045.536689', CHANNEL, USER)
     assert evidence.profile == gateway.runner._primary_profile_name
     assert evidence.adapter is gateway.adapter
-    assert not ingress_identity._ADMITTED  # consumed by its own row, nothing left to reuse
+    assert not _held()  # consumed by its own row, nothing left to reuse
+    # The receipt moved: the adapter's original event no longer proves anything.
+    assert slack_binding(gateway.runner, native.source, native)[1] == ''
+
+
+@pytest.mark.asyncio
+async def test_redelivery_of_an_answered_message_holds_nothing_and_runs_no_turn(gateway):
+    await _deliver(gateway, await _native(gateway.adapter))
+    # Slack retried the same message: its row is already terminal.
+    await gateway.adapter.handle_message(await _native(gateway.adapter))
+    await async_wait_until(lambda: not gateway.adapter._background_tasks, timeout=20, what='the redelivery')
+    assert len(gateway.seen) == 1
+    assert not _held()
 
 
 @pytest.mark.asyncio
@@ -111,7 +147,7 @@ async def test_synthetic_event_gets_no_proof_through_admission(gateway):
     forged = MessageEvent(text='list channels', source=replace(native.source), message_id=native.message_id)
     _, evidence = await _deliver(gateway, forged)
     assert evidence is None
-    assert not ingress_identity._ADMITTED
+    assert not _held()
 
 
 @pytest.mark.asyncio
@@ -119,6 +155,7 @@ async def test_copied_native_event_gets_no_proof_through_admission(gateway):
     native = await _native(gateway.adapter)
     _, evidence = await _deliver(gateway, replace(native))
     assert evidence is None
+    assert not _held()
 
 
 @pytest.mark.asyncio
@@ -129,22 +166,52 @@ async def test_saved_payload_replay_and_restart_recovery_get_no_proof(gateway):
     # A saved payload restored on its own never had an admission to claim.
     replayed = restore_native(payload, runner)
     assert slack_binding(runner, replayed.source, replayed)[1] == ''
-    # A restart drops the process-local hold: the recovered row finds nothing.
-    hold_admitted(runner, 'row-1', native)
+    # A restart drops the process-local holds: the recovered row finds nothing.
+    _admit(runner, 'row-1', native)
     assert 'row-1' in ingress_identity._ADMITTED
     ingress_identity._ADMITTED.clear()
-    carry_admitted(runner, 'row-1', replayed)
+    carry_admitted(runner, KEY, 'row-1', replayed)
     assert slack_binding(runner, replayed.source, replayed)[1] == ''
     # A row cancelled while queued releases its hold.
-    hold_admitted(runner, 'row-1', native)
-    ingress_identity.release_admitted('row-1')
-    carry_admitted(runner, 'row-1', replayed)
+    _admit(runner, 'row-1', native)
+    release_admitted('row-1')
+    carry_admitted(runner, KEY, 'row-1', replayed)
     assert slack_binding(runner, replayed.source, replayed)[1] == ''
     # Another row cannot claim this one's hold, and the wrong claim does not consume it.
-    hold_admitted(runner, 'row-1', native)
-    carry_admitted(runner, 'row-2', replayed)
+    _admit(runner, 'row-1', native)
+    _execute(runner, 'row-2', replayed)
     assert slack_binding(runner, replayed.source, replayed)[1] == ''
     assert 'row-1' in ingress_identity._ADMITTED
+
+
+@pytest.mark.asyncio
+async def test_a_refused_or_already_started_row_keeps_no_hold(gateway):
+    runner = gateway.runner
+    native = await _native(gateway.adapter)
+    hold_pending(runner, KEY, native)
+    settle_pending(KEY, native)  # the write was refused, or its row was not queued
+    assert not _held()
+    rebuilt = restore_native(snapshot_native(runner, native), runner)
+    carry_admitted(runner, KEY, 'row-1', rebuilt)
+    assert slack_binding(runner, rebuilt.source, rebuilt)[1] == ''
+
+
+@pytest.mark.asyncio
+async def test_a_drain_that_claims_the_row_before_the_commit_callback_still_carries_once(gateway):
+    runner = gateway.runner
+    native = await _native(gateway.adapter)
+    payload = snapshot_native(runner, native)
+    hold_pending(runner, KEY, native)
+    rebuilt = restore_native(payload, runner)
+    carry_admitted(runner, KEY, 'row-1', rebuilt)  # the drain ran first
+    assert slack_binding(runner, rebuilt.source, rebuilt)[1] == native.message_id
+    settle_pending(KEY, native, 'row-1')  # the late callback finds nothing to move
+    assert not _held()
+    # Another delivery's settle never moves or drops a hold that is not its own event.
+    other = await _native(gateway.adapter)
+    hold_pending(runner, KEY, other)
+    settle_pending(KEY, native, 'row-1')
+    assert ingress_identity._PENDING == {KEY: other} and not ingress_identity._ADMITTED
 
 
 @pytest.mark.asyncio
@@ -152,11 +219,15 @@ async def test_claim_is_one_shot(gateway):
     runner = gateway.runner
     native = await _native(gateway.adapter)
     payload = snapshot_native(runner, native)
-    hold_admitted(runner, 'row-1', native)
+    _admit(runner, 'row-1', native)
     first, second = restore_native(payload, runner), restore_native(payload, runner)
-    carry_admitted(runner, 'row-1', first)
-    carry_admitted(runner, 'row-1', second)  # the same row executed twice
+    _execute(runner, 'row-1', first)
+    _execute(runner, 'row-1', second)  # the same row executed twice
     assert slack_binding(runner, first.source, first)[1] == native.message_id
+    assert slack_binding(runner, second.source, second)[1] == ''
+    # The same event admitted under a second row carries nothing either: its receipt already moved.
+    ingress_identity._ADMITTED['row-2'] = native
+    _execute(runner, 'row-2', second)
     assert slack_binding(runner, second.source, second)[1] == ''
     # The carried receipt is bound to the rebuilt objects: a copy of them has none.
     duplicate = replace(first)
@@ -169,8 +240,11 @@ async def test_claim_is_one_shot(gateway):
 async def test_duplicate_admission_does_not_overwrite_the_held_event(gateway):
     runner = gateway.runner
     first, second = await _native(gateway.adapter), await _native(gateway.adapter)
-    hold_admitted(runner, 'row-1', first)
-    hold_admitted(runner, 'row-1', second)
+    hold_pending(runner, KEY, first)
+    hold_pending(runner, KEY, second)
+    assert ingress_identity._PENDING[KEY] is first
+    settle_pending(KEY, first, 'row-1')
+    _admit(runner, 'row-1', second)
     assert ingress_identity._ADMITTED['row-1'] is first
 
 
@@ -178,13 +252,13 @@ async def test_duplicate_admission_does_not_overwrite_the_held_event(gateway):
 async def test_unverified_events_are_never_held(gateway):
     runner = gateway.runner
     native = await _native(gateway.adapter)
-    hold_admitted(runner, 'copy', replace(native))
-    hold_admitted(runner, 'synthetic', MessageEvent(text='x', source=replace(native.source),
-                                                    message_id=native.message_id))
+    _admit(runner, 'copy', replace(native))
+    _admit(runner, 'synthetic', MessageEvent(text='x', source=replace(native.source),
+                                             message_id=native.message_id))
     internal = await _native(gateway.adapter)
     internal.internal = True
-    hold_admitted(runner, 'internal', internal)
-    assert not ingress_identity._ADMITTED
+    _admit(runner, 'internal', internal)
+    assert not _held()
 
 
 @pytest.mark.asyncio
@@ -199,10 +273,15 @@ async def test_mismatched_rebuilt_source_gets_no_proof(gateway, field, value):
     if field == 'message_id':
         payload['native_text_v1']['event']['message_id'] = value
     rebuilt = restore_native(payload, runner)
-    hold_admitted(runner, 'row-1', native)
-    carry_admitted(runner, 'row-1', rebuilt)
+    _admit(runner, 'row-1', native)
+    _execute(runner, 'row-1', rebuilt)
     assert slack_binding(runner, rebuilt.source, rebuilt)[1] == ''
-    assert 'row-1' not in ingress_identity._ADMITTED  # a failed claim still consumes the hold
+    assert not _held()  # a failed claim still consumes the hold
+    # ...and the receipt: a correct rebuild cannot claim it afterwards.
+    ingress_identity._ADMITTED['row-1'] = native
+    correct = restore_native(snapshot_native(runner, await _native(gateway.adapter)), runner)
+    _execute(runner, 'row-1', correct)
+    assert slack_binding(runner, correct.source, correct)[1] == ''
 
 
 @pytest.mark.asyncio
@@ -210,11 +289,11 @@ async def test_mutating_the_held_event_after_admission_gets_no_proof(gateway):
     # The comparison is against the snapshot taken by the native builder, not the live object.
     runner = gateway.runner
     native = await _native(gateway.adapter)
-    hold_admitted(runner, 'row-1', native)
+    _admit(runner, 'row-1', native)
     native.source.chat_id = 'C999999999'
     for payload_from in (native, await _native(gateway.adapter)):  # the mutated values, then the true ones
         rebuilt = restore_native(snapshot_native(runner, payload_from), runner)
-        carry_admitted(runner, 'row-1', rebuilt)
+        _execute(runner, 'row-1', rebuilt)
         assert slack_binding(runner, rebuilt.source, rebuilt)[1] == ''
         ingress_identity._ADMITTED['row-1'] = native  # even if the hold were still there
 
@@ -243,24 +322,81 @@ async def test_wrong_adapter_runner_or_launch_gets_no_proof(gateway, drift, tmp_
     runner = gateway.runner
     native = await _native(gateway.adapter)
     payload = snapshot_native(runner, native)
-    hold_admitted(runner, 'row-1', native)
+    _admit(runner, 'row-1', native)
     rebuilt = restore_native(payload, runner)
     claimant = _DRIFTS[drift](gateway, rebuilt, tmp_path) or runner
-    carry_admitted(claimant, 'row-1', rebuilt)
+    _execute(claimant, 'row-1', rebuilt)
     assert slack_binding(claimant, rebuilt.source, rebuilt)[1] == ''
     assert slack_binding(runner, rebuilt.source, rebuilt)[1] == ''
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('folded,proven', [
+    ({'sender_role': '', 'sender_id': USER}, True),            # the same sender's follow-up
+    ({'sender_role': '', 'sender_id': 'U999999999'}, False),   # another member's message
+    ({'sender_role': '', 'sender_id': ''}, False),             # text of unknown origin
+])
+async def test_another_senders_text_folded_into_the_turn_revokes_its_proof(gateway, folded, proven):
+    runner = gateway.runner
+    native = await _native(gateway.adapter)
+    _admit(runner, 'row-1', native)
+    rebuilt = restore_native(snapshot_native(runner, native), runner)
+    _execute(runner, 'row-1', rebuilt)
+    tokens = _bind(runner, rebuilt)
+    try:
+        assert get_trusted_ingress() is not None
+        fold_turn_sender('fixture', folded)  # a busy-path steer or redirect joined the running turn
+        assert (get_trusted_ingress() is not None) is proven
+    finally:
+        clear_session_vars(tokens)
+    assert get_trusted_ingress() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('rebuilt_profile,proven', [('beta', True), ('alpha', False), (None, False)])
+async def test_multiplexed_secondary_bot_carries_only_for_its_own_profile(rebuilt_profile, proven):
+    # A multiplex host: bot "beta" is a secondary profile's adapter; its events name it explicitly.
+    from gateway.ingress_identity import capture_launch
+    from gateway.session import SessionSource
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner._primary_profile_name = 'default'
+    runner.adapters = {Platform.SLACK: _adapter(runner)}  # the primary's own bot
+    adapter = _adapter(runner)
+    runner._profile_adapters = {'beta': {Platform.SLACK: adapter}}
+    adapter.set_owner_profile('beta')
+    capture_launch(runner)
+    build_source = adapter.build_source
+
+    def source_for_beta(**kwargs):
+        built = build_source(**kwargs)
+        built.profile = 'beta'
+        return built
+    adapter.build_source = source_for_beta
+    native = await _native(adapter)
+    assert slack_binding(runner, native.source, native) == ('beta', native.message_id)
+    ingress_identity._PENDING.clear()
+    ingress_identity._ADMITTED.clear()
+    _admit(runner, 'row-1', native)
+    encoded = native.source.to_dict()
+    encoded['profile'] = rebuilt_profile
+    rebuilt = MessageEvent(text=native.text, source=SessionSource.from_dict(encoded), message_id=native.message_id)
+    _execute(runner, 'row-1', rebuilt)
+    assert (slack_binding(runner, rebuilt.source, rebuilt)[1] == native.message_id) is proven
+    assert not _held()
 
 
 @pytest.mark.asyncio
 async def test_holds_are_bounded_and_carried_receipts_die_with_their_event(gateway):
     runner = gateway.runner
     native = await _native(gateway.adapter)
-    for index in range(ingress_identity._ADMITTED_MAX + 5):
-        hold_admitted(runner, f'row-{index}', native)
-    assert len(ingress_identity._ADMITTED) == ingress_identity._ADMITTED_MAX
+    last = ingress_identity._HELD_MAX + 4
+    for index in range(last + 1):
+        _admit(runner, f'row-{index}', native)
+    assert len(ingress_identity._ADMITTED) == ingress_identity._HELD_MAX
     assert 'row-0' not in ingress_identity._ADMITTED
     rebuilt = restore_native(snapshot_native(runner, native), runner)
-    carry_admitted(runner, f'row-{ingress_identity._ADMITTED_MAX + 4}', rebuilt)
+    _execute(runner, f'row-{last}', rebuilt)
     key = id(rebuilt)
     assert key in ingress_identity._EVENTS
     del rebuilt

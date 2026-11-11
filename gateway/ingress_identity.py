@@ -6,8 +6,11 @@ and source copies cannot manufacture them by attaching a RoutingIdentity.
 """
 
 from dataclasses import dataclass
+import logging
 import re
 import weakref
+
+logger = logging.getLogger(__name__)
 
 _PROFILE = re.compile(r"[a-z][a-z0-9_-]*\Z")
 _TS = re.compile(r"[0-9]{10,}\.[0-9]{6}\Z")
@@ -184,20 +187,35 @@ def slack_binding(runner, source, event):
 
 
 # Admission rebuilds every native input from its committed snapshot before the turn runs, so the
-# receipt (bound to the adapter's own event object) never reached the turn. The admitted event is
+# receipt (bound to the adapter's own event object) never reached the turn. The verified event is
 # held here, in this process only, until its own committed row executes: nothing is serialized, and
 # a row recovered after a restart or replayed from a saved payload finds nothing to claim.
-_ADMITTED = {}
-_ADMITTED_MAX = 256
+_PENDING = {}  # (principal id, request id) -> event: from before the admission write to its commit callback
+_ADMITTED = {}  # admission id -> event: a committed queued row
+_HELD_MAX = 256
 
 
-def hold_admitted(runner, admission_id, event):
-    """Keep a verified native event for the row its admission just committed (queued rows only)."""
-    if id(event) not in _EVENTS or not slack_binding(runner, event.source, event)[1]:
-        return
-    _ADMITTED.setdefault(admission_id, event)
-    while len(_ADMITTED) > _ADMITTED_MAX:  # rows that never execute (deleted chat) must not pin events
-        del _ADMITTED[next(iter(_ADMITTED))]
+def _hold(table, key, event):
+    table.setdefault(key, event)  # a duplicate delivery never replaces the held event
+    while len(table) > _HELD_MAX:  # rows that never execute (deleted chat) must not pin events
+        logger.warning("Slack ingress hold evicted (%d held): that turn runs without verified origin", _HELD_MAX)
+        del table[next(iter(table))]
+
+
+def hold_pending(runner, key, event):
+    """Before the admission write: keep a native event that verifies now, under its row's identity."""
+    if id(event) in _EVENTS and slack_binding(runner, event.source, event)[1]:
+        _hold(_PENDING, key, event)
+
+
+def settle_pending(key, event, admission_id=None):
+    """After the write: this event's hold moves to the queued row it committed (*admission_id*), or
+    is dropped (refused write, a row already started or terminal). A drain that claimed the row
+    before this callback ran has already consumed it."""
+    if _PENDING.get(key) is event:
+        del _PENDING[key]
+        if admission_id is not None:
+            _hold(_ADMITTED, admission_id, event)
 
 
 def release_admitted(admission_id):
@@ -205,16 +223,19 @@ def release_admitted(admission_id):
     _ADMITTED.pop(admission_id, None)
 
 
-def carry_admitted(runner, admission_id, restored):
+def carry_admitted(runner, key, admission_id, restored):
     """One-shot: re-issue the held event's receipt for *restored*, its row's rebuilt event.
 
     Only when the original still verifies now and the rebuilt source is the same message, sender,
-    chat and profile on the same owning adapter with an equal routing identity. Anything else
-    (and every later claim of the same row) leaves the rebuilt event without proof."""
+    chat and profile on the same owning adapter with an equal routing identity. The original's
+    receipt moves: anything else, and every later claim, leaves the rebuilt event without proof."""
     original = _ADMITTED.pop(admission_id, None)
+    if original is None:
+        original = _PENDING.pop(key, None)
     receipt = _EVENTS.get(id(original))
     if receipt is None or not slack_binding(runner, original.source, original)[1]:
         return
+    del _EVENTS[id(original)]
     adapter, source = receipt.adapter(), restored.source
     if (
         restored.internal is not False
@@ -233,9 +254,9 @@ def carry_admitted(runner, admission_id, restored):
     identity = identity_of(source) or adapter._canonicalize(source)
     if identity is None or identity != receipt.identity or identity.adapter() is not adapter:
         return
-    key = id(restored)
-    ref = weakref.ref(restored, lambda ref: _EVENTS.pop(key, None))
-    _EVENTS[key] = _Receipt(
+    rebuilt_key = id(restored)
+    ref = weakref.ref(restored, lambda ref: _EVENTS.pop(rebuilt_key, None))
+    _EVENTS[rebuilt_key] = _Receipt(
         ref, weakref.ref(source), receipt.adapter, receipt.runner, receipt.launch, receipt.fields,
         identity, receipt.owner)
 
@@ -283,6 +304,12 @@ def get_trusted_ingress():
         return None
     profile, message = slack_binding(runner, source, event)
     if not message:
+        return None
+    # Another sender's text folded into this turn (steer, redirect, mixed burst) downgraded its
+    # sender: the turn is no longer this one verified message.
+    from gateway.session_context import turn_sender_hook_kwargs
+
+    if turn_sender_hook_kwargs()["sender_id"] != source.user_id:
         return None
     return TrustedIngress(
         "slack",
