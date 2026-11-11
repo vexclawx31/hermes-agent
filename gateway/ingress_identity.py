@@ -183,6 +183,63 @@ def slack_binding(runner, source, event):
     return denied
 
 
+# Admission rebuilds every native input from its committed snapshot before the turn runs, so the
+# receipt (bound to the adapter's own event object) never reached the turn. The admitted event is
+# held here, in this process only, until its own committed row executes: nothing is serialized, and
+# a row recovered after a restart or replayed from a saved payload finds nothing to claim.
+_ADMITTED = {}
+_ADMITTED_MAX = 256
+
+
+def hold_admitted(runner, admission_id, event):
+    """Keep a verified native event for the row its admission just committed (queued rows only)."""
+    if id(event) not in _EVENTS or not slack_binding(runner, event.source, event)[1]:
+        return
+    _ADMITTED.setdefault(admission_id, event)
+    while len(_ADMITTED) > _ADMITTED_MAX:  # rows that never execute (deleted chat) must not pin events
+        del _ADMITTED[next(iter(_ADMITTED))]
+
+
+def release_admitted(admission_id):
+    """A queued row settled without executing (cancelled, /stop): its hold is dropped with it."""
+    _ADMITTED.pop(admission_id, None)
+
+
+def carry_admitted(runner, admission_id, restored):
+    """One-shot: re-issue the held event's receipt for *restored*, its row's rebuilt event.
+
+    Only when the original still verifies now and the rebuilt source is the same message, sender,
+    chat and profile on the same owning adapter with an equal routing identity. Anything else
+    (and every later claim of the same row) leaves the rebuilt event without proof."""
+    original = _ADMITTED.pop(admission_id, None)
+    receipt = _EVENTS.get(id(original))
+    if receipt is None or not slack_binding(runner, original.source, original)[1]:
+        return
+    adapter, source = receipt.adapter(), restored.source
+    if (
+        restored.internal is not False
+        or restored.message_id != receipt.fields[2]
+        or _fields(source) != receipt.fields
+        or runner._adapter_for_source(source) is not adapter
+    ):
+        return
+    transport = getattr(source, "_transport_adapter_ref", None)
+    if transport is None:
+        source._transport_adapter_ref = weakref.ref(adapter)
+    elif not isinstance(transport, weakref.ReferenceType) or transport() is not adapter:
+        return
+    from gateway.session_identity import identity_of
+
+    identity = identity_of(source) or adapter._canonicalize(source)
+    if identity is None or identity != receipt.identity or identity.adapter() is not adapter:
+        return
+    key = id(restored)
+    ref = weakref.ref(restored, lambda ref: _EVENTS.pop(key, None))
+    _EVENTS[key] = _Receipt(
+        ref, weakref.ref(source), receipt.adapter, receipt.runner, receipt.launch, receipt.fields,
+        identity, receipt.owner)
+
+
 from contextvars import ContextVar
 
 _TRUSTED_INGRESS = ContextVar("trusted_native_ingress", default=None)

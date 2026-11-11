@@ -600,6 +600,9 @@ class SessionAuthority:
             committed[0] = SessionRef(self.profile_id, row.get('target_session_id') or ref.session_id)
             if rewrite is not None and rewrite.applied:
                 rewrite.on_commit()
+            if row['status'] == 'queued':
+                from gateway.ingress_identity import hold_admitted
+                hold_admitted(self.runner, row['admission_id'], event)
             return self._admitted(committed[0], event, row)
         from gateway.session_ingress_media import _lease_scope
         if (scope := _lease_scope.get()) is not None:
@@ -859,6 +862,8 @@ class SessionAuthority:
         # Published once: a later exact retry re-collects media but never repeats the completion.
         self.cancel_obligations.discard(admission_id)
         self.native_waiters.discard(admission_id)
+        from gateway.ingress_identity import release_admitted
+        release_admitted(admission_id)
         drop_producer_turn(self, admission_id)
         waiter = self.waiters.pop(admission_id, None)
         if waiter is not None and not waiter.done():
