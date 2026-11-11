@@ -204,8 +204,11 @@ def _hold(table, key, event):
 
 def hold_pending(runner, key, event):
     """Before the admission write: keep a native event that verifies now, under its row's identity."""
-    if id(event) in _EVENTS and slack_binding(runner, event.source, event)[1]:
-        _hold(_PENDING, key, event)
+    try:
+        if id(event) in _EVENTS and slack_binding(runner, event.source, event)[1]:
+            _hold(_PENDING, key, event)
+    except Exception:  # proof is optional; the admission it rides on is not
+        logger.warning("Slack ingress hold failed: that turn runs without verified origin", exc_info=True)
 
 
 def settle_pending(key, event, admission_id=None):
@@ -228,10 +231,19 @@ def carry_admitted(runner, key, admission_id, restored):
 
     Only when the original still verifies now and the rebuilt source is the same message, sender,
     chat and profile on the same owning adapter with an equal routing identity. The original's
-    receipt moves: anything else, and every later claim, leaves the rebuilt event without proof."""
+    receipt moves: anything else, and every later claim, leaves the rebuilt event without proof.
+    A failure here never fails the claimed turn; it runs without proof."""
     original = _ADMITTED.pop(admission_id, None)
     if original is None:
         original = _PENDING.pop(key, None)
+    try:
+        _carry(runner, original, restored)
+    except Exception:
+        _EVENTS.pop(id(restored), None)
+        logger.warning("Slack ingress carry failed: the turn runs without verified origin", exc_info=True)
+
+
+def _carry(runner, original, restored):
     receipt = _EVENTS.get(id(original))
     if receipt is None or not slack_binding(runner, original.source, original)[1]:
         return

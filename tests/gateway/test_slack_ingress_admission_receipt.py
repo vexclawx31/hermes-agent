@@ -353,6 +353,46 @@ async def test_another_senders_text_folded_into_the_turn_revokes_its_proof(gatew
 
 
 @pytest.mark.asyncio
+async def test_a_follow_up_turn_in_the_same_context_does_not_inherit_the_proof(gateway):
+    from gateway.session_context import bind_followup_turn_sender
+    runner = gateway.runner
+    native = await _native(gateway.adapter)
+    _admit(runner, 'row-1', native)
+    rebuilt = restore_native(snapshot_native(runner, native), runner)
+    _execute(runner, 'row-1', rebuilt)
+    tokens = _bind(runner, rebuilt)
+    try:
+        assert get_trusted_ingress() is not None
+        # The same sender's queued follow-up runs next in this context: another message, no proof.
+        bind_followup_turn_sender(replace(rebuilt), rebuilt.source, False)
+        assert get_trusted_ingress() is None
+    finally:
+        clear_session_vars(tokens)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_hold_or_carry_never_fails_the_admission_or_the_turn(gateway, monkeypatch):
+    runner = gateway.runner
+    native = await _native(gateway.adapter)
+    payload = snapshot_native(runner, native)
+    _admit(runner, 'row-1', native)
+    rebuilt = restore_native(payload, runner)
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError('registry unavailable')
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, '_adapter_for_source', broken)
+        _execute(runner, 'row-1', rebuilt)  # does not raise
+    assert slack_binding(runner, rebuilt.source, rebuilt)[1] == ''
+    assert not _held()
+    second = await _native(gateway.adapter)
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, '_owning_profile', broken)
+        hold_pending(runner, KEY, second)  # does not raise
+    assert not _held()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('rebuilt_profile,proven', [('beta', True), ('alpha', False), (None, False)])
 async def test_multiplexed_secondary_bot_carries_only_for_its_own_profile(rebuilt_profile, proven):
     # A multiplex host: bot "beta" is a secondary profile's adapter; its events name it explicitly.
