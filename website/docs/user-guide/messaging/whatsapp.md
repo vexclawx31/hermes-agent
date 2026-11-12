@@ -339,7 +339,7 @@ When the agent calls tools (web search, file operations, etc.), WhatsApp display
 
 The Baileys-bridge adapter (bot mode) supports several native WhatsApp message types:
 
-- **Polls** — the agent can send a native WhatsApp poll (question + options) via the bridge's `/send-poll` endpoint. Poll votes flow back into the conversation.
+- **Polls** — the agent can send a native WhatsApp poll (question + options) via the bridge's `/send-poll` endpoint. Votes on such a poll don't start a turn: they reach transport observers (for example an archive plugin) only. Only votes on the agent's own clarify question (below) flow back into the conversation.
 - **Clarify questions as polls** — when the agent asks a multiple-choice clarify question, it's rendered as a native single-select poll; tapping an option answers the question. If the poll fails to send, the adapter falls back to a plain text question. Approval prompts are **never** mapped onto polls — polls are only used for genuine multiple-choice clarifies.
 - **Location pins** — the agent can send a native location pin (latitude/longitude, optional name/address) via `/send-location`, and incoming shared locations (including live locations) are delivered to the agent as location messages.
 

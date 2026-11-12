@@ -984,6 +984,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         payload: dict[str, Any] = {"chatId": to_whatsapp_jid(chat_id), "question": question, "options": list(options or []), "selectableCount": selectable_count}
         return await self._post_bridge_message("send-poll", payload, timeout=30)
 
+    def _await_poll_votes(self, message_id: Any) -> None:
+        """Remember a poll whose votes are answers the core waits for (the newest 64, this process only): votes on any
+        other poll this account sent, e.g. a tool-sent group poll, start no turn (``_vote_on_awaited_poll``)."""
+        poll_id = str(message_id or "").strip()
+        if not poll_id:
+            return
+        awaited = getattr(self, "_awaited_poll_ids", None)
+        if awaited is None:
+            awaited = self._awaited_poll_ids = {}
+        awaited.pop(poll_id, None)
+        awaited[poll_id] = None
+        while len(awaited) > 64:
+            awaited.pop(next(iter(awaited)))
+
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str,
                            metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Multiple-choice clarify as a native poll (the pick arrives as message text for the normal intercept); else text prompt."""
@@ -991,6 +1005,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if 2 <= len(clean_choices) <= 12:
             result = await self.send_poll(chat_id, str(question or "").strip(), clean_choices, selectable_count=1)
             if result.success:
+                self._await_poll_votes(result.message_id)
                 return result
             logger.warning("[%s] Native WhatsApp clarify poll failed; falling back to text: %s", self.name, result.error)
         return await super().send_clarify(chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id, session_key=session_key, metadata=metadata)

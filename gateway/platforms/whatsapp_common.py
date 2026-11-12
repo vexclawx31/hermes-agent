@@ -7,7 +7,8 @@ Mixin contract — the host adapter sets these on ``self`` before calling any mi
 method: ``config`` (PlatformConfig), ``name``, ``_dm_policy`` / ``_group_policy``
 ("open" | "allowlist" | "disabled" | "pairing"), ``_allow_from`` / ``_group_allow_from`` (set[str]),
 ``_mention_patterns`` (list[re.Pattern]), ``_reply_prefix`` (Optional[str]). Optional:
-``_groups`` (``groups.<chat_id|*>.allow_from`` per-group sender lists) and ``_owners`` (set[str]).
+``_groups`` (``groups.<chat_id|*>.allow_from`` per-group sender lists), ``_owners`` (set[str]) and
+``_awaited_poll_ids`` (ids of polls the core itself asked and is waiting on; see ``_vote_on_awaited_poll``).
 """
 
 from __future__ import annotations
@@ -357,9 +358,19 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         owner's transcript (and its tool results) into a guest turn."""
         return bool(getattr(self, "_owners", None)) and self.config.extra.get("group_sessions_per_user", True) is False
 
+    def _vote_on_awaited_poll(self, data: dict[str, Any]) -> bool:
+        """Whether a poll vote answers a poll the core itself asked and is waiting on (clarify-as-poll). The bridge
+        forwards votes on every poll this account sent, also a tool-sent group poll nobody is waiting on."""
+        meta = data.get("nativeMetadata")
+        update = meta.get("pollUpdate") if isinstance(meta, dict) else None
+        poll_id = str((update.get("pollId") if isinstance(update, dict) else "") or data.get("quotedMessageId") or "").strip()
+        return bool(poll_id) and poll_id in (getattr(self, "_awaited_poll_ids", None) or ())
+
     def _should_process_message(self, data: dict[str, Any]) -> bool:
         if data.get("observerOnly"):
             return False  # bridge-marked observer events (own edits/revokes): transport observers only, never a turn
+        if data.get("nativeType") == "pollUpdateMessage" and not self._vote_on_awaited_poll(data):
+            return False  # a vote on a poll nobody waits on: transport observers only (archived), never a turn
         chat_id = str(data.get("chatId") or "")
         # Broadcast pseudo-chats are filtered even in self-chat mode (fromMe events).
         if self._is_broadcast_chat(chat_id):
@@ -377,7 +388,7 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         if data.get("upsertType") == "append":
             return False  # history/offline replay: archive-only, never a late conversation turn
         if self._whatsapp_require_native_mention():
-            # The bridge emits poll votes only for polls it sent itself (clarify-as-poll answers).
+            # A vote that got this far answers a clarify-as-poll question (see _vote_on_awaited_poll).
             return data.get("nativeType") == "pollUpdateMessage" or self._message_natively_mentions_bot(data)
         # Group messages: check mention / free-response settings
         if chat_id in self._whatsapp_free_response_chats() or not self._whatsapp_require_mention():
