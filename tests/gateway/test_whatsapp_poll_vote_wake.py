@@ -83,6 +83,44 @@ def test_a_vote_on_a_clarify_poll_still_starts_a_turn(body):
     assert adapter._should_process_message(_vote(body, poll_id=OTHER_POLL, sender=OWNER)) is False
 
 
+def test_an_awaited_vote_becomes_a_message_event():
+    adapter = _make_adapter()
+    _clarify(adapter)
+    event = _build_and_drain(adapter, _vote("Option A", sender=OWNER))
+    assert event is not None and event.text == "Option A"  # the pick arrives as text for the clarify intercept
+
+
+class _BridgeReply:
+    """A bridge HTTP reply for ``async with self._bridge_req(...)``."""
+    status = 200
+
+    def __init__(self, data):
+        self._data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self):
+        return self._data
+
+
+def test_the_awaited_id_is_the_bridges_own_message_id_unchanged():
+    """The match rests on this: the bridge puts the id it returned from /send-poll into every vote on that poll."""
+    adapter = _make_adapter()
+    posted = []
+    adapter._bridge_unavailable = AsyncMock(return_value=None)
+    adapter._bridge_req = lambda method, path, timeout, **kw: (posted.append((method, path)) or _BridgeReply({"messageId": POLL_ID}))
+    adapter._fire_outbound_observers = lambda *a, **kw: None
+    result = asyncio.run(adapter.send_clarify(chat_id=ORDINARY_GROUP, question="Which one?", choices=["Option A", "Option B"],
+                                              clarify_id="c1", session_key="s1"))
+    assert result.success is True and result.message_id == POLL_ID and posted == [("post", "send-poll")]
+    assert list(adapter._awaited_poll_ids) == [POLL_ID]
+    assert adapter._should_process_message(_vote("Option A", sender=OWNER)) is True
+
+
 def test_the_poll_id_is_read_from_the_metadata_or_the_quoted_message():
     adapter = _make_adapter()
     _clarify(adapter)
