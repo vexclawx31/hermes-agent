@@ -343,7 +343,8 @@ def test_owners_without_guest_toolsets_means_no_guest_tools():
 
 def test_owner_poll_vote_admitted_guest_vote_denied_in_ordinary_group():
     adapter = _make_adapter()
-    vote = {"nativeType": "pollUpdateMessage", "body": "Option A"}
+    adapter._await_poll_votes("POLL1")  # a clarify poll the core waits on (test_whatsapp_poll_vote_wake.py)
+    vote = {"nativeType": "pollUpdateMessage", "body": "Option A", "quotedMessageId": "POLL1"}
     assert adapter._should_process_message(_group(sender=OWNER, **vote)) is True
     assert adapter._should_process_message(_group(sender=GUEST, **vote)) is False
 
