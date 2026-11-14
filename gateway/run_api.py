@@ -22,6 +22,7 @@ from pathlib import Path
 import socket
 import stat
 import sys
+import tempfile
 import types
 from typing import Any
 from urllib.parse import quote
@@ -215,9 +216,6 @@ UNIX_ORIGIN_SCHEME = "http+unix"
 # dashboard's peer and Host checks) admit it as this loopback peer: only this user (or root) can
 # connect to the 0600 socket, which is narrower than any loopback TCP peer.
 _UNIX_PEER = ("127.0.0.1", 0)
-_MAX_UNIX_PATH = 100  # sun_path is 104 bytes on macOS/BSD, 108 on Linux; margin for the NUL
-
-
 def runtime_api_socket_path(home) -> Path:
     """Where the unix-transport listener of the gateway serving *home* binds."""
     return Path(home).resolve() / RUNTIME_API_SOCKET_NAME
@@ -228,13 +226,31 @@ def unix_api_origin(path) -> str:
     return f"{UNIX_ORIGIN_SCHEME}://{quote(str(path), safe='')}"
 
 
+def check_unix_socket_paths(home) -> None:
+    """Refuse a home whose unix sockets do not fit ``sun_path``: the runtime API's and the loop-tick
+    witness's (``gateway.shutdown_watchdog``, longer), which in unix mode never falls back to TCP.
+    Checked before anything listens, so such a home fails the start with this message."""
+    from gateway.control_socket import _fits_sun_path
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path
+    for path in (runtime_api_socket_path(home), get_loop_tick_socket_path(Path(home)),
+                 get_loop_tick_socket_path(Path(home).resolve())):
+        if not _fits_sun_path(path):
+            raise RuntimeError(f"unix socket path is too long ({path}); gateway.session_api.transport: unix "
+                               "needs a shorter HERMES_HOME (or transport: tcp)")
+
+
 def _unix_listener_socket(path: Path) -> socket.socket:
-    """A listening 0600 unix socket at *path*. A leftover socket nothing answers on (a gateway that
-    died without cleanup) is replaced; a live one, a symlink, another user's node or a non-socket
-    refuses the start (the control socket's rules; that listener is the only other unix one)."""
+    """A bound 0600 unix socket at *path*. A leftover socket nothing answers on (a gateway that died
+    without cleanup) is replaced; a live one, a symlink, another user's node or a non-socket refuses
+    the start (the control socket's rules; that listener is the only other unix one).
+
+    The socket is bound inside a fresh 0700 directory (``mkdtemp``) next to *path*, made 0600 and
+    renamed into place, so no other user can connect before the chmod and the process umask, which
+    other threads share, is never changed."""
     if os.name == "nt":
         raise RuntimeError("gateway.session_api.transport: unix is not supported on Windows")
-    if len(str(path).encode("utf-8")) > _MAX_UNIX_PATH:
+    from gateway.control_socket import _fits_sun_path
+    if not _fits_sun_path(path):
         raise RuntimeError(f"runtime API socket path is too long for a unix socket ({path}); "
                            "use a shorter HERMES_HOME or gateway.session_api.transport: tcp")
     with contextlib.suppress(FileNotFoundError):
@@ -255,17 +271,21 @@ def _unix_listener_socket(path: Path) -> socket.socket:
             raise RuntimeError(f"runtime API socket {path} is in use by a live listener")
         finally:
             probe.close()
+    private = Path(tempfile.mkdtemp(prefix=".r", dir=path.parent))  # 0700, this user only
+    staged = private / "s"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    # Restrictive umask so the socket is never connectable by others, even before the chmod.
-    old_umask = os.umask(0o177)
     try:
-        listener.bind(str(path))
+        listener.bind(str(staged))
+        os.chmod(staged, 0o600)
+        os.rename(staged, path)
     except BaseException:
         listener.close()
+        with contextlib.suppress(OSError):
+            staged.unlink()
         raise
     finally:
-        os.umask(old_umask)
-    os.chmod(path, 0o600)
+        with contextlib.suppress(OSError):
+            private.rmdir()
     return listener
 
 

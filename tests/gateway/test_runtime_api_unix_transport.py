@@ -31,7 +31,7 @@ def short_home(tmp_path):
         home.mkdir()
         yield home.resolve()
         return
-    root = Path(tempfile.mkdtemp(prefix="hu-"))
+    root = Path(tempfile.mkdtemp(prefix="u"))
     try:
         yield root.resolve()
     finally:
@@ -103,7 +103,10 @@ _PROBE = textwrap.dedent("""
                 return tickets.mint(profile_id=str(home), subject="human", purpose="interactive")
             url, protocols = gateway_ws_target(endpoint, ticket())
             out["url"] = url
-            out["transport"] = gateway_ws_transport(endpoint)
+            extra = gateway_ws_transport(endpoint)
+            out["transport"] = sorted(extra)
+            if "sock" in extra:
+                extra["sock"].close()
             async with connect(url, subprotocols=protocols, proxy=None, **gateway_ws_transport(endpoint)) as ws:
                 out["native"] = json.loads(await ws.recv())
             def sync_dial():
@@ -149,7 +152,7 @@ def test_the_default_transport_stays_a_private_loopback_tcp_port(short_home):
     assert out["api_origin"].startswith("http://127.0.0.1:")
     assert int(socket.AF_INET) in out["listening"]["listen"]
     assert out["socket_exists"] is False
-    assert out["transport"] == {} and out["url"] == out["api_origin"].replace("http:", "ws:") + "/api/ws"
+    assert out["transport"] == [] and out["url"] == out["api_origin"].replace("http:", "ws:") + "/api/ws"
     assert out["native"] == {"handler": "handle_ws", "profile_id": str(short_home), "native": True}
     assert out["native_sync"] == out["native"]
 
@@ -168,7 +171,7 @@ def test_unix_transport_serves_the_same_api_on_a_private_socket_and_never_listen
     assert out["api_origin"].startswith("http+unix://")
     from hermes_cli.gateway_runtime import api_socket_path
     assert api_socket_path(out["api_origin"]) == str(path)
-    assert out["transport"] == {"unix": True, "path": str(path)}
+    assert out["transport"] == ["sock", "unix"]  # connected and authenticated before the ticket goes out
     assert out["url"] == "ws://127.0.0.1/api/ws"
     # The ticketed native upgrade reaches the same handler, from the async and the sync client.
     assert out["native"] == {"handler": "handle_ws", "profile_id": str(short_home), "native": True}
@@ -328,7 +331,8 @@ def test_ws_target_and_transport_in_both_modes():
     assert gateway_ws_target(tcp, "t")[0] == "ws://127.0.0.1:9/api/ws" and gateway_ws_transport(tcp) == {}
     unix = SimpleNamespace(api_origin="http+unix://%2Fh%2Fruntime-api.sock")
     assert gateway_ws_target(unix, "t")[0] == "ws://127.0.0.1/api/ws"
-    assert gateway_ws_transport(unix) == {"unix": True, "path": "/h/runtime-api.sock"}
+    with pytest.raises(FileNotFoundError):  # nothing there: never dialed
+        gateway_ws_transport(unix)
 
 
 def test_the_ink_tui_bootstrap_refuses_a_unix_owner_by_name(monkeypatch, tmp_path):
@@ -346,3 +350,266 @@ def test_the_ink_tui_bootstrap_refuses_a_unix_owner_by_name(monkeypatch, tmp_pat
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with pytest.raises(RuntimeError, match="unix socket"):
         module.bootstrap(False)
+
+
+# --- review round 1 ---------------------------------------------------------------------------------
+
+
+def _listening(home):
+    from gateway import run_api
+    path = run_api.runtime_api_socket_path(home)
+    listener = run_api._unix_listener_socket(path)
+    listener.listen(1)
+    return path, listener
+
+
+def test_the_socket_is_made_private_without_touching_the_process_umask(monkeypatch, short_home):
+    from gateway import run_api
+
+    def no_umask(*_):
+        raise AssertionError("the process umask is shared with other threads")
+
+    monkeypatch.setattr(os, "umask", no_umask)
+    path, listener = _listening(short_home)
+    try:
+        assert stat.S_IMODE(path.lstat().st_mode) == 0o600 and stat.S_ISSOCK(path.lstat().st_mode)
+        assert sorted(p.name for p in short_home.iterdir()) == ["runtime-api.sock"]  # staging dir removed
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:  # renamed node still answers
+            peer.connect(str(path))
+    finally:
+        listener.close()
+        path.unlink()
+    assert run_api.runtime_api_socket_path(short_home) == path
+
+
+def test_the_client_sends_nothing_to_a_socket_another_user_could_reach(short_home):
+    from hermes_cli.gateway_client import gateway_ws_transport
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+    from gateway.run_api import unix_api_origin
+    path, listener = _listening(short_home)
+    endpoint = SimpleNamespace(api_origin=unix_api_origin(path))
+    try:
+        extra = gateway_ws_transport(endpoint)
+        assert extra["unix"] is True and extra["sock"].fileno() != -1  # connected, peer checked
+        extra["sock"].close()
+        os.chmod(path, 0o666)
+        with pytest.raises(DiscoveryError) as opened:
+            gateway_ws_transport(endpoint)
+        assert opened.value.reason == "unsafe_control_permissions"
+    finally:
+        listener.close()
+        path.unlink()
+    target = short_home / "real.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as real:
+        real.bind(str(target))
+        real.listen(1)
+        path.symlink_to(target)
+        with pytest.raises(DiscoveryError) as linked:
+            gateway_ws_transport(endpoint)
+        assert linked.value.reason == "unsafe_control_path"
+
+
+def test_the_client_refuses_a_listener_run_by_another_user(monkeypatch, short_home):
+    from hermes_cli import gateway_runtime_discovery
+    from hermes_cli.gateway_client import gateway_ws_transport
+    from gateway.run_api import unix_api_origin
+    path, listener = _listening(short_home)
+    seen = []
+    monkeypatch.setattr(gateway_runtime_discovery, "socket_peer_uid",
+                        lambda sock: seen.append(sock) or os.getuid() + 1)
+    try:
+        with pytest.raises(gateway_runtime_discovery.DiscoveryError) as foreign:
+            gateway_ws_transport(SimpleNamespace(api_origin=unix_api_origin(path)))
+        assert foreign.value.reason == "unsafe_control_peer"
+        assert [s.fileno() for s in seen] == [-1]  # the probed socket was closed, nothing sent on it
+    finally:
+        listener.close()
+        path.unlink()
+
+
+def _padded_home(base, length):
+    """A (not created) home under *base* whose path is exactly *length* characters."""
+    pad = length - len(str(base)) - 1
+    assert pad > 0
+    return base / ("p" * pad)
+
+
+def test_a_home_that_fits_the_api_socket_but_not_the_loop_tick_socket_refuses(short_home):
+    from gateway import run_api
+    from gateway.control_socket import _MAX_UNIX_PATH
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path
+    home = _padded_home(short_home, _MAX_UNIX_PATH - len("/runtime-api.sock"))
+    assert len(str(run_api.runtime_api_socket_path(home))) <= _MAX_UNIX_PATH
+    assert len(str(get_loop_tick_socket_path(home))) > _MAX_UNIX_PATH
+    with pytest.raises(RuntimeError, match="gateway.loop-tick"):
+        run_api.check_unix_socket_paths(home)
+    run_api.check_unix_socket_paths(short_home)  # a short home passes
+
+
+def _heartbeat_once(monkeypatch, home, config):
+    """Run the loop heartbeat for one beat in *home*; returns the TCP servers it asked for."""
+    import asyncio as aio
+    from gateway import shutdown_watchdog
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(config, encoding="utf-8")
+    tcp = []
+    real_start_server = aio.start_server
+
+    async def start_server(*args, **kwargs):
+        tcp.append(kwargs.get("host"))
+        return await real_start_server(*args, **kwargs)
+
+    monkeypatch.setattr(aio, "start_server", start_server)
+    asyncio.run(shutdown_watchdog.loop_heartbeat_forever(home=home, should_continue=lambda: False))
+    return tcp
+
+
+def test_the_loop_tick_never_falls_back_to_tcp_in_unix_mode(monkeypatch, short_home, caplog):
+    from gateway.control_socket import _MAX_UNIX_PATH
+    home = _padded_home(short_home, _MAX_UNIX_PATH - 20)  # the tick socket cannot fit
+    assert _heartbeat_once(monkeypatch, home, "gateway:\n  session_api:\n    transport: unix\n") == []
+    assert "does not fall back to TCP" in caplog.text
+    # Today's behaviour in tcp mode: the witness moves to a loopback port.
+    assert _heartbeat_once(monkeypatch, home, "gateway:\n  session_api:\n    transport: tcp\n") == ["127.0.0.1"]
+
+
+def test_an_unreadable_config_falls_back_to_tcp_with_a_warning(tmp_path, caplog):
+    from gateway.webapp_listener import session_api_transport
+    (tmp_path / "config.yaml").write_text("gateway: [unclosed\n", encoding="utf-8")
+    assert session_api_transport(tmp_path) == "tcp"
+    assert "falls back to tcp" in caplog.text and "could not be read" in caplog.text
+
+
+def test_unix_mode_names_enabled_platforms_that_listen_on_tcp(monkeypatch, short_home, caplog):
+    from gateway import run_api, run_runtime
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    (short_home / "config.yaml").write_text("gateway:\n  session_api:\n    transport: unix\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(short_home))
+
+    async def start(runner, **kwargs):
+        return SimpleNamespace(api_origin=run_api.unix_api_origin(kwargs["unix_path"]))
+
+    monkeypatch.setattr(run_api, "start_gateway_api", start)
+    from gateway.control_socket import GatewayControlServer
+    config = GatewayConfig(platforms={Platform.API_SERVER: PlatformConfig(enabled=True),
+                                      Platform.WEBHOOK: PlatformConfig(enabled=False)})
+    runner = SimpleNamespace(session_runtime_descriptor={}, session_authorities=[], config=config,
+                             session_control_server=GatewayControlServer(short_home))
+    asyncio.run(run_runtime.start_gateway_runtime_api(runner))
+    warned = [r.getMessage() for r in caplog.records if "listen on TCP ports of their own" in r.getMessage()]
+    assert len(warned) == 1 and "api_server" in warned[0] and "webhook" not in warned[0], warned
+
+
+_BOOT = textwrap.dedent("""
+    # Record every bind/listen and every host/port server, then run the real gateway entry point.
+    import json, os, socket, sys
+    record = open(sys.argv[1], "a", buffering=1)
+    def note(kind, sock, address=None):
+        record.write(json.dumps({"kind": kind, "family": int(sock.family),
+                                 "address": address if isinstance(address, (str, tuple, list)) else None}) + "\\n")
+    real_bind, real_listen = socket.socket.bind, socket.socket.listen
+    def bind(self, address):
+        note("bind", self, address)
+        return real_bind(self, address)
+    def listen(self, *args):
+        note("listen", self, self.getsockname())
+        return real_listen(self, *args)
+    socket.socket.bind, socket.socket.listen = bind, listen
+    import asyncio.base_events as base_events
+    real_create_server = base_events.BaseEventLoop.create_server
+    async def create_server(self, factory, host=None, port=None, *args, sock=None, **kwargs):
+        if sock is None:
+            record.write(json.dumps({"kind": "create_server", "host": host, "port": port}) + "\\n")
+        return await real_create_server(self, factory, host, port, *args, sock=sock, **kwargs)
+    base_events.BaseEventLoop.create_server = create_server
+    sys.argv = ["gateway.run"]
+    import runpy
+    runpy.run_module("gateway.run", run_name="__main__", alter_sys=True)
+""")
+
+
+def test_the_real_gateway_in_unix_mode_never_listens_on_tcp(short_home):
+    """The real entry point (``python -m gateway.run``), up to READY with its runtime API and the
+    shutdown watchdog's loop-tick witness: every listening socket is AF_UNIX, a ticketed client
+    reaches the session handler over the API socket, and a stop removes it."""
+    import signal
+    import time
+    from gateway.run_api import runtime_api_socket_path
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path
+    from hermes_cli.gateway_client import gateway_ws_target, gateway_ws_transport
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+    from hermes_cli.gateway_runtime_discovery import query_identify
+    home = short_home / "h"
+    home.mkdir(mode=0o700)
+    (home / "config.yaml").write_text(json.dumps({
+        "gateway": {"multiplex_profiles": False, "session_api": {"transport": "unix"}},
+        "model": {"provider": "custom", "default": "unused-stub", "base_url": "http://127.0.0.1:9/v1"},
+        "auxiliary": {"title_generation": {"enabled": False}},
+    }), encoding="utf-8")
+    events = short_home / "events.jsonl"
+    env = {k: v for k, v in os.environ.items() if k in {"PATH", "LANG", "TZ", "TMPDIR"}}
+    env.update(HOME=str(short_home), USERPROFILE=str(short_home), HERMES_HOME=str(home), PYTHONPATH=str(REPO),
+               PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1", OPENAI_API_KEY="loopback-only")
+    with (short_home / "gateway.log").open("w+") as log:
+        process = subprocess.Popen([sys.executable, "-c", _BOOT, str(events)], cwd=str(REPO), env=env,
+                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            descriptor, tick = {}, get_loop_tick_socket_path(home, process.pid)
+            deadline = time.monotonic() + 60
+            while process.poll() is None and time.monotonic() < deadline:
+                try:
+                    descriptor = query_identify(home, timeout=2)
+                except (OSError, ValueError):
+                    descriptor = {}
+                if descriptor.get("state") == "ready" and tick.exists():
+                    break
+                time.sleep(.2)
+            log.flush()
+            log.seek(0)
+            gateway_log = log.read()
+            assert descriptor.get("state") == "ready" and tick.exists(), (descriptor, gateway_log[-4000:])
+            logs = "".join(p.read_text(errors="replace") for p in (home / "logs").glob("*.log"))
+            assert "Gateway runtime API transport: unix socket" in gateway_log + logs
+            api = runtime_api_socket_path(home)
+            assert descriptor["api_origin"].startswith("http+unix://")
+            assert stat.S_IMODE(api.lstat().st_mode) == 0o600
+            endpoint = discover_gateway_endpoint(home, timeout=5).endpoint
+            from hermes_cli.gateway_client import _session_ticket
+            ticket = _session_ticket(home, endpoint)
+
+            async def resume():
+                from websockets.asyncio.client import connect
+                url, protocols = gateway_ws_target(endpoint, ticket)
+                async with connect(url, subprotocols=protocols, proxy=None, **gateway_ws_transport(endpoint)) as ws:
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "session.resume",
+                                              "params": {"session_id": "not-registered"}}))
+                    while True:
+                        reply = json.loads(await asyncio.wait_for(ws.recv(), 15))
+                        if reply.get("id") == 7:
+                            return reply
+            assert asyncio.run(resume())["error"]["message"] == "not_found"
+            process.send_signal(signal.SIGINT)
+            assert process.wait(timeout=30) == 0
+            assert not api.exists()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+    records = [json.loads(line) for line in events.read_text().splitlines()]
+    unix = int(socket.AF_UNIX)
+    assert [r for r in records if r["kind"] == "listen" and r["family"] != unix] == [], records
+    assert [r for r in records if r["kind"] == "create_server"] == [], records
+    # A non-unix bind is allowed only as a throwaway loopback probe (urllib3's HAS_IPV6): never a
+    # wildcard or a fixed port, and (above) never listened on.
+    for r in records:
+        if r["kind"] == "bind" and r["family"] != unix:
+            host, port = r["address"][0], r["address"][1]
+            assert host in {"127.0.0.1", "::1"} and port == 0, r
+    # The API socket listens under the home (bound in a private staging directory there, so the
+    # kernel keeps reporting that name after the rename into place).
+    assert any(r["kind"] == "listen" and r["family"] == unix and str(r["address"]).startswith(str(home.resolve()))
+               for r in records), records

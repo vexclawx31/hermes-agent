@@ -209,8 +209,11 @@ def session_api_transport(home) -> str:
     from ruamel.yaml.error import YAMLError
     try:
         document = _config_document(Path(home))
-    except (OSError, ValueError, YAMLError):  # the gateway's own config load reports it
-        document = None
+    except (OSError, ValueError, YAMLError) as exc:  # the gateway's own config load reports it too
+        if path.exists():
+            logger.warning("gateway.session_api.transport falls back to tcp: %s could not be read (%s)",
+                           path, exc)
+        return "tcp"
     gateway = document.get("gateway") if isinstance(document, dict) else None
     block = gateway.get("session_api") if isinstance(gateway, dict) else None
     if block is None:

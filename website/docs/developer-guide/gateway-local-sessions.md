@@ -83,7 +83,7 @@ listener keeps working. With `gateway.session_api.transport: unix` the listener 
 at `<HERMES_HOME>/runtime-api.sock` and no TCP port (`api_origin` is `http+unix://<quoted path>`;
 discovery accepts only the socket in the answering control home). Its peers have no address, so the
 listener presents them to every loopback gate as `127.0.0.1`: only this user or root can connect.
-Python clients dial it through `hermes_cli.gateway_client.gateway_ws_transport`; the Webapp, the
+Python clients dial it through `hermes_cli.gateway_client.gateway_ws_transport`, which checks the node (this user's, 0600, no symlink) and the listener's peer uid before the ticket is sent; the Webapp, the
 Desktop app and the Ink TUI are unavailable in that mode ([configuration](../user-guide/configuration.md#gateway-runtime-api-transport)).
 
 ## Deliberately limited compatibility

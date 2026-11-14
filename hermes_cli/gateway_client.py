@@ -8,6 +8,7 @@ import contextvars
 import json
 import os
 from pathlib import Path
+import socket
 import time
 
 # The owner's protocol name; session_contract is dependency-free (no config/plugins load).
@@ -50,12 +51,33 @@ def gateway_ws_target(endpoint, ticket):
 
 
 def gateway_ws_transport(endpoint) -> dict:
-    """Extra ``websockets`` ``connect()`` arguments for dialing *endpoint*: its unix socket when the
-    owner runs ``gateway.session_api.transport: unix``, else none (TCP to ``api_origin``). Both the
-    asyncio and the sync client take them."""
+    """Extra ``websockets`` ``connect()`` arguments for dialing *endpoint*: for an owner running
+    ``gateway.session_api.transport: unix``, its socket already connected and authenticated (call
+    this inline in the ``connect()`` call, which then owns the socket), else none (TCP to
+    ``api_origin``). Both the asyncio and the sync client take them.
+
+    The ticket goes out only to a listener run by this user, as for the control socket: the node
+    must be this user's private socket (no symlink, no group/other access), and the process that
+    accepted the connection must be this user (``socket_peer_uid``). Raises ``DiscoveryError``
+    (``unsafe_control_path``/``unsafe_control_permissions``/``unsafe_control_peer``) otherwise,
+    or ``OSError`` when nothing listens there."""
     from hermes_cli.gateway_runtime import api_socket_path
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError, _private_node, socket_peer_uid
     path = api_socket_path(endpoint.api_origin)
-    return {} if path is None else {"unix": True, "path": path}
+    if path is None:
+        return {}
+    _private_node(Path(path), kind="socket")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(10)
+        sock.connect(path)
+        uid = socket_peer_uid(sock)
+        if uid is not None and uid != os.getuid():  # windows-footgun: ok — POSIX socket peer only
+            raise DiscoveryError("unsafe_control_peer", f"{path} is served by uid {uid}, not this user")
+    except BaseException:
+        sock.close()
+        raise
+    return {"unix": True, "sock": sock}
 
 
 class GatewayClientError(ValueError):

@@ -342,6 +342,19 @@ def _sweep_stale_tick_sockets(own_path: Path) -> None:
         logger.debug("stale loop-tick socket sweep failed", exc_info=True)
 
 
+def _runtime_api_unix_only(home: Optional[Path]) -> bool:
+    """Whether the gateway serving *home* runs ``gateway.session_api.transport: unix`` (no TCP
+    listener). A value that is not tcp or unix counts as unix: it refuses the gateway's start."""
+    try:
+        from gateway.webapp_listener import session_api_transport
+        return session_api_transport(_home(home)) == "unix"
+    except RuntimeError:
+        return True
+    except Exception:
+        logger.debug("could not read gateway.session_api.transport", exc_info=True)
+        return False
+
+
 async def loop_heartbeat_forever(
     *, interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S, start_time: Optional[float] = None,
     home: Optional[Path] = None, should_continue: Optional[Callable[[], bool]] = None) -> None:
@@ -360,8 +373,14 @@ async def loop_heartbeat_forever(
     # consumers already discover this port in the heartbeat, independent of their TMPDIR.
     from gateway.control_socket import _fits_sun_path
     tick_server = tick_socket_path = tick_tcp_port = None
+    unix_only = _runtime_api_unix_only(home)
     try:
         unix_path = get_loop_tick_socket_path(home) if os.name == "posix" else None
+        if unix_only and (unix_path is None or not _fits_sun_path(unix_path)):
+            # gateway.session_api.transport: unix promises no TCP listener; the runtime API's start
+            # refuses a home whose tick socket cannot fit, so this is reached only without one.
+            raise RuntimeError("no unix socket fits for the loop tick and gateway.session_api.transport "
+                               "is unix, so it does not fall back to TCP")
         if unix_path is not None and _fits_sun_path(unix_path):
             tick_socket_path = unix_path
             tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
