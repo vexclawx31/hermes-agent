@@ -3372,6 +3372,20 @@ Sign-in turns on when `host` is `0.0.0.0` or `::`, or when `public_url` is set, 
 
 The Webapp settings are read from the config of the gateway that serves the profile: the default profile's config for named profiles it serves, a standalone profile's own config otherwise.
 
+### Gateway runtime API transport
+
+The gateway's private runtime API (the listener native clients attach to) is a loopback TCP port on an ephemeral port by default. On a host where no process may listen on TCP at all (for example a sandbox that can allow a listening port but not restrict it to loopback), put it on a unix socket instead:
+
+```yaml
+gateway:
+  session_api:
+    transport: unix   # "tcp" (default) | "unix"
+```
+
+- `unix` — the API listens on `<HERMES_HOME>/runtime-api.sock` (mode 0600, this user only) and on no TCP port. Turns, tickets and the dashboard routes behave as on TCP. The gateway publishes `api_origin: http+unix://<socket path>`, and the Python clients (the CLI, `hermes chat`, worker and session-store proxies, A2A forwarding, Bot Chat delivery) dial the socket. Clients send their ticket only after checking that the socket is this user's private node and that the listening process runs as this user. A leftover socket nothing answers on is replaced at start; a live one, a symlink or a non-socket at that path stops the start. The gateway's loop-liveness witness (`state/gateway.loop-tick.<pid>.sock`) stays on its unix socket too and never falls back to a TCP port in this mode, so both socket paths must fit the platform's unix-socket limit (about 100 bytes): a longer `HERMES_HOME` stops the start with an error naming the path. Not on Windows.
+- Unavailable in `unix` mode: the Webapp (`webapp.enabled` is reported as unavailable), the Desktop app and the Ink TUI (`hermes --tui`), which dial a TCP port themselves and refuse a unix owner with a clear error. `unix` does not turn off platform adapters that serve HTTP on their own TCP port (`api_server`, which also receives external cron providers' fires, `webhook`, `teams`, `line`, `sms` and the other webhook platforms): do not enable them on a gateway that must not listen on TCP. In `unix` mode the gateway logs a warning at start naming every enabled one.
+- Any value other than `tcp` or `unix` stops the gateway start instead of falling back to TCP. A `config.yaml` that cannot be read reads as `tcp`, with a warning saying so; the start logs `Gateway runtime API transport: unix socket <path>` when `unix` is in effect. Restart the gateway after changing it.
+
 ## Dashboard
 
 Configuration for the [web dashboard](./features/web-dashboard.md) — visual theme, public URL, and authentication providers. The auth providers (OAuth, basic password, drain) are documented in detail on the web-dashboard page; this is the `config.yaml` shape.

@@ -8,6 +8,7 @@ import contextvars
 import json
 import os
 from pathlib import Path
+import socket
 import time
 
 # The owner's protocol name; session_contract is dependency-free (no config/plugins load).
@@ -41,8 +42,48 @@ def gateway_ws_target(endpoint, ticket):
 
     The owner accepts exactly one ticket subprotocol beside ``GATEWAY_WS_PROTOCOL`` and echoes the
     latter; callers check ``ws.subprotocol == GATEWAY_WS_PROTOCOL`` after the upgrade."""
-    url = endpoint.api_origin.replace("https:", "wss:").replace("http:", "ws:") + "/api/ws"
+    from hermes_cli.gateway_runtime import api_socket_path
+    # A unix-socket owner (``gateway.session_api.transport: unix``) is dialed through
+    # ``gateway_ws_transport``; its URL only names the loopback Host its gates expect.
+    origin = "http://127.0.0.1" if api_socket_path(endpoint.api_origin) else endpoint.api_origin
+    url = origin.replace("https:", "wss:").replace("http:", "ws:") + "/api/ws"
     return url, [GATEWAY_WS_PROTOCOL, GATEWAY_WS_TICKET_PREFIX + ticket]
+
+
+def gateway_ws_transport(endpoint) -> dict:
+    """Extra ``websockets`` ``connect()`` arguments for dialing *endpoint*: for an owner running
+    ``gateway.session_api.transport: unix``, its socket already connected and authenticated (call
+    this inline in the ``connect()`` call, which then owns the socket), else none (TCP to
+    ``api_origin``). Both the asyncio and the sync client take them.
+
+    The ticket goes out only to a listener run by this user, as for the control socket: the node
+    must be this user's private socket (no symlink, no group/other access), and the process that
+    accepted the connection must be this user (``socket_peer_uid``; when it cannot be read, the
+    dial refuses). Raises ``DiscoveryError`` (``unsafe_control_path``/``unsafe_control_permissions``/``unsafe_control_peer``) otherwise,
+    or ``OSError`` when nothing listens there."""
+    from hermes_cli.gateway_runtime import api_socket_path
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError, _private_node, socket_peer_uid
+    path = api_socket_path(endpoint.api_origin)
+    if path is None:
+        return {}
+    _private_node(Path(path), kind="socket")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(10)
+        sock.connect(path)
+        try:
+            uid = socket_peer_uid(sock)
+        except OSError:
+            uid = None
+        # Fail closed: a listener whose identity cannot be read never receives a ticket.
+        if uid is None:
+            raise DiscoveryError("unsafe_control_peer", f"{path}: the listener's uid cannot be verified")
+        if uid != os.getuid():  # windows-footgun: ok — POSIX socket peer only
+            raise DiscoveryError("unsafe_control_peer", f"{path} is served by uid {uid}, not this user")
+    except BaseException:
+        sock.close()
+        raise
+    return {"unix": True, "sock": sock}
 
 
 class GatewayClientError(ValueError):
@@ -371,7 +412,7 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=max_size,
-                           proxy=None) as ws:
+                           proxy=None, **(gateway_ws_transport(endpoint) if endpoint is not None else {})) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:

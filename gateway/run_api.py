@@ -14,13 +14,18 @@ process that already imported it mount it before the listener starts, exactly as
 """
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 import logging
 import os
+from pathlib import Path
 import socket
+import stat
 import sys
+import tempfile
 import types
 from typing import Any
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +208,141 @@ def _listener_socket(family, kind, proto, port: int, *, dual_stack: bool = False
     return listener
 
 
+# ``gateway.session_api.transport: unix``: the listener's unix socket in the gateway's own home, and
+# the origin scheme native clients read it from (``hermes_cli.gateway_runtime.api_socket_path``).
+RUNTIME_API_SOCKET_NAME = "runtime-api.sock"
+UNIX_ORIGIN_SCHEME = "http+unix"
+# A unix socket's peer has no address. The listener's loopback gates (native ticket redemption, the
+# dashboard's peer and Host checks) admit it as this loopback peer: only this user (or root) can
+# connect to the 0600 socket, which is narrower than any loopback TCP peer.
+_UNIX_PEER = ("127.0.0.1", 0)
+def runtime_api_socket_path(home) -> Path:
+    """Where the unix-transport listener of the gateway serving *home* binds."""
+    return Path(home).resolve() / RUNTIME_API_SOCKET_NAME
+
+
+def unix_api_origin(path) -> str:
+    """The ``api_origin`` published for a listener on the unix socket *path*."""
+    return f"{UNIX_ORIGIN_SCHEME}://{quote(str(path), safe='')}"
+
+
+def check_unix_socket_paths(home) -> None:
+    """Refuse a home whose unix sockets do not fit ``sun_path``: the runtime API's and the loop-tick
+    witness's (``gateway.shutdown_watchdog``, longer), which in unix mode never falls back to TCP.
+    Checked before anything listens, so such a home fails the start with this message."""
+    from gateway.control_socket import _fits_sun_path
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path
+    for path in (runtime_api_socket_path(home), get_loop_tick_socket_path(Path(home)),
+                 get_loop_tick_socket_path(Path(home).resolve())):
+        if not _fits_sun_path(path):
+            raise RuntimeError(f"unix socket path is too long ({path}); gateway.session_api.transport: unix "
+                               "needs a shorter HERMES_HOME (or transport: tcp)")
+
+
+def _node_identity(info: os.stat_result) -> tuple:
+    return info.st_dev, info.st_ino, info.st_uid, stat.S_IFMT(info.st_mode)
+
+
+def _clear_stale_socket(path: Path) -> None:
+    """Remove a leftover socket at *path* only when it is provably stale: this user's socket node
+    whose connect is refused (``ECONNREFUSED``: no listener bound to it). A symlink, another user's
+    node, a non-socket, a live listener, or any other connect result (a timeout, ``EACCES``, a
+    resource failure) proves nothing and refuses the start with the node left in place. The node's
+    identity (device, inode, owner, type) is checked again right before the unlink."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(f"runtime API socket {path} is a symlink")
+    if info.st_uid != os.getuid():  # windows-footgun: ok — POSIX listener
+        raise RuntimeError(f"runtime API socket {path} belongs to another user")
+    if not stat.S_ISSOCK(info.st_mode):
+        raise RuntimeError(f"{path} exists and is not a socket")
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(1)
+        probe.connect(str(path))
+    except FileNotFoundError:
+        return  # it vanished: nothing to remove
+    except ConnectionRefusedError:
+        pass  # stale: nothing listens on this node
+    except OSError as exc:
+        raise RuntimeError(f"runtime API socket {path} exists and could not be proven stale "
+                           f"({exc.strerror or type(exc).__name__}); left in place") from exc
+    else:
+        raise RuntimeError(f"runtime API socket {path} is in use by a live listener")
+    finally:
+        probe.close()
+    try:
+        again = path.lstat()
+    except FileNotFoundError:
+        return
+    if _node_identity(again) != _node_identity(info):
+        raise RuntimeError(f"runtime API socket {path} changed while it was checked; left in place")
+    path.unlink()
+
+
+def _unix_listener_socket(path: Path) -> socket.socket:
+    """A bound 0600 unix socket at *path*. A provably stale leftover (``_clear_stale_socket``) is
+    replaced; anything else at the path refuses the start and is left untouched.
+
+    The socket is bound inside a fresh 0700 directory (``mkdtemp``) next to *path*, made 0600 and
+    hard-linked into place, so no other user can connect before the chmod and the process umask,
+    which other threads share, is never changed. The link never replaces: a node that appeared at
+    *path* after the check (a competing gateway) makes it fail with ``EEXIST``, and the start
+    refuses with that node untouched."""
+    if os.name == "nt":
+        raise RuntimeError("gateway.session_api.transport: unix is not supported on Windows")
+    from gateway.control_socket import _fits_sun_path
+    if not _fits_sun_path(path):
+        raise RuntimeError(f"runtime API socket path is too long for a unix socket ({path}); "
+                           "use a shorter HERMES_HOME or gateway.session_api.transport: tcp")
+    _clear_stale_socket(path)
+    private = Path(tempfile.mkdtemp(prefix=".r", dir=path.parent))  # 0700, this user only
+    staged = private / "s"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(staged))
+        os.chmod(staged, 0o600)
+        try:
+            os.link(staged, path)
+        except FileExistsError as exc:
+            raise RuntimeError(f"runtime API socket {path} appeared while this gateway started; "
+                               "left in place") from exc
+    except BaseException:
+        listener.close()
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            staged.unlink()
+        with contextlib.suppress(OSError):
+            private.rmdir()
+    return listener
+
+
+def _remove_unix_socket(path: Path, identity) -> None:
+    """Remove the socket this listener bound, never a successor's at the same path."""
+    with contextlib.suppress(OSError):
+        info = path.lstat()
+        if (info.st_dev, info.st_ino) == identity:
+            path.unlink()
+
+
+class _UnixPeerAsLoopback:
+    """ASGI wrapper for the unix listener: a peer (and server) without an address is the loopback
+    peer every existing gate expects, so turn handling and admission run unchanged."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") in {"http", "websocket"}:
+            scope["client"] = _UNIX_PEER
+            scope["server"] = (_UNIX_PEER[0], None)
+        return await self.app(scope, receive, send)
+
+
 def _listener_public_url(webapp) -> str | None:
     """The public URL the listener answers to: the Webapp's own ``webapp.public_url`` ("" for none),
     never ``dashboard.public_url``, which describes ``hermes dashboard``. None leaves main's listener
@@ -210,8 +350,13 @@ def _listener_public_url(webapp) -> str | None:
     return None if webapp is None else webapp.public_url
 
 
-async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0, webapp=None) -> GatewayAPIHandle:
+async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0, webapp=None,
+                            unix_path: Path | None = None) -> GatewayAPIHandle:
+    """Start the listener: TCP on *host*/*port* (the default), or with *unix_path* a 0600 unix socket
+    there and no TCP listener at all (``gateway.session_api.transport: unix``; no Webapp)."""
     global _ACTIVE_RUNNER
+    if unix_path is not None and (webapp is not None or host != "127.0.0.1" or port):
+        raise ValueError("a unix-socket listener takes no host, port or Webapp")
     from gateway.webapp_listener import dial_origin
     from hermes_cli.web_server_boundary import (
         _dashboard_public_hosts, listener_auth_required, public_hosts_engage_gate, public_url_hosts,
@@ -241,25 +386,37 @@ async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0, w
     # Lifespan off: the dashboard's own lifespan runs when it is mounted (GatewayDashboardMount).
     config, server = build_listener_server(mount, host, port, auth_required=state.auth_required,
                                            timeout_graceful_shutdown=5, lifespan="off")
-    family, kind, proto, _, address = socket.getaddrinfo(
-        host, port, type=socket.SOCK_STREAM,
-    )[0]
-    listener = _listener_socket(family, kind, proto, port,
-                                dual_stack=family == socket.AF_INET6 and address[0] == "::")
+    unix_identity = None
+    if unix_path is None:
+        family, kind, proto, _, address = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM,
+        )[0]
+        listener = _listener_socket(family, kind, proto, port,
+                                    dual_stack=family == socket.AF_INET6 and address[0] == "::")
+    else:
+        unix_path = Path(unix_path)
+        listener = _unix_listener_socket(unix_path)
+        info = unix_path.lstat()
+        unix_identity = (info.st_dev, info.st_ino)
     _ACTIVE_RUNNER = runner
     try:
-        listener.bind(address)
-        if port:
-            # Under SO_REUSEADDR another socket may bind a fixed port too, and the first to listen
-            # owns it. Listening now settles that before the dashboard mounts, so a lost race falls
-            # back at once instead of after the mount is up.
+        if unix_path is not None:
             listener.listen(config.backlog)
+        else:
+            listener.bind(address)
+            if port:
+                # Under SO_REUSEADDR another socket may bind a fixed port too, and the first to listen
+                # owns it. Listening now settles that before the dashboard mounts, so a lost race falls
+                # back at once instead of after the mount is up.
+                listener.listen(config.backlog)
         listener.setblocking(False)
-        state.bound_port = listener.getsockname()[1]
+        state.bound_port = None if unix_path is not None else listener.getsockname()[1]
         # Loading the ASGI graph may fail too; it owns the same bound socket.
         if not config.loaded:
             config.load()
         config.loaded_app = GatewayRuntimeAPI(config.loaded_app, runner, mount)
+        if unix_path is not None:
+            config.loaded_app = _UnixPeerAsLoopback(config.loaded_app)
         # A gated listener needs the dashboard's auth providers (and refuses to start without one);
         # an already-imported dashboard costs nothing to mount now; the Webapp serves its page and
         # mints launch links from the start.
@@ -271,6 +428,8 @@ async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0, w
             raise RuntimeError("gateway API lifespan startup failed")
     except BaseException:
         listener.close()
+        if unix_path is not None:
+            _remove_unix_socket(unix_path, unix_identity)
         _ACTIVE_RUNNER = None
         await mount.close()
         raise
@@ -284,6 +443,8 @@ async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0, w
                 await server.shutdown(sockets=[listener])
             finally:
                 listener.close()
+                if unix_path is not None:
+                    _remove_unix_socket(unix_path, unix_identity)
                 try:
                     await mount.close()
                 finally:
@@ -293,7 +454,8 @@ async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0, w
     return GatewayAPIHandle(
         # The address the socket bound, never a name: native clients accept only a numeric loopback
         # origin, and ``localhost`` may resolve to either family.
-        api_origin=dial_origin(listener.getsockname()[0], state.bound_port),
+        api_origin=(unix_api_origin(unix_path) if unix_path is not None
+                    else dial_origin(listener.getsockname()[0], state.bound_port)),
         server=server, task=task, app=mount, socket=listener,
     )
 

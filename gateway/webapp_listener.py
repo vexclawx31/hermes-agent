@@ -197,6 +197,33 @@ def dial_origin(bind_host: str, port: int) -> str:
     return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
 
 
+SESSION_API_TRANSPORTS = ("tcp", "unix")
+
+
+def session_api_transport(home) -> str:
+    """``gateway.session_api.transport`` from *home*'s config: ``tcp`` (the default: a private
+    loopback port, or the Webapp's) or ``unix`` (a 0600 socket in the home, no TCP listener and no
+    Webapp). A value that is set but not one of these refuses the start rather than reading as
+    ``tcp``: whoever set it asked for no TCP listener."""
+    path = Path(home) / "config.yaml"
+    from ruamel.yaml.error import YAMLError
+    try:
+        document = _config_document(Path(home))
+    except (OSError, ValueError, YAMLError) as exc:  # the gateway's own config load reports it too
+        if path.exists():
+            logger.warning("gateway.session_api.transport falls back to tcp: %s could not be read (%s)",
+                           path, exc)
+        return "tcp"
+    gateway = document.get("gateway") if isinstance(document, dict) else None
+    block = gateway.get("session_api") if isinstance(gateway, dict) else None
+    if block is None:
+        return "tcp"
+    value = block.get("transport", "tcp") if isinstance(block, dict) else None
+    if value not in SESSION_API_TRANSPORTS:
+        raise RuntimeError(f"gateway.session_api.transport in {path} must be tcp or unix")
+    return value
+
+
 def listener_plan(home) -> tuple[str, int, WebappMount | None, str | None]:
     """The gateway listener's ``(host, port, webapp, reason)`` for the gateway serving *home*;
     *reason* says why a ``webapp:`` block that asks for the Webapp cannot be used."""
