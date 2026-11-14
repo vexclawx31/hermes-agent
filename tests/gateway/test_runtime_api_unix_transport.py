@@ -409,21 +409,129 @@ def test_the_client_sends_nothing_to_a_socket_another_user_could_reach(short_hom
         assert linked.value.reason == "unsafe_control_path"
 
 
-def test_the_client_refuses_a_listener_run_by_another_user(monkeypatch, short_home):
+def _unsupported(sock):
+    raise OSError(45, "getpeereid failed")
+
+
+@pytest.mark.parametrize("peer_uid, refused", [
+    (lambda sock: os.getuid() + 1, True),   # another user's listener
+    (lambda sock: None, True),               # the platform cannot report it
+    (_unsupported, True),                    # the call fails
+    (lambda sock: os.getuid(), False),       # this user: dialed
+])
+def test_the_client_delivers_a_ticket_only_to_a_verified_same_user_listener(monkeypatch, short_home,
+                                                                            peer_uid, refused):
     from hermes_cli import gateway_runtime_discovery
     from hermes_cli.gateway_client import gateway_ws_transport
     from gateway.run_api import unix_api_origin
     path, listener = _listening(short_home)
     seen = []
     monkeypatch.setattr(gateway_runtime_discovery, "socket_peer_uid",
-                        lambda sock: seen.append(sock) or os.getuid() + 1)
+                        lambda sock: seen.append(sock) or peer_uid(sock))
     try:
-        with pytest.raises(gateway_runtime_discovery.DiscoveryError) as foreign:
-            gateway_ws_transport(SimpleNamespace(api_origin=unix_api_origin(path)))
-        assert foreign.value.reason == "unsafe_control_peer"
-        assert [s.fileno() for s in seen] == [-1]  # the probed socket was closed, nothing sent on it
+        endpoint = SimpleNamespace(api_origin=unix_api_origin(path))
+        if refused:
+            with pytest.raises(gateway_runtime_discovery.DiscoveryError) as foreign:
+                gateway_ws_transport(endpoint)
+            assert foreign.value.reason == "unsafe_control_peer"
+            assert [s.fileno() for s in seen] == [-1]  # the probed socket was closed, nothing sent on it
+        else:
+            extra = gateway_ws_transport(endpoint)
+            assert extra["unix"] is True and extra["sock"] is seen[0] and extra["sock"].fileno() != -1
+            extra["sock"].close()
     finally:
         listener.close()
+        path.unlink()
+
+
+def _stale_node(path):
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(path))
+    stale.close()
+    info = path.lstat()
+    return info.st_dev, info.st_ino
+
+
+@pytest.mark.parametrize("failure", [
+    TimeoutError("timed out"),
+    PermissionError(13, "Permission denied"),
+    OSError(55, "No buffer space available"),
+])
+def test_a_connect_that_does_not_prove_staleness_keeps_the_node_and_refuses(monkeypatch, short_home, failure):
+    from gateway import run_api
+    path = run_api.runtime_api_socket_path(short_home)
+    identity = _stale_node(path)
+    real_connect = socket.socket.connect
+
+    def connect(self, address):
+        if address == str(path):
+            raise failure
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    with pytest.raises(RuntimeError, match="could not be proven stale"):
+        run_api._unix_listener_socket(path)
+    assert (path.lstat().st_dev, path.lstat().st_ino) == identity
+    assert sorted(p.name for p in short_home.iterdir()) == ["runtime-api.sock"]
+
+
+def test_a_node_replaced_during_the_stale_check_is_left_alone(monkeypatch, short_home):
+    from gateway import run_api
+    path = run_api.runtime_api_socket_path(short_home)
+    _stale_node(path)
+    other = short_home / "other.sock"
+    real_connect = socket.socket.connect
+
+    def connect(self, address):
+        if address == str(path):
+            path.unlink()  # another process swaps a different socket in after our first lstat
+            replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            replacement.bind(str(other))
+            replacement.close()
+            os.rename(other, path)
+            raise ConnectionRefusedError(61, "Connection refused")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    swapped = None
+    try:
+        with pytest.raises(RuntimeError, match="changed while it was checked"):
+            run_api._unix_listener_socket(path)
+        swapped = (path.lstat().st_dev, path.lstat().st_ino)
+    finally:
+        assert swapped is not None and path.exists()  # the different inode is untouched
+        path.unlink()
+
+
+def test_a_competing_listener_that_appears_before_placement_wins(monkeypatch, short_home):
+    from gateway import run_api
+    path = run_api.runtime_api_socket_path(short_home)
+    competitor = []
+    real_mkdtemp = run_api.tempfile.mkdtemp
+
+    def mkdtemp(*args, **kwargs):
+        # Between the (empty) check and the placement, another gateway binds and listens there.
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(str(path))
+        sock.listen(1)
+        competitor.append(sock)
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(run_api.tempfile, "mkdtemp", mkdtemp)
+    try:
+        identity = None
+        with pytest.raises(RuntimeError, match="appeared while this gateway started"):
+            run_api._unix_listener_socket(path)
+        identity = (path.lstat().st_dev, path.lstat().st_ino)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:  # still the competitor's
+            peer.connect(str(path))
+            accepted, _ = competitor[0].accept()
+            accepted.close()
+        assert sorted(p.name for p in short_home.iterdir()) == ["runtime-api.sock"]  # staging removed
+    finally:
+        for sock in competitor:
+            sock.close()
+        assert identity is not None
         path.unlink()
 
 

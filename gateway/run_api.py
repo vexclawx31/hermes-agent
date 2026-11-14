@@ -239,51 +239,83 @@ def check_unix_socket_paths(home) -> None:
                                "needs a shorter HERMES_HOME (or transport: tcp)")
 
 
+def _node_identity(info: os.stat_result) -> tuple:
+    return info.st_dev, info.st_ino, info.st_uid, stat.S_IFMT(info.st_mode)
+
+
+def _clear_stale_socket(path: Path) -> None:
+    """Remove a leftover socket at *path* only when it is provably stale: this user's socket node
+    whose connect is refused (``ECONNREFUSED``: no listener bound to it). A symlink, another user's
+    node, a non-socket, a live listener, or any other connect result (a timeout, ``EACCES``, a
+    resource failure) proves nothing and refuses the start with the node left in place. The node's
+    identity (device, inode, owner, type) is checked again right before the unlink."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(f"runtime API socket {path} is a symlink")
+    if info.st_uid != os.getuid():  # windows-footgun: ok — POSIX listener
+        raise RuntimeError(f"runtime API socket {path} belongs to another user")
+    if not stat.S_ISSOCK(info.st_mode):
+        raise RuntimeError(f"{path} exists and is not a socket")
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(1)
+        probe.connect(str(path))
+    except FileNotFoundError:
+        return  # it vanished: nothing to remove
+    except ConnectionRefusedError:
+        pass  # stale: nothing listens on this node
+    except OSError as exc:
+        raise RuntimeError(f"runtime API socket {path} exists and could not be proven stale "
+                           f"({exc.strerror or type(exc).__name__}); left in place") from exc
+    else:
+        raise RuntimeError(f"runtime API socket {path} is in use by a live listener")
+    finally:
+        probe.close()
+    try:
+        again = path.lstat()
+    except FileNotFoundError:
+        return
+    if _node_identity(again) != _node_identity(info):
+        raise RuntimeError(f"runtime API socket {path} changed while it was checked; left in place")
+    path.unlink()
+
+
 def _unix_listener_socket(path: Path) -> socket.socket:
-    """A bound 0600 unix socket at *path*. A leftover socket nothing answers on (a gateway that died
-    without cleanup) is replaced; a live one, a symlink, another user's node or a non-socket refuses
-    the start (the control socket's rules; that listener is the only other unix one).
+    """A bound 0600 unix socket at *path*. A provably stale leftover (``_clear_stale_socket``) is
+    replaced; anything else at the path refuses the start and is left untouched.
 
     The socket is bound inside a fresh 0700 directory (``mkdtemp``) next to *path*, made 0600 and
-    renamed into place, so no other user can connect before the chmod and the process umask, which
-    other threads share, is never changed."""
+    hard-linked into place, so no other user can connect before the chmod and the process umask,
+    which other threads share, is never changed. The link never replaces: a node that appeared at
+    *path* after the check (a competing gateway) makes it fail with ``EEXIST``, and the start
+    refuses with that node untouched."""
     if os.name == "nt":
         raise RuntimeError("gateway.session_api.transport: unix is not supported on Windows")
     from gateway.control_socket import _fits_sun_path
     if not _fits_sun_path(path):
         raise RuntimeError(f"runtime API socket path is too long for a unix socket ({path}); "
                            "use a shorter HERMES_HOME or gateway.session_api.transport: tcp")
-    with contextlib.suppress(FileNotFoundError):
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise RuntimeError(f"runtime API socket {path} is a symlink")
-        if info.st_uid != os.getuid():  # windows-footgun: ok — POSIX listener
-            raise RuntimeError(f"runtime API socket {path} belongs to another user")
-        if not stat.S_ISSOCK(info.st_mode):
-            raise RuntimeError(f"{path} exists and is not a socket")
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            probe.settimeout(1)
-            probe.connect(str(path))
-        except OSError:
-            path.unlink()  # stale: nothing listens there
-        else:
-            raise RuntimeError(f"runtime API socket {path} is in use by a live listener")
-        finally:
-            probe.close()
+    _clear_stale_socket(path)
     private = Path(tempfile.mkdtemp(prefix=".r", dir=path.parent))  # 0700, this user only
     staged = private / "s"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         listener.bind(str(staged))
         os.chmod(staged, 0o600)
-        os.rename(staged, path)
+        try:
+            os.link(staged, path)
+        except FileExistsError as exc:
+            raise RuntimeError(f"runtime API socket {path} appeared while this gateway started; "
+                               "left in place") from exc
     except BaseException:
         listener.close()
-        with contextlib.suppress(OSError):
-            staged.unlink()
         raise
     finally:
+        with contextlib.suppress(OSError):
+            staged.unlink()
         with contextlib.suppress(OSError):
             private.rmdir()
     return listener

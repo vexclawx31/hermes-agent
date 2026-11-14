@@ -58,8 +58,8 @@ def gateway_ws_transport(endpoint) -> dict:
 
     The ticket goes out only to a listener run by this user, as for the control socket: the node
     must be this user's private socket (no symlink, no group/other access), and the process that
-    accepted the connection must be this user (``socket_peer_uid``). Raises ``DiscoveryError``
-    (``unsafe_control_path``/``unsafe_control_permissions``/``unsafe_control_peer``) otherwise,
+    accepted the connection must be this user (``socket_peer_uid``; when it cannot be read, the
+    dial refuses). Raises ``DiscoveryError`` (``unsafe_control_path``/``unsafe_control_permissions``/``unsafe_control_peer``) otherwise,
     or ``OSError`` when nothing listens there."""
     from hermes_cli.gateway_runtime import api_socket_path
     from hermes_cli.gateway_runtime_discovery import DiscoveryError, _private_node, socket_peer_uid
@@ -71,8 +71,14 @@ def gateway_ws_transport(endpoint) -> dict:
     try:
         sock.settimeout(10)
         sock.connect(path)
-        uid = socket_peer_uid(sock)
-        if uid is not None and uid != os.getuid():  # windows-footgun: ok — POSIX socket peer only
+        try:
+            uid = socket_peer_uid(sock)
+        except OSError:
+            uid = None
+        # Fail closed: a listener whose identity cannot be read never receives a ticket.
+        if uid is None:
+            raise DiscoveryError("unsafe_control_peer", f"{path}: the listener's uid cannot be verified")
+        if uid != os.getuid():  # windows-footgun: ok — POSIX socket peer only
             raise DiscoveryError("unsafe_control_peer", f"{path} is served by uid {uid}, not this user")
     except BaseException:
         sock.close()
