@@ -80,13 +80,15 @@ async def connect_owner(home: Path, endpoint, *, scope=None, max_size: int = 2 *
     """A ``GatewayClient`` on ``endpoint``, the ready gateway serving ``home``; ``scope``: the
     ticket's profile scope (``"host"``: the one native Desktop holds); ``max_size``: the largest
     answer frame accepted (websockets' 1 MiB default)."""
-    from hermes_cli.gateway_client import GATEWAY_WS_PROTOCOL, GatewayClient, _session_ticket, gateway_ws_target
+    from hermes_cli.gateway_client import (GATEWAY_WS_PROTOCOL, GatewayClient, _session_ticket, gateway_ws_target,
+                                           gateway_ws_transport)
     from websockets.asyncio.client import connect
 
     ticket = await asyncio.to_thread(_session_ticket, home, endpoint, scope=scope)
     url, protocols = gateway_ws_target(endpoint, ticket)
     # Loopback owner dial: never through HTTP(S)_PROXY (websockets>=14 honours it by default).
-    async with connect(url, subprotocols=protocols, open_timeout=10, proxy=None, max_size=max_size) as ws:
+    async with connect(url, subprotocols=protocols, open_timeout=10, proxy=None, max_size=max_size,
+                       **gateway_ws_transport(endpoint)) as ws:
         if ws.subprotocol != GATEWAY_WS_PROTOCOL:
             raise OwnerUnavailable("the gateway answered with another protocol")
         async with GatewayClient(ws) as client:

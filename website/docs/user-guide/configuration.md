@@ -3372,6 +3372,20 @@ Sign-in turns on when `host` is `0.0.0.0` or `::`, or when `public_url` is set, 
 
 The Webapp settings are read from the config of the gateway that serves the profile: the default profile's config for named profiles it serves, a standalone profile's own config otherwise.
 
+### Gateway runtime API transport
+
+The gateway's private runtime API (the listener native clients attach to) is a loopback TCP port on an ephemeral port by default. On a host where no process may listen on TCP at all (for example a sandbox that can allow a listening port but not restrict it to loopback), put it on a unix socket instead:
+
+```yaml
+gateway:
+  session_api:
+    transport: unix   # "tcp" (default) | "unix"
+```
+
+- `unix` — the API listens on `<HERMES_HOME>/runtime-api.sock` (mode 0600, this user only) and on no TCP port. Turns, tickets and the dashboard routes behave as on TCP. The gateway publishes `api_origin: http+unix://<socket path>`, and the Python clients (the CLI, `hermes chat`, worker and session-store proxies, A2A forwarding, Bot Chat delivery) dial the socket. A leftover socket nothing answers on is replaced at start; a live one, a symlink or a non-socket at that path stops the start. The socket path must fit the platform's unix-socket limit (about 100 bytes), so use a short `HERMES_HOME`. Not on Windows.
+- Unavailable in `unix` mode: the Webapp (`webapp.enabled` is reported as unavailable), the Desktop app and the Ink TUI (`hermes --tui`), which dial a TCP port themselves and refuse a unix owner with a clear error. The `api_server` platform (OpenAI-compatible API, external cron providers' fires) is a separate listener configured under `platforms.api_server` and is not affected.
+- Any value other than `tcp` or `unix` stops the gateway start instead of falling back to TCP. Restart the gateway after changing it.
+
 ## Dashboard
 
 Configuration for the [web dashboard](./features/web-dashboard.md) — visual theme, public URL, and authentication providers. The auth providers (OAuth, basic password, drain) are documented in detail on the web-dashboard page; this is the `config.yaml` shape.

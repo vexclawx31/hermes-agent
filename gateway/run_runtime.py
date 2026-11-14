@@ -565,16 +565,40 @@ async def recover_bot_mailbox(authority):
 
 
 async def start_gateway_runtime_api(runner):
-    from gateway import run_api
-    from gateway.webapp_listener import (
-        STARTING, BrowserCredentialError, browser_session_token, dial_origin, listener_plan, register_control_verbs,
-    )
+    from gateway.webapp_listener import listener_plan, register_control_verbs, session_api_transport
     from hermes_constants import get_hermes_home
     home = get_hermes_home()
     # The bootstrap registered these before its control socket answered; a runner started without it
     # (an embedded gateway) gets them here, before the listener's slow start.
     register_control_verbs(runner, home)
     host, port, webapp, unusable = listener_plan(home)
+    if session_api_transport(home) == "unix":
+        await _start_unix_runtime_api(runner, home, webapp, unusable)
+    else:
+        await _start_tcp_runtime_api(runner, home, host, port, webapp, unusable)
+    runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
+    for authority in _authorities(runner):
+        await _recover_profile_bot_mailbox(runner, authority)
+
+
+async def _start_unix_runtime_api(runner, home, webapp, unusable):
+    """``gateway.session_api.transport: unix``: no TCP listener at all, the same API on a 0600 socket
+    in the gateway's home. The Webapp is a browser page on a TCP port, so it is reported unavailable."""
+    from gateway import run_api
+    if webapp is not None or unusable:
+        unusable = unusable or "gateway.session_api.transport is unix (the Webapp needs a TCP listener)"
+        logger.error("Webapp unavailable: %s", unusable)
+    runner.webapp_status = ({"state": "unavailable", "url": None, "reason": unusable} if unusable
+                            else {"state": "off", "url": None, "reason": None})
+    path = run_api.runtime_api_socket_path(home)
+    runner.session_api = await run_api.start_gateway_api(runner, unix_path=path)
+    logger.info("Gateway runtime API transport: unix socket %s (no TCP listener)", path)
+
+
+async def _start_tcp_runtime_api(runner, home, host, port, webapp, unusable):
+    """The default transport: the Webapp's listener, or main's private loopback port."""
+    from gateway import run_api
+    from gateway.webapp_listener import STARTING, BrowserCredentialError, browser_session_token, dial_origin
     # A webapp: block that asks for the Webapp but cannot be used is reported with its reason.
     runner.webapp_status = ({"state": "unavailable", "url": None, "reason": unusable} if unusable
                             else {"state": "off", "url": None, "reason": None} if webapp is None
@@ -612,9 +636,7 @@ async def start_gateway_runtime_api(runner):
     else:
         if webapp is not None:
             runner.webapp_status = {"state": "serving", "url": dial_origin(host, port), "reason": None}
-    runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
-    for authority in _authorities(runner):
-        await _recover_profile_bot_mailbox(runner, authority)
+    logger.info("Gateway runtime API transport: tcp %s", runner.session_api.api_origin)
 
 
 async def _recover_profile_bot_mailbox(runner, authority):

@@ -79,7 +79,12 @@ listener stays on loopback unless `webapp.host` binds a wildcard address. The We
 the dashboard sign-in gate on a wildcard bind or when `webapp.public_url` is set, on any bind, and
 one-use launch links are then off. `dashboard.public_url` never applies to the Webapp's listener; the
 gateway's private listener for native clients reads it as main does, so hosted sign-in on that
-listener keeps working.
+listener keeps working. With `gateway.session_api.transport: unix` the listener is a 0600 unix socket
+at `<HERMES_HOME>/runtime-api.sock` and no TCP port (`api_origin` is `http+unix://<quoted path>`;
+discovery accepts only the socket in the answering control home). Its peers have no address, so the
+listener presents them to every loopback gate as `127.0.0.1`: only this user or root can connect.
+Python clients dial it through `hermes_cli.gateway_client.gateway_ws_transport`; the Webapp, the
+Desktop app and the Ink TUI are unavailable in that mode ([configuration](../user-guide/configuration.md#gateway-runtime-api-transport)).
 
 ## Deliberately limited compatibility
 

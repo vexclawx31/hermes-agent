@@ -145,7 +145,7 @@ async def forward(connection, params):
 async def forward_to_owner(home, *, agent, tenant, peer, context_id, input_id, text, timeout):
     """Transport-only caller; a timeout never cancels or re-identifies accepted work."""
     from hermes_cli.gateway_client import (GATEWAY_WS_PROTOCOL, GatewayClient, GatewayClientError,
-        _session_ticket, gateway_ws_target)
+        _session_ticket, gateway_ws_target, gateway_ws_transport)
     from hermes_cli.gateway_runtime import ensure_gateway_runtime
     from websockets.asyncio.client import connect
     home = await asyncio.to_thread(Path(home).resolve)
@@ -157,7 +157,7 @@ async def forward_to_owner(home, *, agent, tenant, peer, context_id, input_id, t
         url, protocols = gateway_ws_target(ready.endpoint, ticket)
         # Loopback authority dial: never through HTTP(S)_PROXY (websockets>=14 honours it by default).
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024,
-                           proxy=None) as ws:
+                           proxy=None, **gateway_ws_transport(ready.endpoint)) as ws:
             if ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError('gateway_protocol_mismatch')
             async with GatewayClient(ws) as client:

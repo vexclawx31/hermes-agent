@@ -82,7 +82,8 @@ def authority_settle(home, params):
 def _authority_rpc(home, method, params):
     import asyncio
     from hermes_cli.gateway_runtime import discover_gateway_endpoint
-    from hermes_cli.gateway_client import GATEWAY_WS_PROTOCOL, GatewayClient, _session_ticket, gateway_ws_target
+    from hermes_cli.gateway_client import (GATEWAY_WS_PROTOCOL, GatewayClient, _session_ticket, gateway_ws_target,
+                                           gateway_ws_transport)
     from websockets.asyncio.client import connect
 
     home = Path(home).resolve()
@@ -97,7 +98,8 @@ def _authority_rpc(home, method, params):
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
         # Loopback authority dial: never through HTTP(S)_PROXY (websockets>=14 honours it by default).
-        async with connect(url, subprotocols=protocols, open_timeout=10, proxy=None) as ws:
+        async with connect(url, subprotocols=protocols, open_timeout=10, proxy=None,
+                           **gateway_ws_transport(endpoint)) as ws:
             if ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise ValueError('authority protocol mismatch')
             async with GatewayClient(ws) as client:

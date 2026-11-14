@@ -135,7 +135,7 @@ class WorkerRPC:
                 return self.link
             # The owner closed it while idle, before any send: redial with a fresh ticket.
             self._drop()
-        from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
+        from hermes_cli.gateway_client import _session_ticket, gateway_ws_target, gateway_ws_transport
         from hermes_cli.gateway_runtime_discovery import query_identify
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
@@ -156,7 +156,8 @@ class WorkerRPC:
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
         # inside its receipt budget; that budget and the observed close are the liveness checks.
         self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=5, close_timeout=1,
-                                       max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
+                                       max_size=8 * 1024 * 1024, proxy=None, ping_interval=None,
+                                       **gateway_ws_transport(endpoint)))
         return self.link
 
     def _drop(self):

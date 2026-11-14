@@ -78,6 +78,11 @@ def bootstrap(start: bool, recover: bool = False) -> dict:
     if not attachable(receipt):
         raise RuntimeError(failure_message(receipt))
     endpoint = receipt.endpoint
+    from hermes_cli.gateway_runtime import api_socket_path
+    if api_socket_path(endpoint.api_origin) is not None:
+        # The Ink client dials the returned URL over TCP itself; a unix-socket owner has no port.
+        raise RuntimeError("gateway runtime API listens on a unix socket (gateway.session_api.transport: unix); "
+                           "the Ink TUI cannot attach to it: use the classic CLI (hermes chat) instead")
     # A profile served by the default multiplexer has no socket of its own; the host mints its ticket.
     control = control_home_for(home, endpoint)
     request = json.dumps({"protocol": 1, "id": 1, "verb": "session-ticket", "params": {

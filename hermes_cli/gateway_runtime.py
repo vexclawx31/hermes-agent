@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 if TYPE_CHECKING:
     from gateway.runtime_contract import RuntimeState
@@ -95,6 +95,38 @@ def _overlay_owner_home(home: Path) -> Path:
     return target.parent
 
 
+def api_socket_path(api_origin: str) -> str | None:
+    """The unix socket an owner running ``gateway.session_api.transport: unix`` publishes as its
+    ``api_origin`` (``http+unix://<quoted absolute path to runtime-api.sock>``), else None."""
+    from gateway.run_api import RUNTIME_API_SOCKET_NAME, UNIX_ORIGIN_SCHEME
+    prefix = UNIX_ORIGIN_SCHEME + "://"
+    if not isinstance(api_origin, str) or not api_origin.startswith(prefix):
+        return None
+    path = unquote(api_origin[len(prefix):])
+    if "\0" in path or not os.path.isabs(path) or Path(path).name != RUNTIME_API_SOCKET_NAME:
+        return None
+    return path
+
+
+def _valid_api_origin(origin, owner_home: Path) -> bool:
+    """A bare numeric-loopback http(s) origin, or the owner's own unix socket in its home."""
+    if not isinstance(origin, str):
+        return False
+    socket_path = api_socket_path(origin)
+    if socket_path is not None:
+        # Only the socket in the home whose control socket answered: a descriptor never sends a
+        # client to a socket elsewhere.
+        return _canonical_home(Path(socket_path).parent) == _canonical_home(owner_home)
+    try:
+        parsed = urlsplit(origin)
+        return not (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.path or parsed.query or parsed.fragment or not parsed.port
+                    or not ipaddress.ip_address(parsed.hostname).is_loopback)
+    except ValueError:
+        return False
+
+
 def _endpoint(payload: dict, home: Path, control_home: Path | None = None) -> GatewayDiscovery:
     if type(payload.get("runtime_protocol")) is not int or payload["runtime_protocol"] != 1:
         return GatewayDiscovery("incompatible", reason_code="runtime_protocol")
@@ -129,16 +161,7 @@ def _endpoint(payload: dict, home: Path, control_home: Path | None = None) -> Ga
     if type(epoch) is not int or epoch <= 0 or not isinstance(instance, str) or not instance:
         return GatewayDiscovery("inaccessible", reason_code="invalid_runtime_identity")
     origin = payload.get("api_origin")
-    if not isinstance(origin, str):
-        return GatewayDiscovery("inaccessible", reason_code="invalid_api_origin")
-    try:
-        parsed = urlsplit(origin)
-        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-                or parsed.username is not None or parsed.password is not None
-                or parsed.path or parsed.query or parsed.fragment or not parsed.port
-                or not ipaddress.ip_address(parsed.hostname).is_loopback):
-            return GatewayDiscovery("inaccessible", reason_code="invalid_api_origin")
-    except ValueError:
+    if not _valid_api_origin(origin, control_home if control_home is not None else home):
         return GatewayDiscovery("inaccessible", reason_code="invalid_api_origin")
     supervisor = payload.get("supervisor")
     if supervisor not in {"none", "systemd", "launchd", "windows", "external"}:

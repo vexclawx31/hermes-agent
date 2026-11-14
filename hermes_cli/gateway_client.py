@@ -41,8 +41,21 @@ def gateway_ws_target(endpoint, ticket):
 
     The owner accepts exactly one ticket subprotocol beside ``GATEWAY_WS_PROTOCOL`` and echoes the
     latter; callers check ``ws.subprotocol == GATEWAY_WS_PROTOCOL`` after the upgrade."""
-    url = endpoint.api_origin.replace("https:", "wss:").replace("http:", "ws:") + "/api/ws"
+    from hermes_cli.gateway_runtime import api_socket_path
+    # A unix-socket owner (``gateway.session_api.transport: unix``) is dialed through
+    # ``gateway_ws_transport``; its URL only names the loopback Host its gates expect.
+    origin = "http://127.0.0.1" if api_socket_path(endpoint.api_origin) else endpoint.api_origin
+    url = origin.replace("https:", "wss:").replace("http:", "ws:") + "/api/ws"
     return url, [GATEWAY_WS_PROTOCOL, GATEWAY_WS_TICKET_PREFIX + ticket]
+
+
+def gateway_ws_transport(endpoint) -> dict:
+    """Extra ``websockets`` ``connect()`` arguments for dialing *endpoint*: its unix socket when the
+    owner runs ``gateway.session_api.transport: unix``, else none (TCP to ``api_origin``). Both the
+    asyncio and the sync client take them."""
+    from hermes_cli.gateway_runtime import api_socket_path
+    path = api_socket_path(endpoint.api_origin)
+    return {} if path is None else {"unix": True, "path": path}
 
 
 class GatewayClientError(ValueError):
@@ -371,7 +384,7 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=max_size,
-                           proxy=None) as ws:
+                           proxy=None, **(gateway_ws_transport(endpoint) if endpoint is not None else {})) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:
