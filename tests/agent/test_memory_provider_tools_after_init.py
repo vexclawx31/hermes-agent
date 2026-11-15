@@ -120,6 +120,53 @@ def test_a_late_tool_still_cant_shadow_a_core_tool(tmp_path):
     assert not agent._memory_manager.has_tool("clarify")
 
 
+class _EarlyOwnerProvider(MemoryProvider):
+    """Offers the same name the lazy provider adds only after initialize, but from the start (it owns the route)."""
+
+    def __init__(self):
+        self.calls = []
+
+    @property
+    def name(self):
+        return "builtin"
+
+    def is_available(self):
+        return True
+
+    def initialize(self, session_id, **kwargs):
+        pass
+
+    def get_tool_schemas(self):
+        return [{"name": _LATE, "description": "B semantics", "parameters": {"type": "object", "properties": {}}}]
+
+    def handle_tool_call(self, tool_name, args, **kwargs):
+        self.calls.append(tool_name)
+        return json.dumps({"ok": "B"})
+
+
+def test_a_late_name_another_provider_owns_shows_and_runs_the_owners_tool(tmp_path):
+    """PR #70 review (Vex): provider A (registered first) gains X only after initialize while B already routes X.
+    The route stays with B, and the model is shown B's schema, never A's."""
+    lazy, owner = _LazyToolsProvider(), _EarlyOwnerProvider()
+    manager = MemoryManager()
+    manager.add_provider(lazy)
+    manager.add_provider(owner)
+    manager.initialize_all(session_id="s-1", platform="api_server", hermes_home=str(tmp_path))
+    assert manager._tool_to_provider[_LATE] is owner
+    shown = {s["name"]: s["description"] for s in manager.get_all_tool_schemas()}
+    assert shown[_LATE] == "B semantics"
+    assert json.loads(manager.handle_tool_call(_LATE, {})) == {"ok": "B"} and lazy.calls == []
+
+
+def test_a_name_that_is_not_routed_is_not_shown(tmp_path):
+    """Before initialize the late tool isn't routed, so it isn't shown either: shown always means dispatchable."""
+    manager = MemoryManager()
+    manager.add_provider(_LazyToolsProvider())
+    lazy = manager.providers[-1]
+    lazy.ready = True  # offers the late tool, but initialize (and so routing) hasn't run
+    assert {s["name"] for s in manager.get_all_tool_schemas()} == {_EARLY}
+
+
 class _BrokenAfterInitProvider(_LazyToolsProvider):
     def get_tool_schemas(self):
         if self.ready:

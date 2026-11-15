@@ -341,7 +341,9 @@ class MemoryManager:
         return added
 
     def _refresh_tool_routes(self) -> None:
-        """Route tools a provider offers only once initialized (e.g. the hindsight plugin's privacy tools,
+        """Post-initialization registration (not ongoing schema synchronization: a later schema change without a
+        new initialize, or a withdrawn name, is not reflected). Routes tools a provider offers only once
+        initialized (e.g. the hindsight plugin's privacy tools,
         which exist only after its privacy guard is built): ``add_provider`` read the schemas before
         ``initialize``, while the agent's tool surface (``get_all_tool_schemas``) is read after it, so such a
         tool was shown to the model but dispatch answered "Unknown tool" (2026-11-15). Same reserved-name and
@@ -632,8 +634,9 @@ class MemoryManager:
         return True
 
     def get_all_tool_schemas(self) -> list[dict[str, Any]]:
-        """Collect deduplicated tool schemas from all providers; reserved core tool names are
-        skipped because :meth:`add_provider` refuses to route them."""
+        """Collect deduplicated tool schemas from all providers: each name only from the provider that routes
+        it (so what the model is shown is exactly what dispatch runs); reserved core tool names are skipped because
+        :meth:`add_provider` refuses to route them, and a name not routed at all is not shown."""
         from toolsets import _HERMES_CORE_TOOLS
 
         schemas: list[dict[str, Any]] = []
@@ -647,7 +650,10 @@ class MemoryManager:
                         "Memory provider '%s' returned a tool schema with "
                         "no resolvable name; skipping (%r)", provider.name, raw_schema,
                     )
-                elif schema["name"] not in _HERMES_CORE_TOOLS and schema["name"] not in seen:
+                elif (schema["name"] not in _HERMES_CORE_TOOLS and schema["name"] not in seen
+                      and self._tool_to_provider.get(schema["name"]) is provider):
+                    # Only the provider that dispatch routes a name to may describe it: the model must never see
+                    # one provider's schema for a call another provider handles (PR #70 review).
                     schemas.append(schema)
                     seen.add(schema["name"])
 
