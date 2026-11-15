@@ -7,6 +7,7 @@ agent knows what was sent.  Standalone: works from CLI, cron and gateway context
 
 import json
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -91,14 +92,11 @@ def _whatsapp_dm_alternates(chat_id: str, user_id: Optional[str]) -> list[tuple[
     chat = str(chat_id or "").strip()
     if not chat or ("@" in chat and not chat.endswith(("@s.whatsapp.net", "@lid"))):
         return []
-    try:
-        from gateway.whatsapp_identity import expand_whatsapp_aliases, normalize_whatsapp_identifier
-        base = normalize_whatsapp_identifier(chat)
-        aliases = expand_whatsapp_aliases(chat)
-        user_base = normalize_whatsapp_identifier(str(user_id)) if user_id is not None else ""
-    except Exception as e:
-        logger.debug("Mirror: whatsapp alias lookup failed for %s: %s", chat, e)
-        return []
+    from gateway.whatsapp_identity import expand_whatsapp_aliases, normalize_whatsapp_identifier
+
+    base = normalize_whatsapp_identifier(chat)
+    aliases = expand_whatsapp_aliases(chat)  # unreadable mapping files are skipped there
+    user_base = normalize_whatsapp_identifier(str(user_id)) if user_id is not None else ""
     mapped = sorted(a for a in aliases if a and a != base)
     if chat.endswith("@lid"):
         candidates = [f"{a}@s.whatsapp.net" for a in mapped]
@@ -137,8 +135,8 @@ def _most_recent_session(session_ids: list[str]) -> Optional[str]:
             rows = [db.get_session(sid) for sid in session_ids]
         finally:
             release_or_close(db)
-    except Exception as e:
-        logger.debug("Mirror: session recency lookup failed: %s", e)
+    except (sqlite3.Error, OSError):
+        logger.debug("Mirror: session recency lookup failed", exc_info=True)
         return None
     if any(not row for row in rows):
         return None
