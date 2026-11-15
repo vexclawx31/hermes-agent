@@ -208,3 +208,82 @@ class TestSessionsIndexProfileScoping:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "elsewhere"))
 
         assert mirror_mod._find_session_id("telegram", "12345") == "sess_patched"
+
+
+PHONE, LID = "33700000001", "131900000000001"
+
+
+def _lid_mapping(tmp_path):
+    """The bridge's lid-mapping files for one person (phone <-> LID), as the WhatsApp adapter writes them."""
+    session_dir = tmp_path / "home" / "whatsapp" / "session"
+    session_dir.mkdir(parents=True)
+    (session_dir / f"lid-mapping-{PHONE}.json").write_text(json.dumps(LID), encoding="utf-8")
+    (session_dir / f"lid-mapping-{LID}_reverse.json").write_text(json.dumps(PHONE), encoding="utf-8")
+    return tmp_path / "home"
+
+
+def _dm_session(chat_id):
+    return {"agent:main:whatsapp:dm:" + PHONE: {
+        "session_id": "sess_dm", "updated_at": "2026-11-15T19:00:00",
+        "origin": {"platform": "whatsapp", "chat_id": chat_id, "user_id": chat_id, "chat_type": "dm"}}}
+
+
+class TestWhatsAppDmAliases:
+    """2026-11-15: an owner notice sent to the phone JID was never mirrored into the owner's DM session, which the
+    bridge had keyed by his LID, so the DM turn that followed had no idea what had just been sent."""
+
+    def _mirror(self, tmp_path, monkeypatch, session_chat, target, user_id):
+        monkeypatch.setenv("HERMES_HOME", str(_lid_mapping(tmp_path)))
+        sessions_dir, index_file = _setup_sessions(tmp_path, _dm_session(session_chat))
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            ok = mirror_to_session("whatsapp", target, "the ski research", source_label="owner-dm", user_id=user_id)
+        return ok, mock_sqlite
+
+    def test_a_phone_jid_send_reaches_a_lid_keyed_dm_session(self, tmp_path, monkeypatch):
+        ok, sqlite = self._mirror(tmp_path, monkeypatch, f"{LID}@lid", f"{PHONE}@s.whatsapp.net",
+                                  f"{PHONE}@s.whatsapp.net")
+        assert ok is True and sqlite.call_args[0][0] == "sess_dm"
+
+    def test_a_lid_send_reaches_a_phone_keyed_dm_session(self, tmp_path, monkeypatch):
+        ok, sqlite = self._mirror(tmp_path, monkeypatch, f"{PHONE}@s.whatsapp.net", f"{LID}@lid", None)
+        assert ok is True and sqlite.call_args[0][0] == "sess_dm"
+
+    def test_a_bare_phone_target_resolves_too(self, tmp_path, monkeypatch):
+        ok, sqlite = self._mirror(tmp_path, monkeypatch, f"{LID}@lid", PHONE, PHONE)
+        assert ok is True and sqlite.call_args[0][0] == "sess_dm"
+
+    def test_without_a_mapping_nothing_is_guessed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+        sessions_dir, index_file = _setup_sessions(tmp_path, _dm_session(f"{LID}@lid"))
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            assert mirror_to_session("whatsapp", f"{PHONE}@s.whatsapp.net", "x") is False
+        mock_sqlite.assert_not_called()
+
+    def test_another_persons_dm_is_never_matched(self, tmp_path, monkeypatch):
+        """Aliases come only from the mapping files: a different number keeps no session."""
+        ok, sqlite = self._mirror(tmp_path, monkeypatch, f"{LID}@lid", "33799999999@s.whatsapp.net",
+                                  "33799999999@s.whatsapp.net")
+        assert ok is False
+        sqlite.assert_not_called()
+
+    def test_groups_and_other_platforms_get_no_alternates(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(_lid_mapping(tmp_path)))
+        assert mirror_mod._whatsapp_dm_alternates("120363000000000001@g.us", None) == []
+        assert mirror_mod._whatsapp_dm_alternates("status@broadcast", None) == []
+        sessions_dir, index_file = _setup_sessions(tmp_path, _dm_session(f"{LID}@lid"))
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            assert mirror_to_session("signal", PHONE, "x") is False
+        mock_sqlite.assert_not_called()
+
+    def test_a_different_user_id_is_kept_not_rewritten(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(_lid_mapping(tmp_path)))
+        alts = mirror_mod._whatsapp_dm_alternates(f"{PHONE}@s.whatsapp.net", "someone-else")
+        assert (f"{LID}@lid", "someone-else") in alts
+        alts = mirror_mod._whatsapp_dm_alternates(f"{PHONE}@s.whatsapp.net", f"{PHONE}@s.whatsapp.net")
+        assert (f"{LID}@lid", f"{LID}@lid") in alts

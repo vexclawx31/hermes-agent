@@ -55,6 +55,12 @@ def mirror_to_session(
     try:
         if not session_id:
             session_id = _find_session_id(platform, str(chat_id), thread_id=thread_id, user_id=user_id)
+        if not session_id and str(platform or "").lower() == "whatsapp":
+            for alt_chat, alt_user in _whatsapp_dm_alternates(str(chat_id), user_id):
+                session_id = _find_session_id(platform, alt_chat, thread_id=thread_id, user_id=alt_user)
+                if session_id:
+                    logger.info("Mirror: whatsapp DM %s matched its session under the alias %s", chat_id, alt_chat)
+                    break
         if not session_id:
             logger.warning(
                 "Mirror: no session found for %s:%s thread=%s user=%s (explicit_id=none, origin-scan bailed)",
@@ -71,6 +77,34 @@ def mirror_to_session(
         # WARNING, not debug: a silent mirror drop is the cron continuation-amnesia bug.
         logger.warning("Mirror failed for %s:%s thread=%s user=%s session=%s: %s", platform, chat_id, thread_id, user_id, session_id, e)
         return False
+
+
+def _whatsapp_dm_alternates(chat_id: str, user_id: Optional[str]) -> list[tuple[str, Optional[str]]]:
+    """Other spellings of a WhatsApp DM peer to retry the origin lookup with: ``(chat_id, user_id)`` pairs.
+
+    The bridge can key one person's DM session by a LID (``<lid>@lid``) while a proactive send (an owner
+    notice, ``send_message``, a cron delivery) targets the phone JID (``<phone>@s.whatsapp.net``), or the
+    reverse; the exact-match origin scan then finds nothing and the delivery is never mirrored. Aliases come
+    from the bridge's lid-mapping files (:func:`gateway.whatsapp_identity.expand_whatsapp_aliases`), so only
+    the same person is ever matched. A group (``@g.us``) or any other JID kind has no alternates. When
+    *user_id* names the same person as *chat_id* (a DM's peer), it follows the alias; otherwise it is kept."""
+    chat = str(chat_id or "").strip()
+    if not chat or ("@" in chat and not chat.endswith(("@s.whatsapp.net", "@lid"))):
+        return []
+    try:
+        from gateway.whatsapp_identity import expand_whatsapp_aliases, normalize_whatsapp_identifier
+        base = normalize_whatsapp_identifier(chat)
+        aliases = expand_whatsapp_aliases(chat)
+    except Exception as e:
+        logger.debug("Mirror: whatsapp alias lookup failed for %s: %s", chat, e)
+        return []
+    same_person = user_id is not None and normalize_whatsapp_identifier(str(user_id)) == base
+    out: list[tuple[str, Optional[str]]] = []
+    for alias in sorted(aliases):
+        for jid in (f"{alias}@lid", f"{alias}@s.whatsapp.net"):
+            if jid != chat:
+                out.append((jid, jid if same_person else user_id))
+    return out
 
 
 def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = None, user_id: Optional[str] = None) -> Optional[str]:
