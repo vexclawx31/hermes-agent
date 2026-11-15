@@ -7,6 +7,7 @@ agent knows what was sent.  Standalone: works from CLI, cron and gateway context
 
 import json
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -55,6 +56,8 @@ def mirror_to_session(
     try:
         if not session_id:
             session_id = _find_session_id(platform, str(chat_id), thread_id=thread_id, user_id=user_id)
+        if not session_id and str(platform or "").lower() == "whatsapp":
+            session_id = _find_whatsapp_dm_session(platform, str(chat_id), thread_id=thread_id, user_id=user_id)
         if not session_id:
             logger.warning(
                 "Mirror: no session found for %s:%s thread=%s user=%s (explicit_id=none, origin-scan bailed)",
@@ -71,6 +74,77 @@ def mirror_to_session(
         # WARNING, not debug: a silent mirror drop is the cron continuation-amnesia bug.
         logger.warning("Mirror failed for %s:%s thread=%s user=%s session=%s: %s", platform, chat_id, thread_id, user_id, session_id, e)
         return False
+
+
+def _whatsapp_dm_alternates(chat_id: str, user_id: Optional[str]) -> list[tuple[str, Optional[str]]]:
+    """Other ids of a WhatsApp DM peer to retry the origin lookup with: ``(chat_id, user_id)`` pairs.
+
+    The bridge can key one person's DM session by a LID (``<lid>@lid``) while a proactive send (an owner
+    notice, ``send_message``, a cron delivery) targets the phone JID (``<phone>@s.whatsapp.net``), or the
+    reverse; the exact-match origin scan then finds nothing and the delivery is never mirrored.
+
+    Only ids a lid-mapping file establishes are tried (:func:`gateway.whatsapp_identity.expand_whatsapp_aliases`),
+    in the OTHER namespace: a phone target (``@s.whatsapp.net`` or a bare number) yields its mapped LIDs as
+    ``<lid>@lid``; a LID target yields its mapped phones as ``<phone>@s.whatsapp.net``. The same digits are never
+    tried in the other namespace (they don't name the same person), and a bare number also yields its own
+    phone JID. Groups (``@g.us``) and other JID kinds get nothing. *user_id* follows the candidate when it is
+    one of the peer's ids (a DM's peer); otherwise it is kept as given."""
+    chat = str(chat_id or "").strip()
+    if not chat or ("@" in chat and not chat.endswith(("@s.whatsapp.net", "@lid"))):
+        return []
+    from gateway.whatsapp_identity import expand_whatsapp_aliases, normalize_whatsapp_identifier
+
+    base = normalize_whatsapp_identifier(chat)
+    aliases = expand_whatsapp_aliases(chat)  # unreadable mapping files are skipped there
+    user_base = normalize_whatsapp_identifier(str(user_id)) if user_id is not None else ""
+    mapped = sorted(a for a in aliases if a and a != base)
+    if chat.endswith("@lid"):
+        candidates = [f"{a}@s.whatsapp.net" for a in mapped]
+    else:
+        candidates = ([f"{base}@s.whatsapp.net"] if "@" not in chat else []) + [f"{a}@lid" for a in mapped]
+    same_person = bool(user_base) and user_base in aliases
+    return [(jid, jid if same_person else user_id) for jid in candidates if jid != chat]
+
+
+def _find_whatsapp_dm_session(platform: str, chat_id: str, thread_id: Optional[str] = None,
+                              user_id: Optional[str] = None) -> Optional[str]:
+    """The DM session of *chat_id*'s peer under another of their ids (see :func:`_whatsapp_dm_alternates`).
+    One live session found: it. Several (e.g. a phone-keyed and a LID-keyed one): the most recently active,
+    by ``last_activity_at`` then ``started_at`` in state.db; when that can't be read, none (never a guess)."""
+    found: list[str] = []
+    for alt_chat, alt_user in _whatsapp_dm_alternates(chat_id, user_id):
+        sid = _find_session_id(platform, alt_chat, thread_id=thread_id, user_id=alt_user)
+        if sid and sid not in found:
+            found.append(sid)
+    if len(found) > 1:
+        chosen = _most_recent_session(found)
+    else:
+        chosen = found[0] if found else None
+    if chosen:
+        logger.info("Mirror: whatsapp DM %s matched its session under another id of the same person (%d candidate%s)",
+                    chat_id, len(found), "" if len(found) == 1 else "s")
+    return chosen
+
+
+def _most_recent_session(session_ids: list[str]) -> Optional[str]:
+    """The most recently active of *session_ids* in state.db, or None when any can't be read."""
+    try:
+        from hermes_state_registry import acquire, release_or_close
+        db = acquire()
+        try:
+            rows = [db.get_session(sid) for sid in session_ids]
+        finally:
+            release_or_close(db)
+    except (sqlite3.Error, OSError):
+        logger.debug("Mirror: session recency lookup failed", exc_info=True)
+        return None
+    if any(not row for row in rows):
+        return None
+
+    def _recency(row: dict) -> tuple[float, float]:
+        return (float(row.get("last_activity_at") or 0), float(row.get("started_at") or 0))
+
+    return str(max(rows, key=_recency)["id"])
 
 
 def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = None, user_id: Optional[str] = None) -> Optional[str]:
