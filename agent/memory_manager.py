@@ -304,14 +304,20 @@ class MemoryManager:
             self._has_external = True
 
         self._providers.append(provider)
+        self._route_tools(provider, schemas)
+        logger.info("Memory provider '%s' registered (%d tools)", provider.name, len(schemas))
 
-        # Core tool names are reserved: built-ins always win at agent init, so a shadowing
-        # provider tool would linger in ``_tool_to_provider`` and hijack dispatch.
-        # ``clarify``, ``delegate_task``). Reject it here, at the door, so it never enters the routing table
-        # at all — matching the built-ins-always-win invariant used by the TTS/browser/search provider
-        # registries. See #40466.
+    def _route_tools(self, provider: MemoryProvider, schemas: list) -> int:
+        """Route *provider*'s tool *schemas* in ``_tool_to_provider``; the number newly routed.
+
+        Core tool names are reserved: built-ins always win at agent init, so a shadowing
+        provider tool would linger in ``_tool_to_provider`` and hijack dispatch.
+        (``clarify``, ``delegate_task``). Reject it here, at the door, so it never enters the routing table
+        at all — matching the built-ins-always-win invariant used by the TTS/browser/search provider
+        registries. See #40466. A name another provider already routes stays with that provider."""
         from toolsets import _HERMES_CORE_TOOLS
 
+        added = 0
         for raw_schema in schemas:
             schema = normalize_tool_schema(raw_schema)
             if schema is None:
@@ -324,14 +330,33 @@ class MemoryManager:
                     "rename the provider's tool to something unique.", provider.name, tool_name,
                 )
             elif tool_name in self._tool_to_provider:
-                logger.warning(
-                    "Memory tool name conflict: '%s' already registered by %s, "
-                    "ignoring from %s", tool_name, self._tool_to_provider[tool_name].name, provider.name,
-                )
+                if self._tool_to_provider[tool_name] is not provider:
+                    logger.warning(
+                        "Memory tool name conflict: '%s' already registered by %s, "
+                        "ignoring from %s", tool_name, self._tool_to_provider[tool_name].name, provider.name,
+                    )
             else:
                 self._tool_to_provider[tool_name] = provider
+                added += 1
+        return added
 
-        logger.info("Memory provider '%s' registered (%d tools)", provider.name, len(schemas))
+    def _refresh_tool_routes(self) -> None:
+        """Route tools a provider offers only once initialized (e.g. the hindsight plugin's privacy tools,
+        which exist only after its privacy guard is built): ``add_provider`` read the schemas before
+        ``initialize``, while the agent's tool surface (``get_all_tool_schemas``) is read after it, so such a
+        tool was shown to the model but dispatch answered "Unknown tool" (2026-11-15). Same reserved-name and
+        conflict rules; a provider whose schemas can't be read keeps its earlier routes."""
+        for provider in list(self._providers):
+            try:
+                schemas = list(provider.get_tool_schemas())
+            except Exception as exc:  # health: allow BLE001 -- a provider's schema bug must not break agent init; logged with traceback
+                logger.warning("Memory provider '%s' tool schemas unreadable after initialize; keeping its "
+                               "earlier routes", provider.name, exc_info=exc)
+                continue
+            added = self._route_tools(provider, schemas)
+            if added:
+                logger.info("Memory provider '%s' tools after initialize: %d (+%d routed)", provider.name,
+                            len(schemas), added)
 
     @property
     def providers(self) -> list[MemoryProvider]:
@@ -982,3 +1007,4 @@ class MemoryManager:
                 self._drop_provider(provider)
         self._each_provider("initialize failed", lambda p: p.initialize(session_id=session_id, **kwargs),
                             level=logging.WARNING)
+        self._refresh_tool_routes()
