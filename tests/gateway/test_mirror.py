@@ -284,6 +284,89 @@ class TestWhatsAppDmAliases:
     def test_a_different_user_id_is_kept_not_rewritten(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(_lid_mapping(tmp_path)))
         alts = mirror_mod._whatsapp_dm_alternates(f"{PHONE}@s.whatsapp.net", "someone-else")
-        assert (f"{LID}@lid", "someone-else") in alts
+        assert alts == [(f"{LID}@lid", "someone-else")]
         alts = mirror_mod._whatsapp_dm_alternates(f"{PHONE}@s.whatsapp.net", f"{PHONE}@s.whatsapp.net")
-        assert (f"{LID}@lid", f"{LID}@lid") in alts
+        assert alts == [(f"{LID}@lid", f"{LID}@lid")]
+        # the peer's other id as user_id (phone target, LID user) also follows the candidate
+        alts = mirror_mod._whatsapp_dm_alternates(f"{PHONE}@s.whatsapp.net", f"{LID}@lid")
+        assert alts == [(f"{LID}@lid", f"{LID}@lid")]
+
+    def test_only_the_mapped_namespace_is_tried(self, tmp_path, monkeypatch):
+        """Vex (PR #69 review): the same digits in the other namespace are not the same person."""
+        monkeypatch.setenv("HERMES_HOME", str(_lid_mapping(tmp_path)))
+        assert mirror_mod._whatsapp_dm_alternates(f"{PHONE}@s.whatsapp.net", None) == [(f"{LID}@lid", None)]
+        assert mirror_mod._whatsapp_dm_alternates(f"{LID}@lid", None) == [(f"{PHONE}@s.whatsapp.net", None)]
+        assert mirror_mod._whatsapp_dm_alternates(PHONE, None) == [(f"{PHONE}@s.whatsapp.net", None),
+                                                                   (f"{LID}@lid", None)]
+
+    def test_same_digits_in_the_other_namespace_are_never_matched_without_a_mapping(self, tmp_path, monkeypatch):
+        """No mapping: a phone-JID send must not land in an unrelated session whose LID has the same digits."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+        assert mirror_mod._whatsapp_dm_alternates(f"{PHONE}@s.whatsapp.net", None) == []
+        assert mirror_mod._whatsapp_dm_alternates(f"{PHONE}@lid", None) == []
+        sessions_dir, index_file = _setup_sessions(tmp_path, _dm_session(f"{PHONE}@lid"))
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            assert mirror_to_session("whatsapp", f"{PHONE}@s.whatsapp.net", "x",
+                                     user_id=f"{PHONE}@s.whatsapp.net") is False
+        mock_sqlite.assert_not_called()
+
+
+class TestWhatsAppDmAliasesInStateDb:
+    """The same lookups through a real SessionDB (state.db), not the sessions.json fallback."""
+
+    def _db(self, tmp_path, monkeypatch):
+        import hermes_state
+        from hermes_state import SessionDB
+
+        home = _lid_mapping(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        db_path = home / "state.db"
+        monkeypatch.setattr(hermes_state, "_default_db_path", lambda: db_path)
+        monkeypatch.setattr(mirror_mod, "_SESSIONS_INDEX", home / "sessions" / "absent.json")
+        return SessionDB(db_path=db_path)
+
+    @staticmethod
+    def _dm(db, sid, peer, started, active):
+        db.create_session(sid, "whatsapp", user_id=peer, session_key=f"agent:main:whatsapp:dm:{PHONE}:{sid}",
+                          chat_id=peer, chat_type="dm")
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET started_at = ?, last_activity_at = ? WHERE id = ?", (started, active, sid)))
+
+    def test_mixed_ids_mirror_into_the_lid_session(self, tmp_path, monkeypatch):
+        db = self._db(tmp_path, monkeypatch)
+        try:
+            self._dm(db, "sess_lid", f"{LID}@lid", 100.0, 200.0)
+        finally:
+            db.close()
+        with patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            assert mirror_to_session("whatsapp", f"{PHONE}@s.whatsapp.net", "the ski research",
+                                     user_id=f"{PHONE}@s.whatsapp.net") is True
+        assert mock_sqlite.call_args[0][0] == "sess_lid"
+
+    def test_with_phone_and_lid_sessions_the_most_recently_active_wins(self, tmp_path, monkeypatch):
+        """A bare-number target can match both a phone-keyed and a LID-keyed DM session of the same person:
+        the conversation active most recently gets the mirror, whatever the alias order."""
+        db = self._db(tmp_path, monkeypatch)
+        try:
+            self._dm(db, "sess_phone_old", f"{PHONE}@s.whatsapp.net", 100.0, 150.0)
+            self._dm(db, "sess_lid_new", f"{LID}@lid", 120.0, 900.0)
+        finally:
+            db.close()
+        with patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            assert mirror_to_session("whatsapp", PHONE, "x", user_id=PHONE) is True
+        assert mock_sqlite.call_args[0][0] == "sess_lid_new"
+
+    def test_an_exact_match_is_unchanged(self, tmp_path, monkeypatch):
+        """A send that already names the session's own id never looks at aliases."""
+        db = self._db(tmp_path, monkeypatch)
+        try:
+            self._dm(db, "sess_phone", f"{PHONE}@s.whatsapp.net", 100.0, 150.0)
+            self._dm(db, "sess_lid", f"{LID}@lid", 120.0, 900.0)
+        finally:
+            db.close()
+        with patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            assert mirror_to_session("whatsapp", f"{PHONE}@s.whatsapp.net", "x",
+                                     user_id=f"{PHONE}@s.whatsapp.net") is True
+        assert mock_sqlite.call_args[0][0] == "sess_phone"
