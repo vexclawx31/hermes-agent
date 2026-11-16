@@ -103,7 +103,7 @@ def test_identity_snapshots_the_job_as_fired():
         job["deliver"] = "slack:C1"
         job["origin"]["user_id"] = "someone-else"
         ident = current_cron_execution()
-        assert ident.prompt_sha256 == hashlib.sha256("Saturday: boat trip".encode()).hexdigest()
+        assert ident.prompt_sha256 == hashlib.sha256(b"Saturday: boat trip").hexdigest()
         assert ident.prompt_sha256 != prompt_digest(job["prompt"])
         assert ident.deliver == "whatsapp:120@g.us"
         assert ident.origin == (("chat_id", "120@g.us"), ("platform", "whatsapp"),
