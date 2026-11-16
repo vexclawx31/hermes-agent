@@ -1,4 +1,5 @@
 """Plugins can tell which cron execution they run inside (#130722)."""
+import hashlib
 import json
 import os
 import subprocess
@@ -82,7 +83,45 @@ def test_tool_hook_in_a_ticked_job_sees_its_execution_and_none_outside(tmp_path)
     assert ident["scheduled_instant"] == execution["scheduled_instant"] is not None
     assert ident["started_at"] == execution["started_at"]
     assert ident["profile"] == report["profile"]
+    assert ident["prompt_sha256"] == hashlib.sha256(b"read the note").hexdigest()
+    assert ident["deliver"] == "local"
+    assert ident["origin"] == []  # dataclasses.asdict + JSON: the empty tuple
     assert report["outside"] is None
+
+
+def test_identity_snapshots_the_job_as_fired():
+    from cron.execution_identity import (
+        current_cron_execution, enter_cron_execution, exit_cron_execution, origin_fields, prompt_digest)
+
+    job = {"id": "j", "name": "J", "prompt": "Saturday: boat trip",
+           "deliver": "whatsapp:120@g.us",
+           "origin": {"platform": "whatsapp", "chat_id": "120@g.us", "user_id": "1555@s.whatsapp.net",
+                      "chat_type": None, "extra": {"nested": "dropped"}}}
+    token = enter_cron_execution(job, "exec-1", {})
+    try:
+        job["prompt"] = "edited after the fire"
+        job["deliver"] = "slack:C1"
+        job["origin"]["user_id"] = "someone-else"
+        ident = current_cron_execution()
+        assert ident.prompt_sha256 == hashlib.sha256(b"Saturday: boat trip").hexdigest()
+        assert ident.prompt_sha256 != prompt_digest(job["prompt"])
+        assert ident.deliver == "whatsapp:120@g.us"
+        assert ident.origin == (("chat_id", "120@g.us"), ("platform", "whatsapp"),
+                                ("user_id", "1555@s.whatsapp.net"))
+        assert ident.origin != origin_fields(job["origin"])
+    finally:
+        exit_cron_execution(token)
+
+
+def test_identity_snapshot_fields_are_empty_for_a_job_without_them():
+    from cron.execution_identity import current_cron_execution, enter_cron_execution, exit_cron_execution
+
+    token = enter_cron_execution({"id": "j", "script": "x.py", "origin": "not-a-mapping"}, "exec-2", {})
+    try:
+        ident = current_cron_execution()
+        assert (ident.prompt_sha256, ident.deliver, ident.origin) == (None, None, ())
+    finally:
+        exit_cron_execution(token)
 
 
 def test_identity_is_scoped_and_not_inherited_by_delegated_children():
