@@ -210,13 +210,28 @@ hermes browser run -- node my-helper.js input.json
 hermes browser run --timeout 120 -- node my-helper.js input.json
 ```
 
-It holds the browser open for the command exactly as a browser session does
-(starting it when it is off), sets `HERMES_BROWSER_CDP_URL` (for example
-`http://127.0.0.1:53124`) and `HERMES_BROWSER_CDP_PORT` for it, and lets go
-when the command exits; the last holder stops the browser. The command is run
-as given, without a shell, and is stopped after `--timeout` seconds (default
-600). The exit status is the command's, or 124 when the timeout ended it. The
-address is not a tab boundary: a helper must open and close only its own tabs.
+It holds the browser open for the command through the same launcher and leases
+a browser session uses (starting it when it is off), sets
+`HERMES_BROWSER_CDP_URL` (for example `http://127.0.0.1:53124`) and
+`HERMES_BROWSER_CDP_PORT` for it, and lets go when the command exits; the last
+holder stops the browser.
+
+- The command goes after `--` and is run as given, without a shell.
+- It is stopped after `--timeout` seconds (default 600), together with
+  everything it started; background processes it leaves behind are stopped
+  when it exits too.
+- Exit status: the command's own; `128 + N` when signal `N` ended it or the
+  wrapper; 124 when the timeout ended it; 2 when nothing was run (no
+  `browser.own_profile`, a missing `--`, a browser that could not be started,
+  or a profile whose sessions use a CDP override, a cloud provider or
+  Lightpanda instead).
+- The address is not a tab boundary: a helper must open and close only its own
+  tabs.
+- When an agent runs it from its terminal tool, keep `--timeout` below the
+  terminal tool's own timeout. A terminal timeout kills the whole command tree
+  at once, including a browser this command started, even if a browser session
+  has attached to it meanwhile; that session then starts a new browser on its
+  next call.
 
 `browser.own_profile` needs both other keys and a binary Hermes can run; if one
 is missing the browser call fails with a message naming it, and nothing else is

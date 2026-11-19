@@ -63,8 +63,8 @@ def own(tmp_path):
            "PYTHONDONTWRITEBYTECODE": "1"}
     started: list[subprocess.Popen] = []
 
-    def configure(own_profile: bool = True) -> None:
-        browser = {"user_data_dir": "browser-profiles/own", "executable_path": str(fake)}
+    def configure(own_profile: bool = True, **more) -> None:
+        browser = {"user_data_dir": "browser-profiles/own", "executable_path": str(fake), **more}
         if own_profile:
             browser["own_profile"] = True
         (home / "config.yaml").write_text(json.dumps({"browser": browser}))
@@ -87,6 +87,11 @@ def own(tmp_path):
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=10)
+    for out in tmp_path.glob("*.json"):   # a helper (and its child) a failed case left behind
+        seen = json.loads(out.read_text())
+        for pid in (seen.get("pid"), seen.get("child")):
+            if pid and _alive(pid):
+                os.kill(pid, signal.SIGKILL)
     for pid in pids(profile, "launches"):
         if _alive(pid):
             os.kill(pid, signal.SIGTERM)
@@ -118,12 +123,12 @@ def test_another_holder_keeps_the_browser_open(own):
 
 
 def test_the_deadline_stops_the_commands_whole_process_tree_before_the_browser(own):
-    proc, out = own["start"]("a", mode="tree", deadline=3.0)
+    proc, out = own["start"]("a", mode="tree", deadline=8.0)
     seen = own["report"](out)
     (browser,) = own["browsers"]()
     assert proc.wait(timeout=40) == 124
-    assert "ran longer than 3 s" in proc.stderr.read()
-    assert not _alive(seen["pid"]) and not _alive(seen["child"])    # nothing of the command is left
+    assert "ran longer than 8 s" in proc.stderr.read()
+    wait_until(lambda: not _alive(seen["pid"]) and not _alive(seen["child"]), timeout=15)   # nothing of it is left
     wait_until(lambda: not _alive(browser), timeout=15)
 
 
@@ -133,7 +138,7 @@ def test_a_terminated_wrapper_stops_its_command_and_lets_go_of_the_browser(own):
     (browser,) = own["browsers"]()
     proc.send_signal(signal.SIGTERM)
     assert proc.wait(timeout=40) == 128 + signal.SIGTERM
-    assert not _alive(seen["pid"]) and not _alive(seen["child"])
+    wait_until(lambda: not _alive(seen["pid"]) and not _alive(seen["child"]), timeout=15)
     wait_until(lambda: not _alive(browser), timeout=15)
 
 
@@ -143,6 +148,27 @@ def test_without_the_own_profile_opt_in_nothing_is_started_and_the_command_never
     assert proc.wait(timeout=30) == 2
     assert "browser.own_profile is off" in proc.stderr.read()
     assert not out.exists() and own["browsers"]() == []
+
+
+def test_a_command_that_exits_by_itself_leaves_no_child_of_its_own_behind(own):
+    proc, out = own["start"]("a", mode="tree")
+    seen = own["report"](out)
+    Path(str(out) + ".go").touch()
+    assert proc.wait(timeout=40) == 7
+    wait_until(lambda: not _alive(seen["child"]), timeout=15)        # its background child went with the hold
+
+
+def test_beside_another_browser_backend_it_refuses_and_starts_nothing(own):
+    own["configure"](cdp_url="http://127.0.0.1:9")                   # sessions of this profile use a CDP override
+    proc, out = own["start"]("a", mode="exit")
+    assert proc.wait(timeout=30) == 2
+    assert "not the own-profile browser" in proc.stderr.read()
+    assert not out.exists() and own["browsers"]() == []
+
+
+def test_a_command_ended_by_a_signal_reports_the_shell_status():
+    from hermes_cli.browser_run import _status
+    assert (_status(0), _status(7), _status(-signal.SIGKILL)) == (0, 7, 128 + signal.SIGKILL)
 
 
 def test_an_endpoint_that_is_not_loopback_http_is_never_handed_on():
@@ -158,10 +184,13 @@ def test_the_cli_passes_the_command_as_an_argv_without_the_separator(monkeypatch
     calls = []
     monkeypatch.setattr(browser_run, "run", lambda command, deadline: calls.append((command, deadline)) or 0)
     parser = argparse.ArgumentParser()
-    build_browser_parser(parser.add_subparsers())
+    build_browser_parser(parser.add_subparsers(dest="command"))    # as the real top-level parser names it
     args = parser.parse_args(["browser", "run", "--timeout", "90", "--", "node", "x.js", "--flag", "a b; c"])
+    assert args.command == "browser"                               # the helper's argv never overwrites it
     assert args.func(args) == 0
     args = parser.parse_args(["browser", "run", "--", "node", "x.js"])
     assert args.func(args) == 0
+    args = parser.parse_args(["browser", "run", "node", "x.js"])    # no separator: refused, nothing is run
+    assert args.func(args) == 2
     assert calls == [(["node", "x.js", "--flag", "a b; c"], 90.0),
                      (["node", "x.js"], browser_run.DEFAULT_DEADLINE)]

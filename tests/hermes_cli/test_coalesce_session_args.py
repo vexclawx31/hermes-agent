@@ -23,6 +23,13 @@ class TestCoalesceSessionNameArgs:
 
     # ── passthrough (no session flags) ───────────────────────────────────
 
+    def test_nothing_after_the_separator_is_touched(self):
+        """hermes browser run -- python3 -c code a b: the command's own -c/-r and arguments stay as given"""
+        argv = ["browser", "run", "--", "python3", "-c", "code", "a", "b", "-r", "mod", "x", "y"]
+        assert _coalesce_session_name_args(argv) == argv
+        assert _coalesce_session_name_args(["-c", "My", "Session", "--", "-c", "a", "b"]) == [
+            "-c", "My Session", "--", "-c", "a", "b"]
+
     def test_no_session_flags_passthrough(self):
         """hermes -w chat -q hello (nothing to merge)"""
         result = _coalesce_session_name_args(["-w", "chat", "-q", "hello"])

@@ -36,14 +36,19 @@ def build_browser_parser(subparsers) -> None:
             "without a shell; put it after --. Exit status: the command's, 124 when --timeout ended it.")
     browser_run.add_argument("--timeout", type=float, default=None, metavar="SECONDS",
                              help="Stop the command after this many seconds (default 600)")
-    browser_run.add_argument("command", nargs=argparse.REMAINDER, help="-- <command> [args...]")
+    # Not ``command``: that is the top-level parser's own dest (the subcommand name).
+    browser_run.add_argument("run_command", nargs=argparse.REMAINDER, metavar="command",
+                             help="-- <command> [args...]")
 
     def _dispatch_browser(_args):
         if getattr(_args, "browser_action", None) == "run":
             from hermes_cli.browser_run import DEFAULT_DEADLINE, run
-            command = list(_args.command or [])
-            if command[:1] == ["--"]:
-                command = command[1:]
+            command = list(_args.run_command or [])
+            if command[:1] != ["--"]:   # without it Hermes's own flag scan would read the command's flags
+                print("hermes browser run: put the command after --: hermes browser run [--timeout SECONDS] "
+                      "-- <command> [args...]", file=sys.stderr)
+                return 2
+            command = command[1:]
             return run(command, DEFAULT_DEADLINE if _args.timeout is None else _args.timeout)
         from hermes_cli.browser_connect import (
             UNSUPPORTED_CHANNEL, close_browser_holding_profile, detect_default_chromium,
