@@ -156,6 +156,36 @@ browser:
 then shares that one profile directory. Leave it empty for isolated, throwaway
 browsing.
 
+#### An agent's own browser profile, started on demand
+
+Set both `browser.user_data_dir` and `browser.executable_path` to give an agent
+its own signed-in browser that Hermes starts and stops by itself:
+
+```yaml
+browser:
+  executable_path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  user_data_dir: browser-profiles/main   # relative to the profile's HERMES_HOME, or absolute
+  headed: true
+  inactivity_timeout: 120
+```
+
+- The first browser call starts that binary on that directory. Later sessions,
+  and other Hermes processes of the same OS user, attach to it.
+- It is stopped when its last session ends: after `inactivity_timeout` without
+  a browser call (checked every 30 seconds, minimum 30), or when Hermes exits.
+  A browser that was already running on the directory when Hermes arrived is
+  used but never stopped by Hermes.
+- Because the binary is your own browser, it is launched as one: no
+  `--password-store=basic` / `--use-mock-keychain`, so the profile's cookies
+  stay readable, and no sandbox-bypass flags. On macOS the browser gets the
+  home directory of the OS account Hermes runs as, so it finds that account's
+  login keychain even when Hermes itself runs with another `HOME`. This only
+  tells the browser where the keychain is; it does not unlock it.
+- Each session works only in tabs it opened, as with `browser.cdp_url`.
+
+Do not set `browser.cdp_url` as well: a CDP override always wins and Hermes then
+neither starts nor stops anything.
+
 ### Headed mode (visible browser window)
 
 ```yaml

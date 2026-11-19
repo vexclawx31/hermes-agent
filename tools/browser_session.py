@@ -173,17 +173,56 @@ def _bot_desktop_target() -> Optional[tuple[str, dict[str, Any]]]:
                               "extra_args": _bd_browser.SHARED_PROFILE_ARGS}
 
 
-def _launch_target(cache_key: str) -> tuple[str, dict[str, Any], bool]:
-    """``(launcher key, launch kwargs, shared)``. A persistent profile (Bot Desktop, ``browser.user_data_dir``)
-    is keyed by its dir so every cache key shares the one Chromium Chromium's singleton allows on it."""
+def _launch_target(cache_key: str) -> tuple[str, dict[str, Any], bool, bool]:
+    """``(launcher key, launch kwargs, shared, own profile)``. A persistent profile (Bot Desktop,
+    ``browser.user_data_dir``) is keyed by its dir so every cache key shares the one Chromium Chromium's singleton
+    allows on it. ``own profile``: the operator's own browser on the agent's own profile (see below)."""
     bot_desktop = _bot_desktop_target()
     if bot_desktop is not None:
-        return bot_desktop[0], bot_desktop[1], True
+        return bot_desktop[0], bot_desktop[1], True, False
     from tools.browser_session_cloud import user_data_dir
     udd = user_data_dir()
     if udd:
-        return f"profile:{udd}", {"user_data_dir": udd, "ephemeral": False}, True
-    return cache_key, {}, False
+        kwargs: dict[str, Any] = {"user_data_dir": udd, "ephemeral": False}
+        own = pinned_browser_executable()
+        if own:
+            # The operator's own browser on the agent's own profile (``browser.executable_path`` +
+            # ``browser.user_data_dir``): its cookies are encrypted with the OS store, so it is launched like
+            # the real-profile browser: the pinned binary, never the packaged-only keychain flags or the
+            # host's sandbox-bypass flags, and (macOS) the OS account's own HOME so the login keychain is found.
+            kwargs.update(executable=own, sandbox_bypass=False, env=own_profile_browser_env())
+        return f"profile:{udd}", kwargs, True, bool(own)
+    return cache_key, {}, False, False
+
+
+def pinned_browser_executable() -> Optional[str]:
+    """``browser.executable_path`` when the operator pinned one (their own browser binary), else None: pm's
+    Chromium, the image's baked one and a system fallback are Hermes's choice, not a pin."""
+    from hermes_cli.browser_runtime import chromium_executable
+    pinned = chromium_executable(allow_override=True)
+    return pinned if pinned and pinned != chromium_executable(allow_override=False) else None
+
+
+def own_profile_browser_env() -> dict:
+    """:func:`build_browser_env` for the operator's own browser on a persistent profile. On macOS the browser
+    looks for the login keychain under ``HOME``; a gateway whose ``HOME`` is the Hermes profile home has none
+    there, and Chrome then starts signed out behind a "Keychain Not Found" dialog. So ``HOME`` / ``USER`` /
+    ``LOGNAME`` are set to those of THIS process's own OS account (the password database entry of its uid,
+    never another account's and never a value from the environment). This only tells the browser where an
+    existing keychain is: it grants no access to it and unlocks nothing. Other platforms: unchanged."""
+    import os
+    import sys
+    env = build_browser_env()
+    if sys.platform != "darwin":
+        return env
+    try:
+        import pwd
+        account = pwd.getpwuid(os.getuid())
+    except (ImportError, KeyError, OSError):
+        return env
+    if account.pw_dir and os.path.isdir(account.pw_dir):
+        env.update(HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name)
+    return env
 
 
 def _create_chromium_session(cache_key: str) -> dict[str, Any]:
@@ -199,11 +238,13 @@ def _create_chromium_session(cache_key: str) -> dict[str, Any]:
         return create_sandbox_session(cache_key)
     from tools.browser_launcher import launch_chromium
     ensure_screen_for_headed_chromium()  # first: an auto-started screen selects the Bot Desktop profile
-    launcher_key, kwargs, shared = _launch_target(cache_key)
+    launcher_key, kwargs, shared, own_profile = _launch_target(cache_key)
     browser, err = launch_chromium(launcher_key, **kwargs)
     if browser is None:
         raise RuntimeError(err or "the local browser could not be started")
-    info = _session_record("h", browser.cdp_url, {"local": True})
+    # ``own_profile``: a signed-in browser every session of this agent (and a person at its window) shares, like a
+    # CDP override: each session works only in tabs it opened (tools.browser_owned_tabs).
+    info = _session_record("h", browser.cdp_url, {"local": True, **({"own_profile": True} if own_profile else {})})
     info.update(launcher_key=launcher_key, shared_profile=shared)
     logger.info("Created local browser session %s for %s (Chromium pid %s)", info["session_name"], cache_key, browser.pid)
     return info

@@ -131,7 +131,7 @@ def release_session_backend(cache_key: str, session_info: dict[str, Any]) -> Non
     """Release ``session_info``'s browser BY OBJECT (an unpublished session releases through this alone)."""
     _close_cloud_session(session_info)
     features = session_info.get("features") or {}
-    if features.get("cdp_override"):  # a shared external browser: close only the tabs this session opened
+    if features.get("cdp_override") or features.get("own_profile"):  # a shared browser: close only our own tabs
         from tools.browser_owned_tabs import release_owned_tabs
         release_owned_tabs(session_info)
     if features.get("lightpanda"):

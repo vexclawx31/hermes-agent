@@ -451,6 +451,8 @@ def _mark_local_browser(env: dict, session: dict, key: str) -> None:
     env[_BOT_DESKTOP_BROWSER_SENTINEL] = "lightpanda" if features.get("lightpanda") else "local"
     if not session.get("shared_profile") and not features.get("real_profile"):
         env[_PRIVATE_BROWSER_SENTINEL] = "1"
+    if features.get("own_profile"):  # the agent's own signed-in browser: owned tabs only, as on a CDP override
+        env[_SHARED_CDP_SENTINEL] = "1"
     _export_real_profile_note(env, key)
 
 
