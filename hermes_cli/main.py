@@ -2430,7 +2430,6 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
-
 def _coalesce_session_name_args(argv: list) -> list:
     """Join unquoted multi-word session names after -c/--continue and -r/--resume.
 
@@ -2446,7 +2445,8 @@ def _coalesce_session_name_args(argv: list) -> list:
     }
     _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
 
-    result = []
+    cut = argv.index("--") if "--" in argv else len(argv)  # after it: somebody else's argv (``browser run -- cmd -c x``)
+    argv, tail, result = argv[:cut], argv[cut:], []
     i = 0
     while i < len(argv):
         token = argv[i]
@@ -2467,7 +2467,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         else:
             result.append(token)
             i += 1
-    return result
+    return result + tail
 
 
 from hermes_cli.profile_cmd import cmd_profile

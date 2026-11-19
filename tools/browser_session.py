@@ -239,7 +239,7 @@ def own_profile_browser_env() -> dict:
         return env
     try:
         import pwd
-        account = pwd.getpwuid(os.getuid())
+        account = pwd.getpwuid(os.getuid())  # windows-footgun: ok — macOS only, returned above
     except (ImportError, KeyError, OSError):
         return env
     if account.pw_dir and os.path.isdir(account.pw_dir):
