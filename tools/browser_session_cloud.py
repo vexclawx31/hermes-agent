@@ -136,6 +136,13 @@ def get_browser_engine() -> str:
     return _memo("engine", compute)
 
 
+def own_profile() -> bool:
+    """``browser.own_profile``: ``browser.executable_path`` on ``browser.user_data_dir`` is the operator's own
+    browser on the agent's own signed-in profile (``tools.browser_session._launch_target``). Off by default: a
+    pinned binary on a persistent dir alone keeps the packaged launch."""
+    return browser_cfg("own_profile", False, _truthy)
+
+
 def is_headed_mode() -> bool:
     """``browser.headed``: launch a visible window (Linux: only when a display exists)."""
     return _memo("headed", lambda: browser_cfg("headed", False, _truthy))

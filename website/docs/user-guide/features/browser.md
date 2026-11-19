@@ -156,6 +156,63 @@ browser:
 then shares that one profile directory. Leave it empty for isolated, throwaway
 browsing.
 
+#### An agent's own browser profile, started on demand
+
+Set `browser.own_profile: true` together with `browser.user_data_dir` and
+`browser.executable_path` to give an agent its own signed-in browser that Hermes
+starts and stops by itself:
+
+```yaml
+browser:
+  own_profile: true
+  executable_path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  user_data_dir: browser-profiles/main   # relative to the profile's HERMES_HOME, or absolute
+  headed: true
+  inactivity_timeout: 120
+```
+
+- The first browser call starts that binary on that directory. Later sessions,
+  and other Hermes processes of the same OS user, attach to it.
+- It is stopped when its last session ends and no other Hermes process holds
+  it. With `headed: true` a session ends after `inactivity_timeout` seconds
+  without a browser call (checked every 30 seconds, minimum 30; read once when
+  Hermes starts), so the browser quits roughly `inactivity_timeout` to
+  `inactivity_timeout + 30` seconds after the last call. With `headed: false`
+  a session also ends at the end of each turn. Hermes's exit stops it too. A
+  person typing in its window does not count as activity.
+- A browser that was already running on the directory is attached and never
+  stopped by Hermes, but only if it exposes its DevTools endpoint through the
+  profile's `DevToolsActivePort` file (a browser Hermes or a person started
+  with `--remote-debugging-port=0`). One started another way, for example with
+  a fixed port, cannot be attached: browser calls then fail with "profile is in
+  use" until that browser is closed. A browser Hermes itself launched and then
+  lost track of (its process was killed) is cleaned up by the next Hermes
+  process.
+- It is launched with the profile's real credential store: no
+  `--password-store=basic` / `--use-mock-keychain`, so cookies written by that
+  browser can be decrypted (this makes an existing sign-in readable; it does
+  not create one), and no sandbox-bypass flags. Hermes's other launch flags
+  still apply (no sync, no component updates, no first-run pages). On macOS the
+  browser gets the home directory of the OS account Hermes runs as, so it finds
+  that account's login keychain even when Hermes itself runs with another
+  `HOME`; it then also reads that account's `~/Library` and default download
+  folder. This only tells the browser where the keychain is; it does not unlock
+  it.
+- Each session works only in tabs it opened, as with `browser.cdp_url`.
+- Use one configuration per profile directory: every Hermes profile that points
+  at the same directory must set the same three keys.
+
+`browser.own_profile` needs both other keys and a binary Hermes can run; if one
+is missing the browser call fails with a message naming it, and nothing else is
+started on that profile. Without `own_profile`, a pinned binary on a persistent
+directory is launched as before, like the packaged Chromium.
+
+The mode does not apply when something with higher precedence handles the call:
+a CDP override (`browser.cdp_url`, `BROWSER_CDP_URL`, `/browser connect`), a
+cloud provider (whose private-URL sidecar gets a throwaway profile, never this
+one), `browser.engine: lightpanda`, consented real-profile browsing, a terminal
+placement, or a running Bot Desktop screen.
+
 ### Headed mode (visible browser window)
 
 ```yaml

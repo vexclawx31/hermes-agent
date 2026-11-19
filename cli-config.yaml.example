@@ -652,6 +652,10 @@ browser:
   # profile for every local session (empty = a throwaway profile per session).
   # executable_path: ""
   # user_data_dir: ""
+  # own_profile: true with BOTH keys above = the agent's own signed-in browser:
+  # started at the first browser call, stopped with its last session, launched
+  # with the real OS key store (no mock keychain), owned tabs per session.
+  # own_profile: false
   # chromium_args: ["--lang=de"]
 
   # With a cloud provider (Browserbase, Browser Use, ...), LAN/localhost URLs

@@ -65,7 +65,11 @@ def _route_lock(route_key: str) -> threading.Lock:
 
 
 def is_shared_cdp_session(record: dict[str, Any]) -> bool:
-    return bool((record.get("features") or {}).get("cdp_override"))
+    """A browser this session shares with others it must not disturb: a CDP override, or the operator's own
+    browser the launcher started on the agent's own profile (``browser.own_profile``): signed in and used by
+    every session of the agent."""
+    features = record.get("features") or {}
+    return bool(features.get("cdp_override") or features.get("own_profile"))
 
 
 def owned_pin(record: dict[str, Any]) -> Optional[str]:
