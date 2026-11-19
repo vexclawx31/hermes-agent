@@ -202,6 +202,22 @@ browser:
 - Use one configuration per profile directory: every Hermes profile that points
   at the same directory must set the same three keys.
 
+Helper scripts that talk to that browser directly (raw CDP) run through
+`hermes browser run`:
+
+```bash
+hermes browser run -- node my-helper.js input.json
+hermes browser run --timeout 120 -- node my-helper.js input.json
+```
+
+It holds the browser open for the command exactly as a browser session does
+(starting it when it is off), sets `HERMES_BROWSER_CDP_URL` (for example
+`http://127.0.0.1:53124`) and `HERMES_BROWSER_CDP_PORT` for it, and lets go
+when the command exits; the last holder stops the browser. The command is run
+as given, without a shell, and is stopped after `--timeout` seconds (default
+600). The exit status is the command's, or 124 when the timeout ended it. The
+address is not a tab boundary: a helper must open and close only its own tabs.
+
 `browser.own_profile` needs both other keys and a binary Hermes can run; if one
 is missing the browser call fails with a message naming it, and nothing else is
 started on that profile. Without `own_profile`, a pinned binary on a persistent
