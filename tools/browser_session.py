@@ -176,31 +176,51 @@ def _bot_desktop_target() -> Optional[tuple[str, dict[str, Any]]]:
 def _launch_target(cache_key: str) -> tuple[str, dict[str, Any], bool, bool]:
     """``(launcher key, launch kwargs, shared, own profile)``. A persistent profile (Bot Desktop,
     ``browser.user_data_dir``) is keyed by its dir so every cache key shares the one Chromium Chromium's singleton
-    allows on it. ``own profile``: the operator's own browser on the agent's own profile (see below)."""
+    allows on it.
+
+    ``own profile`` (``browser.own_profile: true``, an explicit opt-in: a pinned binary on a persistent dir alone
+    keeps the packaged launch it always had): the operator's own browser on the agent's own signed-in profile.
+    Its cookies are encrypted with the OS store, so it is launched like the real-profile browser: the pinned
+    binary, never the packaged-only keychain flags or the host's sandbox-bypass flags, and (macOS) this OS
+    account's own HOME so the login keychain is found. A hybrid ``::local`` sidecar never uses it: that session
+    exists for private URLs next to a cloud browser and gets a throwaway profile, as without any persistent dir.
+    Raises ``RuntimeError`` when the opt-in is set but its binary or directory is not usable: never a fallback to
+    the packaged Chromium on the signed-in profile."""
     bot_desktop = _bot_desktop_target()
     if bot_desktop is not None:
         return bot_desktop[0], bot_desktop[1], True, False
-    from tools.browser_session_cloud import user_data_dir
+    from tools.browser_session_cloud import own_profile, user_data_dir
     udd = user_data_dir()
+    if own_profile():
+        if is_local_sidecar_key(cache_key):
+            return cache_key, {}, False, False
+        executable = own_profile_executable(udd)
+        return (f"profile:{udd}", {"user_data_dir": udd, "ephemeral": False, "executable": executable,
+                                   "sandbox_bypass": False, "env": own_profile_browser_env()}, True, True)
     if udd:
-        kwargs: dict[str, Any] = {"user_data_dir": udd, "ephemeral": False}
-        own = pinned_browser_executable()
-        if own:
-            # The operator's own browser on the agent's own profile (``browser.executable_path`` +
-            # ``browser.user_data_dir``): its cookies are encrypted with the OS store, so it is launched like
-            # the real-profile browser: the pinned binary, never the packaged-only keychain flags or the
-            # host's sandbox-bypass flags, and (macOS) the OS account's own HOME so the login keychain is found.
-            kwargs.update(executable=own, sandbox_bypass=False, env=own_profile_browser_env())
-        return f"profile:{udd}", kwargs, True, bool(own)
+        return f"profile:{udd}", {"user_data_dir": udd, "ephemeral": False}, True, False
     return cache_key, {}, False, False
 
 
-def pinned_browser_executable() -> Optional[str]:
-    """``browser.executable_path`` when the operator pinned one (their own browser binary), else None: pm's
-    Chromium, the image's baked one and a system fallback are Hermes's choice, not a pin."""
-    from hermes_cli.browser_runtime import chromium_executable
-    pinned = chromium_executable(allow_override=True)
-    return pinned if pinned and pinned != chromium_executable(allow_override=False) else None
+def own_profile_executable(udd: str) -> str:
+    """The browser binary for ``browser.own_profile``: ``browser.executable_path`` as a file this process can
+    execute (a bare command name is located like the packaged one). Raises ``RuntimeError`` naming the missing
+    setting or path; the caller must not launch anything else on that profile."""
+    import os
+    from tools.browser_session_cloud import browser_cfg
+    pinned = os.path.expanduser(browser_cfg("executable_path", "", lambda v: str(v or "").strip()))
+    if not udd or not pinned:
+        raise RuntimeError("browser.own_profile is on, but it needs both browser.user_data_dir (the agent's own "
+                           "profile directory) and browser.executable_path (its browser binary). Set both, or "
+                           "turn browser.own_profile off.")
+    if not os.path.isfile(pinned):
+        from hermes_platform.resolver import locate_command
+        found = locate_command(pinned).command
+        pinned = found[0] if found else pinned
+    if not (os.path.isfile(pinned) and os.access(pinned, os.X_OK)):
+        raise RuntimeError(f"browser.own_profile is on, but browser.executable_path ({pinned}) is not a browser "
+                           "this process can run. Fix the path; nothing else is started on that profile.")
+    return pinned
 
 
 def own_profile_browser_env() -> dict:
@@ -209,7 +229,9 @@ def own_profile_browser_env() -> dict:
     there, and Chrome then starts signed out behind a "Keychain Not Found" dialog. So ``HOME`` / ``USER`` /
     ``LOGNAME`` are set to those of THIS process's own OS account (the password database entry of its uid,
     never another account's and never a value from the environment). This only tells the browser where an
-    existing keychain is: it grants no access to it and unlocks nothing. Other platforms: unchanged."""
+    existing keychain is: it grants no access to it and unlocks nothing. With that HOME the browser also reads
+    that account's ``~/Library`` (the browser's keychain item, shared with any other profile of the same browser
+    of that account) and uses its default download folder. Other platforms: unchanged."""
     import os
     import sys
     env = build_browser_env()
@@ -242,8 +264,9 @@ def _create_chromium_session(cache_key: str) -> dict[str, Any]:
     browser, err = launch_chromium(launcher_key, **kwargs)
     if browser is None:
         raise RuntimeError(err or "the local browser could not be started")
-    # ``own_profile``: a signed-in browser every session of this agent (and a person at its window) shares, like a
-    # CDP override: each session works only in tabs it opened (tools.browser_owned_tabs).
+    # ``own_profile``: a signed-in browser every session of this agent shares, like a CDP override: each session
+    # works only in tabs it opened (tools.browser_owned_tabs). A person typing in its window is not activity: the
+    # idle janitor still stops it.
     info = _session_record("h", browser.cdp_url, {"local": True, **({"own_profile": True} if own_profile else {})})
     info.update(launcher_key=launcher_key, shared_profile=shared)
     logger.info("Created local browser session %s for %s (Chromium pid %s)", info["session_name"], cache_key, browser.pid)

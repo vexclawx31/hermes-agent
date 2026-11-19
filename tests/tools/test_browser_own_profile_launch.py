@@ -1,8 +1,8 @@
-"""The operator's own browser on the agent's own persistent profile (``browser.executable_path`` +
-``browser.user_data_dir``): the browser tool starts it on demand and stops it with its last session, and it is
-launched as a real browser (the pinned binary, no packaged-only keychain flags, on macOS the OS account's own
-HOME), never as the packaged Chromium. Runs the real session layer + launcher against a fake browser binary that
-records its argv and environment."""
+"""``browser.own_profile``: the operator's own browser (``browser.executable_path``) on the agent's own persistent
+profile (``browser.user_data_dir``). The browser tool starts it on demand and stops it with its last session, and
+launches it as a real browser (the pinned binary, no packaged-only keychain flags, no sandbox bypass, on macOS the
+OS account's own HOME), with owned tabs per session. Without the opt-in a pinned binary on a persistent dir keeps
+the packaged launch. Runs the real session layer + launcher against fake browser binaries."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import os
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
@@ -25,7 +24,7 @@ _FAKE_BROWSER = textwrap.dedent('''\
     os.makedirs(udd, exist_ok=True)
     with open(os.path.join(udd, "launch.json"), "w") as f:
         json.dump({{"argv": sys.argv, "home": os.environ.get("HOME"), "user": os.environ.get("USER"),
-                   "logname": os.environ.get("LOGNAME")}}, f)
+                   "logname": os.environ.get("LOGNAME"), "marker": os.environ.get("OWN_ENV_MARKER")}}, f)
     with open(os.path.join(udd, "DevToolsActivePort"), "w") as f:
         f.write("{port}\\n/devtools/browser/{{}}\\n".format(os.getpid()))
     time.sleep(600)
@@ -41,8 +40,8 @@ def _fake_browser(tmp_path: Path, name: str, port: int) -> Path:
 
 @pytest.fixture
 def agent_home(tmp_path, monkeypatch):
-    """One agent home whose config pins its own browser binary and profile dir; ``packaged`` is what the
-    launcher would resolve without the pin."""
+    """One agent home; ``configure`` writes its browser settings. ``packaged`` is what the launcher resolves
+    itself, ``own`` the operator's pinned binary."""
     from tools import browser_launcher as launcher
     packaged = _fake_browser(tmp_path, "packaged-chromium", 45681)
     own = _fake_browser(tmp_path, "own-browser", 45682)
@@ -59,10 +58,15 @@ def agent_home(tmp_path, monkeypatch):
     home.mkdir()
     profile = home / "browser-profiles" / "own"
 
-    def configure(pinned: bool) -> None:
-        browser = {"user_data_dir": "browser-profiles/own"}
+    def configure(*, own_profile: bool, pinned: bool = True, user_data_dir: bool = True,
+                  executable: str | None = None) -> None:
+        browser: dict = {}
+        if user_data_dir:
+            browser["user_data_dir"] = "browser-profiles/own"
         if pinned:
-            browser["executable_path"] = str(own)
+            browser["executable_path"] = executable or str(own)
+        if own_profile:
+            browser["own_profile"] = True
         (home / "config.yaml").write_text(json.dumps({"browser": browser}))
 
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -75,10 +79,10 @@ def agent_home(tmp_path, monkeypatch):
         reset_hermes_home_override(token)
 
 
-def _session(task: str) -> dict:
+def _session(task: str, *, sidecar: bool = False) -> dict:
     from tools.browser_session import get_session_info
     from tools.browser_use_cli import _backend_cache_key
-    return get_session_info(_backend_cache_key(task))
+    return get_session_info(_backend_cache_key(task, "", sidecar))
 
 
 def _launch_record(profile: Path) -> dict:
@@ -94,16 +98,22 @@ def _alive(pid: int) -> bool:
 
 
 def _wait_gone(pid: int, seconds: float = 10.0) -> bool:
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if not _alive(pid):
-            return True
-        time.sleep(0.05)
-    return False
+    from tests.waiting import wait_until
+    try:
+        wait_until(lambda: not _alive(pid), timeout=seconds)
+    except (AssertionError, TimeoutError):
+        return False
+    return True
 
 
-def test_a_pinned_binary_on_the_agents_profile_is_launched_as_a_real_browser(agent_home):
-    agent_home["configure"](pinned=True)
+# ── the launch ───────────────────────────────────────────────────────────────────────────────────────
+
+def test_the_own_profile_is_launched_as_a_real_browser_with_the_own_env(agent_home, monkeypatch):
+    from tools import browser_session
+    real_env = browser_session.own_profile_browser_env
+    monkeypatch.setattr(browser_session, "own_profile_browser_env",
+                        lambda: {**real_env(), "OWN_ENV_MARKER": "from-own-profile-env"})
+    agent_home["configure"](own_profile=True)
     info = _session("task-1")
     assert info["shared_profile"] is True and info["launcher_key"] == f"profile:{agent_home['profile']}"
     launched = _launch_record(agent_home["profile"])
@@ -114,18 +124,56 @@ def test_a_pinned_binary_on_the_agents_profile_is_launched_as_a_real_browser(age
     from tools.browser_launcher import CHROMIUM_SANDBOX_BYPASS_ARGS
     assert not set(CHROMIUM_SANDBOX_BYPASS_ARGS) & set(argv)       # never started without its own sandbox
     assert "--remote-debugging-port=0" in argv                     # no fixed port to collide on
+    assert launched["marker"] == "from-own-profile-env"            # the child really got own_profile_browser_env()
+
+
+def test_a_pinned_binary_on_a_persistent_dir_without_the_opt_in_keeps_the_packaged_launch(agent_home):
+    """What that pair always did (the Docker / AppArmor ``executable_path`` setups): packaged flags and the
+    host's sandbox bypass, the served env, the own-tab preamble only."""
+    agent_home["configure"](own_profile=False)
+    info = _session("task-1")
+    launched = _launch_record(agent_home["profile"])
+    assert "--password-store=basic" in launched["argv"]
+    from tools.browser_launcher import CHROMIUM_SANDBOX_BYPASS_ARGS
+    assert set(CHROMIUM_SANDBOX_BYPASS_ARGS) <= set(launched["argv"])
+    assert launched["marker"] is None and "own_profile" not in info["features"]
 
 
 def test_without_a_pin_the_persistent_profile_keeps_the_packaged_launch(agent_home):
-    agent_home["configure"](pinned=False)
+    agent_home["configure"](own_profile=False, pinned=False)
     _session("task-1")
     launched = _launch_record(agent_home["profile"])
     assert launched["argv"][0] == str(agent_home["packaged"])
     assert "--password-store=basic" in launched["argv"]
-    assert launched["home"] == os.environ.get("HOME")              # the env is untouched without a pin
 
 
-def test_the_own_browser_env_uses_this_accounts_home_on_macos_only(monkeypatch, tmp_path):
+@pytest.mark.parametrize("settings", [{"pinned": False}, {"user_data_dir": False}])
+def test_the_opt_in_without_its_binary_or_its_dir_is_refused_and_nothing_is_launched(agent_home, settings):
+    agent_home["configure"](own_profile=True, **settings)
+    with pytest.raises(RuntimeError, match="needs both browser.user_data_dir .* and browser.executable_path"):
+        _session("task-1")
+    assert not (agent_home["profile"] / "launch.json").exists()    # never the packaged Chromium on that profile
+
+
+def test_a_pinned_path_that_is_no_runnable_browser_is_refused_and_nothing_is_launched(agent_home, tmp_path):
+    agent_home["configure"](own_profile=True, executable=str(tmp_path / "no-such-browser"))
+    with pytest.raises(RuntimeError, match="is not a browser this process can run"):
+        _session("task-1")
+    assert not (agent_home["profile"] / "launch.json").exists()
+
+
+def test_a_hybrid_local_sidecar_never_uses_the_signed_in_profile(agent_home):
+    agent_home["configure"](own_profile=True)
+    info = _session("task-1", sidecar=True)
+    assert "own_profile" not in info["features"] and not info.get("shared_profile")
+    assert not (agent_home["profile"] / "launch.json").exists()    # a throwaway profile, the packaged binary
+    from tools.browser_owned_tabs import is_shared_cdp_session
+    assert not is_shared_cdp_session(info)
+
+
+# ── the environment ──────────────────────────────────────────────────────────────────────────────────
+
+def test_the_own_browser_env_uses_this_accounts_home_on_macos_only(monkeypatch):
     from tools import browser_session
     monkeypatch.setattr(browser_session, "build_browser_env", lambda: {"HOME": "/agent/home", "USER": "agent",
                                                                        "KEEP": "1"})
@@ -173,10 +221,12 @@ def test_an_account_without_a_usable_home_leaves_the_env_alone(monkeypatch):
     assert browser_session.own_profile_browser_env() == {"HOME": "/agent/home"}
 
 
+# ── owned tabs ───────────────────────────────────────────────────────────────────────────────────────
+
 def test_sessions_on_the_own_browser_are_owned_tab_sessions_like_a_cdp_override(agent_home):
     """Every session of the agent shares the one signed-in browser, so each works only in tabs it opened: the
     same guard as on a CDP override, not the best-effort own tab of a packaged shared profile."""
-    agent_home["configure"](pinned=True)
+    agent_home["configure"](own_profile=True)
     info = _session("task-1")
     assert info["features"].get("own_profile") is True and info["features"].get("local") is True
     from tools.browser_owned_tabs import is_shared_cdp_session
@@ -189,7 +239,7 @@ def test_sessions_on_the_own_browser_are_owned_tab_sessions_like_a_cdp_override(
 
 
 def test_a_packaged_persistent_profile_keeps_its_own_tab_preamble_only(agent_home):
-    agent_home["configure"](pinned=False)
+    agent_home["configure"](own_profile=False, pinned=False)
     info = _session("task-1")
     assert "own_profile" not in info["features"]
     from tools.browser_owned_tabs import is_shared_cdp_session
@@ -200,24 +250,29 @@ def test_a_packaged_persistent_profile_keeps_its_own_tab_preamble_only(agent_hom
     assert browser_use_cli._SHARED_CDP_SENTINEL not in env
 
 
-def test_a_sessions_end_closes_its_own_tabs_before_the_browser_is_left_or_stopped(agent_home, monkeypatch):
-    agent_home["configure"](pinned=True)
+def test_a_sessions_end_closes_its_own_tabs_first_and_only_the_last_one_stops_the_browser(agent_home, monkeypatch):
+    agent_home["configure"](own_profile=True)
     first, second = _session("task-1"), _session("task-2")
-    released = []
-    from tools import browser_owned_tabs
-    monkeypatch.setattr(browser_owned_tabs, "release_owned_tabs", lambda record: released.append(record["session_name"]))
     from tools.browser_launcher import get_browser
     pid = get_browser(first["launcher_key"]).pid
+    released = []
+    from tools import browser_owned_tabs
+    # Recorded WITH the browser's state at that moment: the tabs are closed while it is still running.
+    monkeypatch.setattr(browser_owned_tabs, "release_owned_tabs",
+                        lambda record: released.append((record["session_name"], _alive(pid))))
     from tools.browser_session_lifecycle import cleanup_single_session
     from tools.browser_use_cli import _backend_cache_key
     cleanup_single_session(_backend_cache_key("task-1"))
-    assert released == [first["session_name"]] and _alive(pid)     # its tabs only; the other session's browser stays
+    assert released == [(first["session_name"], True)] and _alive(pid)   # its tabs only; the browser stays
     cleanup_single_session(_backend_cache_key("task-2"))
-    assert released == [first["session_name"], second["session_name"]] and _wait_gone(pid)
+    assert released[-1] == (second["session_name"], True)          # own tabs first, with the browser still up
+    assert _wait_gone(pid)                                         # then the last session's end stops it
 
+
+# ── start and stop ───────────────────────────────────────────────────────────────────────────────────
 
 def test_two_sessions_share_the_one_browser_and_only_the_last_to_end_stops_it(agent_home):
-    agent_home["configure"](pinned=True)
+    agent_home["configure"](own_profile=True)
     first, second = _session("task-1"), _session("task-2")
     assert first["cdp_url"] == second["cdp_url"] and first["launcher_key"] == second["launcher_key"]
     from tools.browser_launcher import get_browser
@@ -230,9 +285,10 @@ def test_two_sessions_share_the_one_browser_and_only_the_last_to_end_stops_it(ag
     assert _wait_gone(pid)                                         # the last session's end stops it
 
 
-def test_the_next_call_after_the_stop_starts_it_again(agent_home):
-    agent_home["configure"](pinned=True)
+def test_the_next_call_after_the_stop_starts_it_again_with_a_fresh_record(agent_home):
+    agent_home["configure"](own_profile=True)
     first = _session("task-1")
+    first["owned_target_ids"] = ["tab-of-the-old-browser"]         # what a call on the old browser left behind
     from tools.browser_launcher import get_browser
     pid = get_browser(first["launcher_key"]).pid
     from tools.browser_session_lifecycle import cleanup_single_session
@@ -242,21 +298,22 @@ def test_the_next_call_after_the_stop_starts_it_again(agent_home):
     again = _session("task-1")
     new_pid = get_browser(again["launcher_key"]).pid
     assert new_pid != pid and _alive(new_pid)
+    assert not again.get("owned_target_ids")                       # no tab id of the stopped browser survives
+    assert again["features"].get("own_profile") is True
 
 
 def test_a_browser_somebody_else_started_on_the_profile_is_used_and_never_stopped(agent_home, tmp_path):
-    agent_home["configure"](pinned=True)
+    agent_home["configure"](own_profile=True)
     profile = agent_home["profile"]
     profile.mkdir(parents=True)
     # The shared fake behaves like a real browser where the launcher looks: it takes the profile's singleton
     # lock and answers /json/version on the port it writes to DevToolsActivePort.
     from tests.tools.browser_launcher_fakes import write_fake_chromium
+    from tests.waiting import wait_until
     real_like = write_fake_chromium(tmp_path / "started-by-hand")
     by_hand = subprocess.Popen([str(real_like), f"--user-data-dir={profile}"], start_new_session=True)
     try:
-        deadline = time.monotonic() + 10
-        while not (profile / "DevToolsActivePort").exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
+        wait_until((profile / "DevToolsActivePort").exists, timeout=10)
         info = _session("task-1")
         from tools.browser_launcher import get_browser
         attached = get_browser(info["launcher_key"])
