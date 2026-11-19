@@ -215,7 +215,7 @@ def test_a_new_link_with_the_very_same_text_is_another_browsers_lock(profile):
     pid = _dead_pid()
     state = _dead_browser_state(profile, pid=pid, start_time=1, lock=f"same-host-{pid}")
     lock = profile["udd"] / "SingletonLock"
-    os.unlink(lock)
+    os.rename(lock, profile["udd"] / "the-dead-browsers-old-link")    # kept, so its inode cannot be handed out again
     os.symlink(f"same-host-{pid}", lock)                              # the replacement: same text, a new link
     with _records_lock(profile):
         assert launcher._clear_own_singleton(str(profile["udd"]), state) is False
