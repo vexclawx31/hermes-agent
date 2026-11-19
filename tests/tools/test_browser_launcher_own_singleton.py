@@ -143,9 +143,15 @@ def _dead_browser_state(profile, *, pid: int, start_time, lock: str) -> Path:
     (target / "SingletonSocket").write_text("kept")
     os.symlink(str(target / "SingletonSocket"), udd / "SingletonSocket")
     state = profile["state"]()
-    atomic_json_write(_marker(state), {"pid": pid, "start_time": start_time, "lock": lock, "ns": holders.ns_identity()},
-                      indent=None)
+    atomic_json_write(_marker(state), {"pid": pid, "start_time": start_time, **launcher._lock_identity(str(udd)),
+                                       "ns": holders.ns_identity(), "machine": launcher._machine_id()}, indent=None)
     return state
+
+
+def _dead_pid() -> int:
+    dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    dead.wait()
+    return dead.pid
 
 
 def test_only_the_links_are_removed_never_what_they_point_at(profile):
@@ -187,16 +193,84 @@ def test_a_lock_that_was_replaced_since_the_marker_is_not_ours_to_remove(profile
     assert "SingletonCookie" in _links(profile["udd"])
 
 
-def test_a_marker_from_another_pid_namespace_proves_nothing(profile):
+def _rewrite_marker(state: Path, **change) -> None:
+    import json
     from utils import atomic_json_write
-    dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
-    dead.wait()
-    state = _dead_browser_state(profile, pid=dead.pid, start_time=1, lock=f"old-host-{dead.pid}")
-    atomic_json_write(_marker(state), {"pid": dead.pid, "start_time": 1, "lock": f"old-host-{dead.pid}",
-                                       "ns": "another-namespace:another-boot"}, indent=None)
+    atomic_json_write(_marker(state), {**json.loads(_marker(state).read_text()), **change}, indent=None)
+
+
+@pytest.mark.parametrize("change", [{"ns": "another-namespace:another-boot"}, {"machine": 1}])
+def test_a_marker_from_another_pid_namespace_or_another_machine_proves_nothing(profile, change):
+    pid = _dead_pid()
+    state = _dead_browser_state(profile, pid=pid, start_time=1, lock=f"old-host-{pid}")
+    _rewrite_marker(state, **change)
     with _records_lock(profile):
         assert launcher._clear_own_singleton(str(profile["udd"]), state) is False
     assert "SingletonLock" in _links(profile["udd"])
+
+
+def test_a_new_link_with_the_very_same_text_is_another_browsers_lock(profile):
+    """The dead browser's pid was recycled by a browser the process scan cannot see (no ``--user-data-dir=`` in its
+    argv, another OS user's, a container's): its lock reads the same, but it is another link. Never unlinked."""
+    pid = _dead_pid()
+    state = _dead_browser_state(profile, pid=pid, start_time=1, lock=f"same-host-{pid}")
+    lock = profile["udd"] / "SingletonLock"
+    os.unlink(lock)
+    os.symlink(f"same-host-{pid}", lock)                              # the replacement: same text, a new link
+    with _records_lock(profile):
+        assert launcher._clear_own_singleton(str(profile["udd"]), state) is False
+    assert os.readlink(lock) == f"same-host-{pid}" and "SingletonCookie" in _links(profile["udd"])
+    assert not _marker(state).exists()                                # that marker can never match again
+
+
+def test_a_browser_process_on_the_profile_blocks_the_clear_even_when_the_marked_pid_is_dead(profile, monkeypatch):
+    pid = _dead_pid()
+    state = _dead_browser_state(profile, pid=pid, start_time=1, lock=f"old-host-{pid}")
+    monkeypatch.setattr(launcher, "_browser_running_on", lambda udd: True)
+    with _records_lock(profile):
+        assert launcher._clear_own_singleton(str(profile["udd"]), state) is False
+    assert "SingletonLock" in _links(profile["udd"]) and _marker(state).is_file()
+
+
+def test_a_launch_record_of_another_pid_namespace_naming_that_pid_blocks_the_clear(profile, monkeypatch):
+    pid = _dead_pid()
+    state = _dead_browser_state(profile, pid=pid, start_time=1, lock=f"old-host-{pid}")
+    asked = []
+    monkeypatch.setattr(launcher, "_foreign_record_names", lambda udd, p: asked.append(p) or True)
+    with _records_lock(profile):
+        assert launcher._clear_own_singleton(str(profile["udd"]), state) is False
+    assert asked == [pid] and "SingletonLock" in _links(profile["udd"])
+
+
+def test_a_lock_replaced_while_waiting_for_the_browser_to_die_is_left_alone(profile, monkeypatch):
+    from tools import browser_launcher_holders as holders
+    pid = _dead_pid()
+    state = _dead_browser_state(profile, pid=pid, start_time=1, lock=f"old-host-{pid}")
+    lock = profile["udd"] / "SingletonLock"
+    calls = []
+
+    def dying(p, start):                                              # alive on the first look, gone on the second;
+        calls.append(p)                                               # meanwhile another browser took the profile
+        if len(calls) == 1:
+            os.unlink(lock)
+            os.symlink("new-browser-host-31337", lock)
+            return True
+        return False
+
+    monkeypatch.setattr(holders, "process_alive", dying)
+    with _records_lock(profile):
+        assert launcher._clear_own_singleton(str(profile["udd"]), state, wait=2.0) is False
+    assert os.readlink(lock) == "new-browser-host-31337"
+
+
+def test_no_marker_is_written_when_the_lock_names_another_pid_than_the_launched_one(profile, monkeypatch):
+    """A wrapper binary: the process Hermes started is not the one holding the singleton. No proof, no marker."""
+    browser, err = profile["launch"]()
+    assert browser is not None, err
+    _marker(profile["state"]()).unlink()
+    monkeypatch.setattr(launcher, "_singleton_owner", lambda udd: ("some-host", browser.pid + 1))
+    launcher._note_own_singleton(browser)
+    assert not _marker(profile["state"]()).exists()
 
 
 def test_the_marker_is_not_a_launch_record_to_the_reaper(profile):

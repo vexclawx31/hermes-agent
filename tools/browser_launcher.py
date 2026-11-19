@@ -439,11 +439,29 @@ def _spawn(argv: list[str], env: dict, user_data_dir: str) -> subprocess.Popen:
 # host name takes a stale lock over; under another host name Chromium refuses, and so does ``_foreign_holder``:
 # a machine whose host name follows its network (macOS without a fixed HostName) then cannot start its own
 # browser again. So Hermes removes the links of a browser IT launched once that browser is provably gone. The
-# proof is a marker in the profile's local state dir (this machine's, never the profile dir, which may sit on
-# shared storage): the exact lock target that launch wrote. A lock without that marker is never touched.
+# proof is a marker in the profile's local state dir (never the profile dir, which may sit on shared storage),
+# bound to this machine and PID namespace: the exact lock LINK that launch wrote (target, inode, change time). A
+# lock without that marker, or one that only reads the same, is never touched.
 _SINGLETON_LINKS = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 _OWN_SINGLETON = "own-singleton.marker"  # not *.json: the reaper reads every *.json here as a launch record
 _SINGLETON_EXIT_WAIT_S = 5.0
+
+
+def _lock_identity(user_data_dir: str) -> Optional[dict]:
+    """The singleton lock now on the profile as ONE link: its target and the link's own inode and change time. A
+    later browser that happens to write the same ``<hostname>-<pid>`` text creates another link: another identity."""
+    lock = os.path.join(user_data_dir, "SingletonLock")
+    try:
+        st = os.lstat(lock)
+        return {"lock": os.readlink(lock), "ino": st.st_ino, "ctime_ns": st.st_ctime_ns}
+    except OSError:
+        return None
+
+
+def _machine_id() -> int:
+    """This machine, for a marker that must never prove anything on another one (a state dir on shared storage)."""
+    import uuid
+    return uuid.getnode()
 
 
 def _note_own_singleton(browser: LaunchedBrowser) -> None:
@@ -452,44 +470,42 @@ def _note_own_singleton(browser: LaunchedBrowser) -> None:
     from utils import atomic_json_write
     state = _shared_state_dir(browser.user_data_dir)
     owner = _singleton_owner(browser.user_data_dir)
-    if state is None or owner is None or owner[1] != browser.pid:
+    identity = _lock_identity(browser.user_data_dir)
+    if state is None or owner is None or owner[1] != browser.pid or identity is None:
         return
     try:
-        target = os.readlink(os.path.join(browser.user_data_dir, "SingletonLock"))
-        atomic_json_write(state / _OWN_SINGLETON, {"pid": browser.pid, "start_time": browser.start_time,
-                                                    "lock": target, "ns": holders.ns_identity()}, indent=None)
+        atomic_json_write(state / _OWN_SINGLETON, {"pid": browser.pid, "start_time": browser.start_time, **identity,
+                                                    "ns": holders.ns_identity(), "machine": _machine_id()}, indent=None)
     except OSError as exc:
         logger.debug("browser: could not note the singleton of pid %s: %s", browser.pid, exc)
 
 
 def _clear_own_singleton(user_data_dir: str, state: Path, wait: float = 0.0) -> bool:
     """Remove the singleton links a browser Hermes launched here left behind (caller holds the profile's records
-    lock). Only when every one of these holds: the local marker names exactly the lock now on the profile; that
-    browser (its pid AND start time) is gone, waited for up to ``wait`` seconds; no browser process names the
-    profile; and the lock is still the same right before the unlink. The links are removed, never their targets."""
+    lock). Only when every one of these holds: the local marker, written on this machine in this PID namespace,
+    names exactly the lock LINK now on the profile (target, inode and change time); that browser (its pid AND start
+    time) is gone, waited for up to ``wait`` seconds; no launch record of another PID namespace names that pid for
+    the profile; no browser process names the profile; and the link is still the same right before the unlink.
+    The links are removed, never their targets. A marker that no longer matches the lock is dropped."""
     from tools import browser_launcher_holders as holders
     marker_path = state / _OWN_SINGLETON
     marker = _load_record(marker_path)
-    if marker is None or not holders.same_namespace(marker) or not isinstance(marker.get("lock"), str):
+    if (marker is None or not holders.same_namespace(marker) or marker.get("machine") != _machine_id()
+            or not isinstance(marker.get("lock"), str)):
         return False
-    lock = os.path.join(user_data_dir, "SingletonLock")
-
-    def current() -> Optional[str]:
-        try:
-            return os.readlink(lock)
-        except OSError:
-            return None
-    if current() != marker["lock"]:  # gone, or another browser's: nothing of ours is left to clear
-        if current() is None:
-            marker_path.unlink(missing_ok=True)
+    wanted = {k: marker.get(k) for k in ("lock", "ino", "ctime_ns")}
+    if _lock_identity(user_data_dir) != wanted:  # gone, or another browser's link: this marker proves nothing more
+        marker_path.unlink(missing_ok=True)
         return False
     pid, start = marker.get("pid"), marker.get("start_time")
     deadline = time.monotonic() + max(0.0, wait)
     while holders.process_alive(pid, start) and time.monotonic() < deadline:
         time.sleep(0.1)
-    if holders.process_alive(pid, start) or _browser_running_on(user_data_dir):
+    if (holders.process_alive(pid, start) or (isinstance(pid, int) and _foreign_record_names(user_data_dir, pid))
+            or _browser_running_on(user_data_dir)):
         return False
-    if current() != marker["lock"]:  # replaced while we waited
+    if _lock_identity(user_data_dir) != wanted:  # replaced while we waited
+        marker_path.unlink(missing_ok=True)
         return False
     for name in _SINGLETON_LINKS:
         link = os.path.join(user_data_dir, name)
