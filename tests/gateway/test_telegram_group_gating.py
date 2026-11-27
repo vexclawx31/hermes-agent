@@ -163,6 +163,46 @@ def _mention_entities(text, mentions):
     return [_mention_entity(text, mention) for mention in mentions]
 
 
+def test_listen_only_keeps_mentions_without_dispatching(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_LISTEN_ONLY_CHATS", raising=False)
+    adapter = _make_adapter(require_mention=True, observe_unmentioned_group_messages=True,
+                            allowed_chats=["-100", "-200"], group_allowed_chats=["-100", "-200"],
+                            free_response_chats=["-100"], guest_mode=True)
+    adapter.config.extra["listen_only_chats"] = ["-100"]
+    adapter._observe_unmentioned_group_message = Mock()
+    text = "@hermes_bot what's new?"
+    update = SimpleNamespace(update_id=1)
+    for msg in (_group_message(text, entities=[_mention_entity(text)]),
+                _group_message(reply_to_bot=True), _group_message()):
+        assert adapter._gate_or_observe(msg, update, MessageType.TEXT) is False
+    assert adapter._observe_unmentioned_group_message.call_count == 3
+    assert adapter._should_process_message(_group_message(text, chat_id=-200,
+                                            entities=[_mention_entity(text)]))
+    assert adapter._should_process_message(_dm_message())
+    adapter.config.extra["group_allowed_chats"] = ["-200"]
+    assert not adapter._should_observe_unmentioned_group_message(_group_message())
+
+
+@pytest.mark.asyncio
+async def test_listen_only_refuses_normal_send(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_LISTEN_ONLY_CHATS", raising=False)
+    adapter = _make_adapter()
+    adapter.config.extra["listen_only_chats"] = ["-100"]
+    adapter._send_text_locked = AsyncMock()
+    result = await adapter.send("-100", "must not be sent")
+    assert result.success is False
+    assert result.retryable is False
+    adapter._send_text_locked.assert_not_awaited()
+    from plugins.platforms.telegram.adapter import _standalone_send
+    assert await _standalone_send(adapter.config, "-100", "blocked") == {
+        "error": "Telegram chat is listen-only",
+    }
+    from tools.send_message_tool import _send_to_platform
+    assert await _send_to_platform(Platform.TELEGRAM, adapter.config, "-100", "blocked") == {
+        "error": "Telegram chat is listen-only",
+    }
+
+
 def _bot_command_entity(text, command):
     """Entity Telegram emits for a ``/cmd`` or ``/cmd@botname`` token.
 
@@ -553,6 +593,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "  guest_mode: true\n"
         "  exclusive_bot_mentions: true\n"
         "  observe_unmentioned_group_messages: true\n"
+        "  listen_only_chats: ['-100']\n"
         "  mention_patterns:\n"
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
@@ -601,6 +642,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("guest_mode") is True
     assert tg_cfg.extra.get("exclusive_bot_mentions") is True
     assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
+    assert tg_cfg.extra.get("listen_only_chats") == ["-100"]
     assert tg_cfg.extra.get("mention_patterns") == [r"^\s*chompy\b"]
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
