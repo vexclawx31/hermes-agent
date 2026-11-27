@@ -744,6 +744,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                                              thread_id=thread_id, max_len=None, force_document=force_document)
     # Telegram chunks internally on the *formatted* text (escaping inflates length).
     if platform == Platform.TELEGRAM:
+        from plugins.platforms.telegram.adapter import _listen_only_chat
+        if _listen_only_chat(getattr(pconfig, "extra", {}) or {}, chat_id):
+            return {"error": "Telegram chat is listen-only"}
         return await _send_telegram(
             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
             disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))

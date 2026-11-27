@@ -193,6 +193,14 @@ async def test_listen_only_refuses_normal_send(monkeypatch):
     assert result.success is False
     assert result.retryable is False
     adapter._send_text_locked.assert_not_awaited()
+    from plugins.platforms.telegram.adapter import _standalone_send
+    assert await _standalone_send(adapter.config, "-100", "blocked") == {
+        "error": "Telegram chat is listen-only",
+    }
+    from tools.send_message_tool import _send_to_platform
+    assert await _send_to_platform(Platform.TELEGRAM, adapter.config, "-100", "blocked") == {
+        "error": "Telegram chat is listen-only",
+    }
 
 
 def _bot_command_entity(text, command):

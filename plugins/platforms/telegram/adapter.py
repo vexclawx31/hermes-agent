@@ -5786,11 +5786,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     def _extra_str_set(self, key: str, env_name: str) -> set[str]:
         """Comma/list allowlist: scoped ``env_name`` → ``config.extra[key]`` → empty."""
-        raw = _extra_or_secret(self.config.extra, key, env_name, "", blank_is_unset=False)
-        raw = _decode_json_list_literal(raw)
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
+        return _telegram_string_set(self.config.extra, key, env_name)
 
     def _telegram_require_mention(self) -> bool:
         """Return whether group chats should require an explicit bot trigger."""
@@ -5844,9 +5840,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return self._extra_str_set("group_allowed_chats", "TELEGRAM_GROUP_ALLOWED_CHATS")
 
     def _telegram_listens_only(self, chat_id) -> bool:
-        chat_id = str(chat_id)
-        return chat_id.startswith("-") and chat_id in self._extra_str_set(
-            "listen_only_chats", "TELEGRAM_LISTEN_ONLY_CHATS")
+        return _listen_only_chat(self.config.extra, chat_id)
 
     def _telegram_observe_allowed_chats(self) -> set[str]:
         """Chats where observed group context may use a shared source: ``group_allowed_chats`` ∩
@@ -7287,9 +7281,23 @@ def _is_connected(config) -> bool:
     return bool(str(token).strip())
 
 
+def _telegram_string_set(extra, key, env_name):
+    raw = _decode_json_list_literal(_extra_or_secret(extra, key, env_name, "", blank_is_unset=False))
+    parts = raw if isinstance(raw, list) else str(raw).split(",")
+    return {str(part).strip() for part in parts if str(part).strip()}
+
+
+def _listen_only_chat(extra, chat_id):
+    chat_id = str(chat_id)
+    return chat_id.startswith("-") and chat_id in _telegram_string_set(
+        extra, "listen_only_chats", "TELEGRAM_LISTEN_ONLY_CHATS")
+
+
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
     """Out-of-process delivery (standalone_sender_fn) so deliver=telegram cron jobs succeed without the
     gateway; delegates to the REST ``_send_telegram`` sender."""
+    if _listen_only_chat(getattr(pconfig, "extra", {}) or {}, chat_id):
+        return {"error": "Telegram chat is listen-only"}
     token = getattr(pconfig, "token", None)
     if not token:
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
