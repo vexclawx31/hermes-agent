@@ -2777,6 +2777,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # The gateway-owned boundary runs the full profile-scoped auth chain before plugin dispatch.
         try:
             source = self._source_for_platform_event_auth(update)
+            if self._telegram_listens_only(source.chat_id):
+                return
             self._accept_update()
             await handler(event, source)
         except Exception:
@@ -3640,6 +3642,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
+        if self._telegram_listens_only(chat_id):
+            return SendResult(success=False, error="Telegram chat is listen-only", retryable=False)
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
@@ -4717,6 +4721,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Dispatch inline keyboard button clicks on the callback_data prefix."""
         query = update.callback_query
         if not query or not query.data:
+            return
+        if query.message and self._telegram_listens_only(query.message.chat_id):
             return
         self._accept_update()
         data = query.data
@@ -5837,6 +5843,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Return Telegram chats authorized at group scope."""
         return self._extra_str_set("group_allowed_chats", "TELEGRAM_GROUP_ALLOWED_CHATS")
 
+    def _telegram_listens_only(self, chat_id) -> bool:
+        chat_id = str(chat_id)
+        return chat_id.startswith("-") and chat_id in self._extra_str_set(
+            "listen_only_chats", "TELEGRAM_LISTEN_ONLY_CHATS")
+
     def _telegram_observe_allowed_chats(self) -> set[str]:
         """Chats where observed group context may use a shared source: ``group_allowed_chats`` ∩
         ``allowed_chats`` (when set)."""
@@ -6189,6 +6200,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         allowed = self._telegram_observe_allowed_chats()
         if not allowed or chat_id_str not in allowed:
             return False
+        if self._telegram_listens_only(chat_id_str):
+            return True
         # Free-response chats/topics dispatch every message, so they are never observed.
         if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
             return False
@@ -6427,6 +6440,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if self._topic_gates_pass(thread_id, warn_non_numeric=True) is False:
             return False
         chat_id_str = self._chat_id_str(message)
+        if self._telegram_listens_only(chat_id_str):
+            return False
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
         # Resolve once; _message_mentions_bot is not re-called below in guest mode.
@@ -6513,6 +6528,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        if self._is_group_chat(msg) and self._telegram_listens_only(self._chat_id_str(msg)):
+            if self._is_user_authorized_from_message(msg) and self._should_observe_unmentioned_group_message(msg):
+                self._observe_unmentioned_group_message(msg, MessageType.COMMAND, update_id=update.update_id)
             return
         if not self._should_process_message(msg, is_command=True):
             return
